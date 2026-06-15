@@ -47,7 +47,7 @@ READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
-DASHBOARD_ORDERS = 8
+DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
@@ -900,18 +900,54 @@ class VariationalToLighterRuntime:
         while self.cross_spread_history and self.cross_spread_history[0][0] < cutoff:
             self.cross_spread_history.popleft()
 
-    def _median_cross_spread(self, window_seconds: float, long_side: bool) -> float | None:
+    def _cross_spread_values(self, window_seconds: float, long_side: bool) -> list[float]:
         now = time.monotonic()
         cutoff = now - window_seconds
         value_index = 1 if long_side else 2
-        values = [
+        return [
             row[value_index]
             for row in self.cross_spread_history
             if row[0] >= cutoff and row[value_index] is not None
         ]
+
+    def _median_cross_spread(self, window_seconds: float, long_side: bool) -> float | None:
+        values = self._cross_spread_values(window_seconds, long_side)
         if not values:
             return None
         return float(median(values))
+
+    def _percentile_cross_spread(
+        self, window_seconds: float, long_side: bool, pct: float
+    ) -> float | None:
+        values = self._cross_spread_values(window_seconds, long_side)
+        return self._percentile(values, pct)
+
+    @staticmethod
+    def _percentile(values: list[float], pct: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return float(ordered[0])
+        rank = (pct / 100.0) * (len(ordered) - 1)
+        low = int(rank)
+        high = min(low + 1, len(ordered) - 1)
+        frac = rank - low
+        return float(ordered[low] + (ordered[high] - ordered[low]) * frac)
+
+    def _fmt_window_cell(
+        self,
+        median_v: float | None,
+        p90_v: float | None,
+        p10_v: float | None,
+        labels: tuple[str, str, str],
+    ) -> str:
+        med_l, up_l, lo_l = labels
+        return (
+            f"{med_l} {self._fmt_median_pct(median_v)}\n"
+            f"{up_l} {self._fmt_median_pct(p90_v)}\n"
+            f"{lo_l} {self._fmt_median_pct(p10_v)}"
+        )
 
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
@@ -938,6 +974,19 @@ class VariationalToLighterRuntime:
         short_pct_median_30m = self._median_cross_spread(30 * 60, long_side=False)
         short_pct_median_1h = self._median_cross_spread(60 * 60, long_side=False)
 
+        long_p90_5m = self._percentile_cross_spread(5 * 60, long_side=True, pct=90)
+        long_p10_5m = self._percentile_cross_spread(5 * 60, long_side=True, pct=10)
+        long_p90_30m = self._percentile_cross_spread(30 * 60, long_side=True, pct=90)
+        long_p10_30m = self._percentile_cross_spread(30 * 60, long_side=True, pct=10)
+        long_p90_1h = self._percentile_cross_spread(60 * 60, long_side=True, pct=90)
+        long_p10_1h = self._percentile_cross_spread(60 * 60, long_side=True, pct=10)
+        short_p90_5m = self._percentile_cross_spread(5 * 60, long_side=False, pct=90)
+        short_p10_5m = self._percentile_cross_spread(5 * 60, long_side=False, pct=10)
+        short_p90_30m = self._percentile_cross_spread(30 * 60, long_side=False, pct=90)
+        short_p10_30m = self._percentile_cross_spread(30 * 60, long_side=False, pct=10)
+        short_p90_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=90)
+        short_p10_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=10)
+
         async with self._record_lock:
             recent_keys = list(self.record_order)[-DASHBOARD_ORDERS:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
@@ -955,11 +1004,11 @@ class VariationalToLighterRuntime:
         col_book_spread_pct = "买卖价差%" if is_zh else "Bid/Ask Spread %"
         spread_title = "价差" if is_zh else "Spreads"
         col_metric = "指标" if is_zh else "Metric"
-        col_formula = "公式" if is_zh else "Formula"
         col_value_pct = "当前值%" if is_zh else "Value %"
-        col_median_5m_pct = "5分钟中位数%" if is_zh else "Median 5m %"
-        col_median_30m_pct = "30分钟中位数%" if is_zh else "Median 30m %"
-        col_median_1h_pct = "1小时中位数%" if is_zh else "Median 1h %"
+        col_win_5m = "5分钟窗口" if is_zh else "5m Window"
+        col_win_30m = "30分钟窗口" if is_zh else "30m Window"
+        col_win_1h = "1小时窗口" if is_zh else "1h Window"
+        window_labels = ("中位", "P90↑", "P90↓") if is_zh else ("med", "P90↑", "P90↓")
         metric_long_short = "做多 Var / 做空 Lighter" if is_zh else "Long Var / Short Lighter"
         metric_short_long = "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
@@ -1005,14 +1054,12 @@ class VariationalToLighterRuntime:
 
         spread_table = Table(title=spread_title, show_header=True, expand=True)
         spread_table.add_column(col_metric, style="bold")
-        spread_table.add_column(col_formula)
         spread_table.add_column(col_value_pct, justify="right")
-        spread_table.add_column(col_median_5m_pct, justify="right")
-        spread_table.add_column(col_median_30m_pct, justify="right")
-        spread_table.add_column(col_median_1h_pct, justify="right")
+        spread_table.add_column(col_win_5m, justify="right")
+        spread_table.add_column(col_win_30m, justify="right")
+        spread_table.add_column(col_win_1h, justify="right")
         spread_table.add_row(
-            metric_long_short,
-            "lighter_bid - var_ask",
+            f"{metric_long_short}\n[dim]lighter_bid - var_ask[/dim]",
             self._fmt_signal_pct(
                 long_var_short_lighter_pct,
                 spread_color_baseline,
@@ -1020,13 +1067,12 @@ class VariationalToLighterRuntime:
                 long_pct_median_30m,
                 long_pct_median_1h,
             ),
-            self._fmt_median_pct(long_pct_median_5m),
-            self._fmt_median_pct(long_pct_median_30m),
-            self._fmt_median_pct(long_pct_median_1h),
+            self._fmt_window_cell(long_pct_median_5m, long_p90_5m, long_p10_5m, window_labels),
+            self._fmt_window_cell(long_pct_median_30m, long_p90_30m, long_p10_30m, window_labels),
+            self._fmt_window_cell(long_pct_median_1h, long_p90_1h, long_p10_1h, window_labels),
         )
         spread_table.add_row(
-            metric_short_long,
-            "var_bid - lighter_ask",
+            f"{metric_short_long}\n[dim]var_bid - lighter_ask[/dim]",
             self._fmt_signal_pct(
                 short_var_long_lighter_pct,
                 spread_color_baseline,
@@ -1034,9 +1080,9 @@ class VariationalToLighterRuntime:
                 short_pct_median_30m,
                 short_pct_median_1h,
             ),
-            self._fmt_median_pct(short_pct_median_5m),
-            self._fmt_median_pct(short_pct_median_30m),
-            self._fmt_median_pct(short_pct_median_1h),
+            self._fmt_window_cell(short_pct_median_5m, short_p90_5m, short_p10_5m, window_labels),
+            self._fmt_window_cell(short_pct_median_30m, short_p90_30m, short_p10_30m, window_labels),
+            self._fmt_window_cell(short_pct_median_1h, short_p90_1h, short_p10_1h, window_labels),
         )
 
         orders_table = Table(title=orders_title, show_header=True, expand=True)
