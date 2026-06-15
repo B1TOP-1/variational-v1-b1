@@ -9,7 +9,7 @@ import signal
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -49,6 +49,8 @@ HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
+HOURLY_HISTORY_HOURS = 12
+CST_TZ = timezone(timedelta(hours=8))
 ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
@@ -57,6 +59,10 @@ LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def now_cst_display() -> str:
+    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S UTC+8")
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -239,6 +245,7 @@ class VariationalToLighterRuntime:
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
+        self.hourly_spread_buckets: dict[int, dict[str, list[float]]] = {}
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
         self._asset_switch_candidate_hits = 0
@@ -355,6 +362,7 @@ class VariationalToLighterRuntime:
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
         self.cross_spread_history.clear()
+        self.hourly_spread_buckets.clear()
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -480,8 +488,13 @@ class VariationalToLighterRuntime:
         await self.append_order_log("lighter_fill", payload)
 
     def build_lighter_ws_url(self) -> str:
+        params: list[str] = []
+        if not self.args.auto_hedge:
+            params.append("readonly=true")
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
-            return f"{LIGHTER_WS_URL}?server_pings=true"
+            params.append("server_pings=true")
+        if params:
+            return f"{LIGHTER_WS_URL}?{'&'.join(params)}"
         return LIGHTER_WS_URL
 
     async def handle_lighter_ws(self) -> None:
@@ -496,28 +509,29 @@ class VariationalToLighterRuntime:
                 ) as ws:
                     await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
-                    account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
-                    try:
-                        async with self._lighter_signer_lock:
-                            if not self.lighter_client:
-                                self.initialize_lighter_client()
-                            auth_token, err = self.lighter_client.create_auth_token_with_expiry(
-                                api_key_index=self.api_key_index
-                            )
-                        if err is None:
-                            await ws.send(
-                                json.dumps(
-                                    {
-                                        "type": "subscribe",
-                                        "channel": account_orders_channel,
-                                        "auth": auth_token,
-                                    }
+                    if self.args.auto_hedge:
+                        account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
+                        try:
+                            async with self._lighter_signer_lock:
+                                if not self.lighter_client:
+                                    self.initialize_lighter_client()
+                                auth_token, err = self.lighter_client.create_auth_token_with_expiry(
+                                    api_key_index=self.api_key_index
                                 )
-                            )
-                        else:
-                            self.logger.warning("Failed to create Lighter WS auth token: %s", err)
-                    except Exception as exc:
-                        self.logger.warning("Error creating Lighter WS auth token: %s", exc)
+                            if err is None:
+                                await ws.send(
+                                    json.dumps(
+                                        {
+                                            "type": "subscribe",
+                                            "channel": account_orders_channel,
+                                            "auth": auth_token,
+                                        }
+                                    )
+                                )
+                            else:
+                                self.logger.warning("Failed to create Lighter WS auth token: %s", err)
+                        except Exception as exc:
+                            self.logger.warning("Error creating Lighter WS auth token: %s", exc)
 
                     while not self.stop_flag:
                         raw = await ws.recv()
@@ -935,6 +949,35 @@ class VariationalToLighterRuntime:
         frac = rank - low
         return float(ordered[low] + (ordered[high] - ordered[low]) * frac)
 
+    def _record_hourly_spread(
+        self,
+        long_var_short_lighter_pct: Decimal | None,
+        short_var_long_lighter_pct: Decimal | None,
+    ) -> None:
+        hour_key = int(time.time() // 3600)
+        bucket = self.hourly_spread_buckets.get(hour_key)
+        if bucket is None:
+            bucket = {"long": [], "short": []}
+            self.hourly_spread_buckets[hour_key] = bucket
+        long_value = self._decimal_as_float(long_var_short_lighter_pct)
+        short_value = self._decimal_as_float(short_var_long_lighter_pct)
+        if long_value is not None:
+            bucket["long"].append(long_value)
+        if short_value is not None:
+            bucket["short"].append(short_value)
+        cutoff_key = hour_key - (HOURLY_HISTORY_HOURS - 1)
+        for stale_key in [k for k in self.hourly_spread_buckets if k < cutoff_key]:
+            del self.hourly_spread_buckets[stale_key]
+
+    def _hourly_bucket_cells(self, values: list[float]) -> tuple[str, str, str]:
+        if not values:
+            return "-", "-", "-"
+        return (
+            self._fmt_median_pct(float(median(values))),
+            self._fmt_median_pct(self._percentile(values, 90)),
+            self._fmt_median_pct(self._percentile(values, 10)),
+        )
+
     def _fmt_window_cell(
         self,
         median_v: float | None,
@@ -963,6 +1006,10 @@ class VariationalToLighterRuntime:
         long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
         short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
         self._record_cross_spreads(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+        )
+        self._record_hourly_spread(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
         )
@@ -1027,7 +1074,7 @@ class VariationalToLighterRuntime:
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
-            f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | {utc_now()}",
+            f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | {now_cst_display()}",
             border_style="cyan",
         )
 
@@ -1125,7 +1172,51 @@ class VariationalToLighterRuntime:
                     self._fmt_pct(fill_diff_pct),
                 )
 
-        return Group(header, quote_table, spread_table, orders_table)
+        hourly_title = (
+            "历史价差·每小时（近12小时, UTC+8）"
+            if is_zh
+            else "Hourly Spread History (last 12h, UTC+8)"
+        )
+        col_hour = "时段" if is_zh else "Hour"
+        col_h_long_med = "多·中位%" if is_zh else "Long med%"
+        col_h_long_up = "多·P90↑" if is_zh else "Long P90↑"
+        col_h_long_dn = "多·P90↓" if is_zh else "Long P90↓"
+        col_h_short_med = "空·中位%" if is_zh else "Short med%"
+        col_h_short_up = "空·P90↑" if is_zh else "Short P90↑"
+        col_h_short_dn = "空·P90↓" if is_zh else "Short P90↓"
+        no_hourly_text = "（暂无历史）" if is_zh else "(no history yet)"
+
+        hourly_table = Table(title=hourly_title, show_header=True, expand=True)
+        hourly_table.add_column(col_hour, style="bold")
+        hourly_table.add_column(col_h_long_med, justify="right")
+        hourly_table.add_column(col_h_long_up, justify="right")
+        hourly_table.add_column(col_h_long_dn, justify="right")
+        hourly_table.add_column(col_h_short_med, justify="right")
+        hourly_table.add_column(col_h_short_up, justify="right")
+        hourly_table.add_column(col_h_short_dn, justify="right")
+
+        hour_keys = sorted(self.hourly_spread_buckets.keys(), reverse=True)[:HOURLY_HISTORY_HOURS]
+        if not hour_keys:
+            hourly_table.add_row(no_hourly_text, "-", "-", "-", "-", "-", "-")
+        else:
+            for hour_key in hour_keys:
+                bucket = self.hourly_spread_buckets[hour_key]
+                start = datetime.fromtimestamp(hour_key * 3600, tz=CST_TZ)
+                end = start + timedelta(hours=1)
+                hour_label = f"{start:%H:%M}-{end:%H:%M}"
+                long_med, long_up, long_dn = self._hourly_bucket_cells(bucket["long"])
+                short_med, short_up, short_dn = self._hourly_bucket_cells(bucket["short"])
+                hourly_table.add_row(
+                    hour_label,
+                    long_med,
+                    long_up,
+                    long_dn,
+                    short_med,
+                    short_up,
+                    short_dn,
+                )
+
+        return Group(header, quote_table, spread_table, hourly_table, orders_table)
 
     async def export_trade_records_csv(self) -> None:
         if self.trade_records_csv_file is None:
