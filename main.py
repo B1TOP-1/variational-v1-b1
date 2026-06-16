@@ -51,6 +51,10 @@ DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
 CST_TZ = timezone(timedelta(hours=8))
+# Lines consumed by always-on chrome (header panel + quote/spread tables +
+# the hourly/orders table frames). Remaining terminal height is split between
+# the hourly-history and recent-orders rows so the dashboard fits one screen.
+DASHBOARD_FIXED_OVERHEAD_LINES = 30
 ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
@@ -292,10 +296,22 @@ class VariationalToLighterRuntime:
         self.dashboard_console.print(Panel("\n".join(lines), title=title, border_style="yellow"))
 
     def setup_signal_handlers(self) -> None:
-        signal.signal(signal.SIGINT, self.shutdown)
-        signal.signal(signal.SIGTERM, self.shutdown)
+        try:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, self.shutdown)
+        except (NotImplementedError, RuntimeError):
+            # Windows / no running loop: fall back to synchronous handlers.
+            signal.signal(signal.SIGINT, self.shutdown)
+            signal.signal(signal.SIGTERM, self.shutdown)
 
     def shutdown(self, signum=None, frame=None) -> None:
+        if self.stop_flag:
+            # Second interrupt: restore default handler so a stuck shutdown
+            # can still be force-quit with another Ctrl+C.
+            with contextlib.suppress(Exception):
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+            return
         self.stop_flag = True
 
     def initialize_lighter_client(self) -> SignerClient:
@@ -978,6 +994,22 @@ class VariationalToLighterRuntime:
             self._fmt_median_pct(self._percentile(values, 10)),
         )
 
+    def _adaptive_row_limits(self) -> tuple[int, int]:
+        """Return (hourly_rows, order_rows) that fit the current terminal height.
+
+        The always-on chrome takes a roughly fixed number of lines; whatever
+        height remains is split between the hourly-history and recent-orders
+        tables (each capped at its configured maximum) so a small window stays
+        on one screen instead of being truncated.
+        """
+        height = self.dashboard_console.size.height
+        budget = height - DASHBOARD_FIXED_OVERHEAD_LINES
+        if budget < 2:
+            return 1, 1
+        hourly_rows = min(HOURLY_HISTORY_HOURS, max(1, budget // 2))
+        order_rows = min(DASHBOARD_ORDERS, max(1, budget - hourly_rows))
+        return hourly_rows, order_rows
+
     def _fmt_window_cell(
         self,
         median_v: float | None,
@@ -1034,8 +1066,9 @@ class VariationalToLighterRuntime:
         short_p90_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=90)
         short_p10_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=10)
 
+        hourly_row_limit, order_row_limit = self._adaptive_row_limits()
         async with self._record_lock:
-            recent_keys = list(self.record_order)[-DASHBOARD_ORDERS:]
+            recent_keys = list(self.record_order)[-order_row_limit:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
 
         is_zh = self.args.lang == "zh"
@@ -1195,7 +1228,7 @@ class VariationalToLighterRuntime:
         hourly_table.add_column(col_h_short_up, justify="right")
         hourly_table.add_column(col_h_short_dn, justify="right")
 
-        hour_keys = sorted(self.hourly_spread_buckets.keys(), reverse=True)[:HOURLY_HISTORY_HOURS]
+        hour_keys = sorted(self.hourly_spread_buckets.keys(), reverse=True)[:hourly_row_limit]
         if not hour_keys:
             hourly_table.add_row(no_hourly_text, "-", "-", "-", "-", "-", "-")
         else:
