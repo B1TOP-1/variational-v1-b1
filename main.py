@@ -1147,15 +1147,19 @@ class VariationalToLighterRuntime:
             return record.var_fill_price - lighter
         return None
 
-    def compute_pnl(self) -> tuple[Decimal, Decimal, int]:
+    def compute_pnl(self) -> tuple[Decimal, Decimal, int, Decimal, Decimal | None]:
         """FIFO-offset PnL (USDC) over fully-filled rounds. Caller holds _record_lock.
 
         Long rounds (Var buy) and short rounds (Var sell) offset each other by qty;
         an offset pair locks in both rounds' captured spreads as realized. Whatever
-        stays unoffset is unrealized. Returns (realized, unrealized, pending_rounds).
+        stays unoffset is the live position.
+
+        Returns (realized, unrealized, pending_rounds, position_qty, avg_open_pct):
+        position_qty is signed (+ long Var / - short Var), avg_open_pct is the
+        qty-weighted entry spread% of the still-open lots (the close reference).
         """
         realized = Decimal("0")
-        open_lots: list[list[Any]] = []  # each: [side, remaining_qty, unit_spread]
+        open_lots: list[list[Any]] = []  # each: [side, remaining_qty, unit_spread, spread_pct]
         pending = 0
         for key in self.record_order:
             record = self.records.get(key)
@@ -1165,6 +1169,10 @@ class VariationalToLighterRuntime:
             if unit is None:
                 pending += 1
                 continue
+            rate = record.fill_usdc_usdt_rate or self.usdc_usdt_rate
+            _, pct = self._fill_diff_by_direction(
+                record.side, record.var_fill_price, record.lighter_fill_price, rate
+            )
             side = record.side.strip().lower()
             qty = record.qty
             while qty > 0 and open_lots and open_lots[0][0] != side:
@@ -1176,9 +1184,16 @@ class VariationalToLighterRuntime:
                 if lot[1] <= 0:
                     open_lots.pop(0)
             if qty > 0:
-                open_lots.append([side, qty, unit])
+                open_lots.append([side, qty, unit, pct])
         unrealized = sum((lot[2] * lot[1] for lot in open_lots), Decimal("0"))
-        return realized, unrealized, pending
+        open_qty = sum((lot[1] for lot in open_lots), Decimal("0"))
+        open_side = open_lots[0][0] if open_lots else None
+        position_qty = open_qty if open_side == "buy" else -open_qty
+        avg_open_pct: Decimal | None = None
+        if open_qty > 0:
+            weighted = sum((lot[3] * lot[1] for lot in open_lots if lot[3] is not None), Decimal("0"))
+            avg_open_pct = weighted / open_qty
+        return realized, unrealized, pending, position_qty, avg_open_pct
 
     def _fmt_window_cell(
         self,
@@ -1253,7 +1268,7 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             recent_keys = list(self.record_order)[-order_row_limit:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
-            realized_pnl, unrealized_pnl, _pnl_pending = self.compute_pnl()
+            realized_pnl, unrealized_pnl, _pnl_pending, position_qty, avg_open_pct = self.compute_pnl()
 
         is_zh = self.args.lang == "zh"
         header_title = "Var↔Lit"
@@ -1299,10 +1314,17 @@ class VariationalToLighterRuntime:
             pnl_text = f"收益：[{r_color}]{realized_u}[/]（[{u_color}]{unrealized_u}[/]）"
         else:
             pnl_text = f"PnL: [{r_color}]{realized_u}[/] ([{u_color}]{unrealized_u}[/])"
+
+        pos_label = "持仓" if is_zh else "pos"
+        if avg_open_pct is None or position_qty == 0:
+            pos_text = f"{pos_label} 0"
+        else:
+            pos_color = "green" if avg_open_pct >= 0 else "red"
+            pos_text = f"{pos_label}{position_qty:+.3f}{self.ticker} [{pos_color}]{avg_open_pct:+.4f}%[/]"
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{pnl_text} | USDC/USDT={fx_text} | {now_cst_display()}",
+            f"{pnl_text} | {pos_text} | USDC/USDT={fx_text} | {now_cst_display()}",
             border_style="cyan",
         )
 
