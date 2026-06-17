@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import signal
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -23,6 +24,13 @@ from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+
+try:  # POSIX-only; keyboard paging falls back to disabled on Windows.
+    import termios
+    import tty
+except ImportError:  # pragma: no cover
+    termios = None
+    tty = None
 
 from variational.listener import (
     HEARTBEAT_STALE_SECONDS,
@@ -55,6 +63,11 @@ CST_TZ = timezone(timedelta(hours=8))
 # the hourly/orders table frames). Remaining terminal height is split between
 # the hourly-history and recent-orders rows so the dashboard fits one screen.
 DASHBOARD_FIXED_OVERHEAD_LINES = 30
+# Binance USDCUSDT spot price = USDT per 1 USDC; used to normalize Lighter's
+# USDT-quoted prices into Variational's USDC quote so the cross-venue spread no
+# longer drifts with the stablecoin basis.
+BINANCE_USDCUSDT_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
+USDC_USDT_POLL_SECONDS = 10.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
@@ -66,7 +79,8 @@ def utc_now() -> str:
 
 
 def now_cst_display() -> str:
-    return datetime.now(CST_TZ).strftime("%Y-%m-%d %H:%M:%S UTC+8")
+    now = datetime.now(CST_TZ)
+    return f"{now.month}-{now.day} {now:%H:%M:%S}"
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -278,6 +292,16 @@ class VariationalToLighterRuntime:
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+        self.usdc_usdt_task: asyncio.Task[None] | None = None
+
+        # USDT->USDC normalization (Binance USDCUSDT = USDT per 1 USDC).
+        self.usdc_usdt_rate: Decimal | None = None
+
+        # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
+        self.current_page = 1
+        self._stdin_fd: int | None = None
+        self._stdin_old_settings: Any = None
+        self._keyboard_active = False
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -313,6 +337,69 @@ class VariationalToLighterRuntime:
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
             return
         self.stop_flag = True
+
+    def setup_keyboard(self) -> None:
+        """Put stdin in cbreak/no-echo mode and watch single keypresses for paging."""
+        if termios is None or tty is None or not sys.stdin.isatty():
+            return
+        try:
+            self._stdin_fd = sys.stdin.fileno()
+            self._stdin_old_settings = termios.tcgetattr(self._stdin_fd)
+            mode = termios.tcgetattr(self._stdin_fd)
+            mode[3] = mode[3] & ~(termios.ICANON | termios.ECHO)
+            mode[6][termios.VMIN] = 1
+            mode[6][termios.VTIME] = 0
+            termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, mode)
+            asyncio.get_running_loop().add_reader(self._stdin_fd, self._on_keypress)
+            self._keyboard_active = True
+        except Exception:
+            self.restore_keyboard()
+
+    def _on_keypress(self) -> None:
+        try:
+            data = os.read(self._stdin_fd, 1)
+        except (OSError, TypeError):
+            return
+        if not data:
+            return
+        key = data.decode("utf-8", errors="ignore")
+        if key == "1":
+            self.current_page = 1
+        elif key == "2":
+            self.current_page = 2
+        elif key == "\t":
+            self.current_page = 2 if self.current_page == 1 else 1
+        elif key in ("q", "Q", "\x03"):  # q / Ctrl-C
+            self.shutdown()
+
+    def restore_keyboard(self) -> None:
+        if self._stdin_fd is None:
+            return
+        with contextlib.suppress(Exception):
+            asyncio.get_running_loop().remove_reader(self._stdin_fd)
+        if self._stdin_old_settings is not None and termios is not None:
+            with contextlib.suppress(Exception):
+                termios.tcsetattr(self._stdin_fd, termios.TCSADRAIN, self._stdin_old_settings)
+        self._keyboard_active = False
+        self._stdin_fd = None
+
+    async def update_usdc_usdt_rate_loop(self) -> None:
+        """Poll Binance USDCUSDT (USDT per 1 USDC) for spread normalization."""
+        while not self.stop_flag:
+            try:
+                rate = await asyncio.to_thread(self._fetch_usdc_usdt_rate)
+                if rate is not None and rate > 0:
+                    self.usdc_usdt_rate = rate
+            except Exception as exc:
+                self.logger.warning("Failed to fetch USDCUSDT rate: %s", exc)
+            await asyncio.sleep(USDC_USDT_POLL_SECONDS)
+
+    @staticmethod
+    def _fetch_usdc_usdt_rate() -> Decimal | None:
+        response = requests.get(BINANCE_USDCUSDT_URL, timeout=5)
+        response.raise_for_status()
+        price = response.json().get("price")
+        return Decimal(str(price)) if price is not None else None
 
     def initialize_lighter_client(self) -> SignerClient:
         if self.lighter_client is None:
@@ -997,18 +1084,65 @@ class VariationalToLighterRuntime:
     def _adaptive_row_limits(self) -> tuple[int, int]:
         """Return (hourly_rows, order_rows) that fit the current terminal height.
 
-        The always-on chrome takes a roughly fixed number of lines; whatever
-        height remains is split between the hourly-history and recent-orders
-        tables (each capped at its configured maximum) so a small window stays
-        on one screen instead of being truncated.
+        Page 1 chrome (header + quote/spread tables + footer) takes a roughly
+        fixed number of lines; the rest is given to the recent-orders table so a
+        small window stays on one screen. The hourly history owns page 2, so it
+        always renders its full window.
         """
         height = self.dashboard_console.size.height
         budget = height - DASHBOARD_FIXED_OVERHEAD_LINES
-        if budget < 2:
-            return 1, 1
-        hourly_rows = min(HOURLY_HISTORY_HOURS, max(1, budget // 2))
-        order_rows = min(DASHBOARD_ORDERS, max(1, budget - hourly_rows))
-        return hourly_rows, order_rows
+        order_rows = min(DASHBOARD_ORDERS, max(1, budget))
+        # Hourly history has page 2 to itself, so always show the full window.
+        return HOURLY_HISTORY_HOURS, order_rows
+
+    def _record_unit_spread(self, record: OrderLifecycle) -> Decimal | None:
+        """Direction-adjusted, USDC-normalized per-unit captured spread for a fully
+        filled round (both legs). None if either leg is missing."""
+        if record.var_fill_price is None or record.lighter_fill_price is None:
+            return None
+        lighter = record.lighter_fill_price
+        rate = self.usdc_usdt_rate
+        if rate and rate > 0:
+            lighter = lighter / rate
+        side = record.side.strip().lower()
+        if side == "buy":  # long Var / short Lighter: lighter - var
+            return lighter - record.var_fill_price
+        if side == "sell":  # short Var / long Lighter: var - lighter
+            return record.var_fill_price - lighter
+        return None
+
+    def compute_pnl(self) -> tuple[Decimal, Decimal, int]:
+        """FIFO-offset PnL (USDC) over fully-filled rounds. Caller holds _record_lock.
+
+        Long rounds (Var buy) and short rounds (Var sell) offset each other by qty;
+        an offset pair locks in both rounds' captured spreads as realized. Whatever
+        stays unoffset is unrealized. Returns (realized, unrealized, pending_rounds).
+        """
+        realized = Decimal("0")
+        open_lots: list[list[Any]] = []  # each: [side, remaining_qty, unit_spread]
+        pending = 0
+        for key in self.record_order:
+            record = self.records.get(key)
+            if record is None:
+                continue
+            unit = self._record_unit_spread(record)
+            if unit is None:
+                pending += 1
+                continue
+            side = record.side.strip().lower()
+            qty = record.qty
+            while qty > 0 and open_lots and open_lots[0][0] != side:
+                lot = open_lots[0]
+                matched = min(qty, lot[1])
+                realized += lot[2] * matched + unit * matched
+                lot[1] -= matched
+                qty -= matched
+                if lot[1] <= 0:
+                    open_lots.pop(0)
+            if qty > 0:
+                open_lots.append([side, qty, unit])
+        unrealized = sum((lot[2] * lot[1] for lot in open_lots), Decimal("0"))
+        return realized, unrealized, pending
 
     def _fmt_window_cell(
         self,
@@ -1035,8 +1169,17 @@ class VariationalToLighterRuntime:
         if var_book_spread_pct is not None and lighter_book_spread_pct is not None:
             spread_color_baseline = (var_book_spread_pct + lighter_book_spread_pct) / Decimal("2")
 
-        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
-        short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+        # Normalize Lighter's USDT prices into Variational's USDC quote so the
+        # cross-venue spread no longer drifts with the USDT/USDC basis.
+        rate = self.usdc_usdt_rate
+        if rate and rate > 0:
+            lighter_bid_usdc = lighter_bid / rate if lighter_bid is not None else None
+            lighter_ask_usdc = lighter_ask / rate if lighter_ask is not None else None
+        else:
+            lighter_bid_usdc, lighter_ask_usdc = lighter_bid, lighter_ask
+
+        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid_usdc), var_ask)
+        short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask_usdc, var_bid), lighter_ask_usdc)
         self._record_cross_spreads(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
@@ -1070,10 +1213,11 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             recent_keys = list(self.record_order)[-order_row_limit:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
+            realized_pnl, unrealized_pnl, _pnl_pending = self.compute_pnl()
 
         is_zh = self.args.lang == "zh"
-        header_title = "Variational <-> Lighter"
-        auto_hedge_label = "自动对冲" if is_zh else "auto_hedge"
+        header_title = "Var↔Lit"
+        auto_hedge_label = "对冲" if is_zh else "hedge"
         auto_hedge_on = "开" if is_zh else "ON"
         auto_hedge_off = "关" if is_zh else "OFF"
         quote_title = "最优买一 / 卖一" if is_zh else "Best Bid / Ask"
@@ -1105,9 +1249,19 @@ class VariationalToLighterRuntime:
         hedge_color = "green" if self.args.auto_hedge else "red"
         hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
 
+        fx_text = f"{self.usdc_usdt_rate:.4f}" if self.usdc_usdt_rate else "-"
+        r_color = "green" if realized_pnl >= 0 else "red"
+        u_color = "green" if unrealized_pnl >= 0 else "red"
+        realized_u = "0" if realized_pnl == 0 else f"{realized_pnl:.2f}u"
+        unrealized_u = "0" if unrealized_pnl == 0 else f"{unrealized_pnl:.2f}u"
+        if is_zh:
+            pnl_text = f"收益：[{r_color}]{realized_u}[/]（[{u_color}]{unrealized_u}[/]）"
+        else:
+            pnl_text = f"PnL: [{r_color}]{realized_u}[/] ([{u_color}]{unrealized_u}[/])"
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
-            f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | {now_cst_display()}",
+            f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
+            f"{pnl_text} | USDC/USDT={fx_text} | {now_cst_display()}",
             border_style="cyan",
         )
 
@@ -1206,9 +1360,9 @@ class VariationalToLighterRuntime:
                 )
 
         hourly_title = (
-            "历史价差·每小时（近12小时, UTC+8）"
+            "历史价差·每小时（近12小时）"
             if is_zh
-            else "Hourly Spread History (last 12h, UTC+8)"
+            else "Hourly Spread History (last 12h)"
         )
         col_hour = "时段" if is_zh else "Hour"
         col_h_long_med = "多·中位%" if is_zh else "Long med%"
@@ -1249,7 +1403,17 @@ class VariationalToLighterRuntime:
                     short_dn,
                 )
 
-        return Group(header, quote_table, spread_table, hourly_table, orders_table)
+        if is_zh:
+            page_hint = "[1] 实时  [2] 历史  Tab 切换  q 退出"
+            page_label = f"当前: 第{self.current_page}页"
+        else:
+            page_hint = "[1] Live  [2] History  Tab toggle  q quit"
+            page_label = f"Page {self.current_page}"
+        footer = Panel(f"{page_hint}  |  {page_label}", border_style="dim")
+
+        if self.current_page == 2:
+            return Group(header, hourly_table, footer)
+        return Group(header, quote_table, spread_table, orders_table, footer)
 
     async def export_trade_records_csv(self) -> None:
         if self.trade_records_csv_file is None:
@@ -1350,6 +1514,8 @@ class VariationalToLighterRuntime:
 
     async def run(self) -> None:
         self.setup_signal_handlers()
+        self.setup_keyboard()
+        self.usdc_usdt_task = asyncio.create_task(self.update_usdc_usdt_rate_loop())
         await self.runtime.start()
         self.print_startup_next_steps()
         self.logger.info(
@@ -1377,6 +1543,11 @@ class VariationalToLighterRuntime:
 
     async def close(self) -> None:
         self.stop_flag = True
+        self.restore_keyboard()
+
+        if self.usdc_usdt_task and not self.usdc_usdt_task.done():
+            self.usdc_usdt_task.cancel()
+            await asyncio.gather(self.usdc_usdt_task, return_exceptions=True)
 
         if self.dashboard_task and not self.dashboard_task.done():
             self.dashboard_task.cancel()
