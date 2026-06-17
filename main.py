@@ -20,6 +20,7 @@ import requests
 import websockets
 from dotenv import load_dotenv
 from lighter.signer_client import SignerClient
+from sortedcontainers import SortedDict
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -175,6 +176,10 @@ class OrderLifecycle:
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
 
+    # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills, so the
+    # directional fill spread and PnL normalize at the real fill-time rate.
+    fill_usdc_usdt_rate: Decimal | None = None
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "trade_key": self.trade_key,
@@ -188,6 +193,7 @@ class OrderLifecycle:
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
+            "fill_usdc_usdt_rate": decimal_to_str(self.fill_usdc_usdt_rate),
             "auto_hedge_enabled": self.auto_hedge_enabled,
             "hedge_error": self.hedge_error,
             "last_variational_status": self.last_variational_status,
@@ -280,7 +286,9 @@ class VariationalToLighterRuntime:
         self.base_amount_multiplier = 0
         self.price_multiplier = 0
 
-        self.lighter_order_book = {"bids": {}, "asks": {}}
+        # Price-keyed SortedDict per side so best bid/ask is O(log n) instead of
+        # scanning every level on each book update.
+        self.lighter_order_book = {"bids": SortedDict(), "asks": SortedDict()}
         self.lighter_best_bid: Decimal | None = None
         self.lighter_best_ask: Decimal | None = None
         self.lighter_order_book_offset = 0
@@ -550,6 +558,13 @@ class VariationalToLighterRuntime:
             else:
                 self.lighter_order_book[side].pop(price, None)
 
+    def _refresh_lighter_best(self) -> None:
+        """Recompute best bid/ask from the SortedDict books. Caller holds the lock."""
+        bids = self.lighter_order_book["bids"]
+        asks = self.lighter_order_book["asks"]
+        self.lighter_best_bid = bids.peekitem(-1)[0] if bids else None
+        self.lighter_best_ask = asks.peekitem(0)[0] if asks else None
+
     def validate_order_book_offset(self, new_offset: int) -> bool:
         return new_offset > self.lighter_order_book_offset
 
@@ -586,6 +601,7 @@ class VariationalToLighterRuntime:
 
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
+            record.fill_usdc_usdt_rate = self.usdc_usdt_rate
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
@@ -653,16 +669,7 @@ class VariationalToLighterRuntime:
                                 self.update_lighter_order_book("asks", order_book.get("asks", []))
                                 self.lighter_snapshot_loaded = True
                                 self.lighter_order_book_ready = True
-                                self.lighter_best_bid = (
-                                    max(self.lighter_order_book["bids"].keys())
-                                    if self.lighter_order_book["bids"]
-                                    else None
-                                )
-                                self.lighter_best_ask = (
-                                    min(self.lighter_order_book["asks"].keys())
-                                    if self.lighter_order_book["asks"]
-                                    else None
-                                )
+                                self._refresh_lighter_best()
 
                         elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
                             order_book = data.get("order_book", {})
@@ -676,16 +683,7 @@ class VariationalToLighterRuntime:
                                     self.update_lighter_order_book("bids", order_book.get("bids", []))
                                     self.update_lighter_order_book("asks", order_book.get("asks", []))
                                     self.lighter_order_book_offset = new_offset
-                                    self.lighter_best_bid = (
-                                        max(self.lighter_order_book["bids"].keys())
-                                        if self.lighter_order_book["bids"]
-                                        else None
-                                    )
-                                    self.lighter_best_ask = (
-                                        min(self.lighter_order_book["asks"].keys())
-                                        if self.lighter_order_book["asks"]
-                                        else None
-                                    )
+                                    self._refresh_lighter_best()
 
                         elif msg_type == "update/account_orders":
                             orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
@@ -712,6 +710,37 @@ class VariationalToLighterRuntime:
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
         async with self.lighter_order_book_lock:
             return self.lighter_best_bid, self.lighter_best_ask
+
+    async def get_lighter_depth_quote(self, notional: Decimal) -> tuple[Decimal | None, Decimal | None]:
+        """VWAP bid/ask to fill `notional` (USDT) along the Lighter book."""
+        async with self.lighter_order_book_lock:
+            return (
+                self._lighter_vwap_locked("bids", notional),
+                self._lighter_vwap_locked("asks", notional),
+            )
+
+    def _lighter_vwap_locked(self, book_side: str, notional: Decimal) -> Decimal | None:
+        """Volume-weighted avg price to consume `notional` (USDT) on one book side.
+        bids walked high->low (we sell), asks low->high (we buy). Caller holds the
+        lock. If depth < notional, returns the VWAP of all available depth."""
+        book = self.lighter_order_book[book_side]
+        if not book or notional <= 0:
+            return None
+        prices = reversed(book) if book_side == "bids" else iter(book)
+        remaining = notional
+        total_base = Decimal("0")
+        total_quote = Decimal("0")
+        for price in prices:
+            level_notional = price * book[price]
+            take = level_notional if level_notional < remaining else remaining
+            total_quote += take
+            total_base += take / price
+            remaining -= take
+            if remaining <= 0:
+                break
+        if total_base <= 0:
+            return None
+        return total_quote / total_base
 
     async def get_variational_best_bid_ask(self, preferred_asset: str | None):
         async with self.runtime.monitor._lock:
@@ -972,19 +1001,26 @@ class VariationalToLighterRuntime:
         side: str,
         var_fill_price: Decimal | None,
         lighter_fill_price: Decimal | None,
+        rate: Decimal | None = None,
     ) -> tuple[Decimal | None, Decimal | None]:
+        # Only the derived spread is normalized: the Lighter (USDT) leg is
+        # converted to USDC for the subtraction. Displayed fill prices are
+        # untouched elsewhere — these are the real venue fills.
+        lighter = lighter_fill_price
+        if lighter is not None and rate and rate > 0:
+            lighter = lighter / rate
         side_n = side.strip().lower()
         if side_n == "buy":
             # Long Var / Short Lighter: lighter_fill - var_fill
-            diff = spread_value(var_fill_price, lighter_fill_price)
+            diff = spread_value(var_fill_price, lighter)
             pct = spread_percent(diff, var_fill_price)
             return diff, pct
         if side_n == "sell":
             # Short Var / Long Lighter: var_fill - lighter_fill
-            diff = spread_value(lighter_fill_price, var_fill_price)
-            pct = spread_percent(diff, lighter_fill_price)
+            diff = spread_value(lighter, var_fill_price)
+            pct = spread_percent(diff, lighter)
             return diff, pct
-        diff = spread_value(lighter_fill_price, var_fill_price)
+        diff = spread_value(lighter, var_fill_price)
         pct = spread_percent(diff, var_fill_price)
         return diff, pct
 
@@ -1101,7 +1137,7 @@ class VariationalToLighterRuntime:
         if record.var_fill_price is None or record.lighter_fill_price is None:
             return None
         lighter = record.lighter_fill_price
-        rate = self.usdc_usdt_rate
+        rate = record.fill_usdc_usdt_rate or self.usdc_usdt_rate
         if rate and rate > 0:
             lighter = lighter / rate
         side = record.side.strip().lower()
@@ -1162,24 +1198,28 @@ class VariationalToLighterRuntime:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         var_book_spread = spread_value(var_bid, var_ask)
-        lighter_book_spread = spread_value(lighter_bid, lighter_ask)
         var_book_spread_pct = book_spread_percent(var_bid, var_ask)
         lighter_book_spread_pct = book_spread_percent(lighter_bid, lighter_ask)
         spread_color_baseline: Decimal | None = None
         if var_book_spread_pct is not None and lighter_book_spread_pct is not None:
             spread_color_baseline = (var_book_spread_pct + lighter_book_spread_pct) / Decimal("2")
 
-        # Normalize Lighter's USDT prices into Variational's USDC quote so the
-        # cross-venue spread no longer drifts with the USDT/USDC basis.
+        # Depth-aware signal: use the VWAP to fill --depth-notional along the
+        # Lighter book (not just top-of-book), then normalize that USDT VWAP into
+        # Variational's USDC quote. Var leg stays top-of-book (no Var depth feed).
+        depth_notional = Decimal(str(self.args.depth_notional))
+        vwap_bid, vwap_ask = await self.get_lighter_depth_quote(depth_notional)
+        sig_bid = vwap_bid if vwap_bid is not None else lighter_bid
+        sig_ask = vwap_ask if vwap_ask is not None else lighter_ask
         rate = self.usdc_usdt_rate
         if rate and rate > 0:
-            lighter_bid_usdc = lighter_bid / rate if lighter_bid is not None else None
-            lighter_ask_usdc = lighter_ask / rate if lighter_ask is not None else None
+            sig_bid_usdc = sig_bid / rate if sig_bid is not None else None
+            sig_ask_usdc = sig_ask / rate if sig_ask is not None else None
         else:
-            lighter_bid_usdc, lighter_ask_usdc = lighter_bid, lighter_ask
+            sig_bid_usdc, sig_ask_usdc = sig_bid, sig_ask
 
-        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid_usdc), var_ask)
-        short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask_usdc, var_bid), lighter_ask_usdc)
+        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, sig_bid_usdc), var_ask)
+        short_var_long_lighter_pct = spread_percent(spread_value(sig_ask_usdc, var_bid), sig_ask_usdc)
         self._record_cross_spreads(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
@@ -1226,7 +1266,8 @@ class VariationalToLighterRuntime:
         col_ask = "卖一" if is_zh else "Ask"
         col_book_spread = "买卖价差" if is_zh else "Bid/Ask Spread"
         col_book_spread_pct = "买卖价差%" if is_zh else "Bid/Ask Spread %"
-        spread_title = "价差" if is_zh else "Spreads"
+        depth_n = f"{self.args.depth_notional:g}"
+        spread_title = f"价差（Lighter深度${depth_n}）" if is_zh else f"Spreads (Lighter depth ${depth_n})"
         col_metric = "指标" if is_zh else "Metric"
         col_value_pct = "当前值%" if is_zh else "Value %"
         col_win_5m = "5分钟窗口" if is_zh else "5m Window"
@@ -1241,11 +1282,11 @@ class VariationalToLighterRuntime:
         col_qty = "数量" if is_zh else "Qty"
         col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
         col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
-        col_fill_diff = "成交价差(按方向)" if is_zh else "Fill Diff (Directional)"
-        col_fill_diff_pct = "成交价差%(按方向)" if is_zh else "Fill Diff % (Directional)"
+        col_fill_diff = "成交价差(归一)" if is_zh else "Fill Diff (norm)"
+        col_fill_diff_pct = "成交价差%(归一)" if is_zh else "Fill Diff % (norm)"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
-        lighter_label = "Lighter"
+        lighter_label = f"Lighter (深度${depth_n})" if is_zh else f"Lighter (depth ${depth_n})"
         hedge_color = "green" if self.args.auto_hedge else "red"
         hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
 
@@ -1280,10 +1321,10 @@ class VariationalToLighterRuntime:
         )
         quote_table.add_row(
             lighter_label,
-            self._fmt_price(lighter_bid),
-            self._fmt_price(lighter_ask),
-            self._fmt_price(lighter_book_spread),
-            self._fmt_pct(lighter_book_spread_pct),
+            self._fmt_price(sig_bid),
+            self._fmt_price(sig_ask),
+            self._fmt_price(spread_value(sig_bid, sig_ask)),
+            self._fmt_pct(book_spread_percent(sig_bid, sig_ask)),
         )
 
         spread_table = Table(title=spread_title, show_header=True, expand=True)
@@ -1293,7 +1334,7 @@ class VariationalToLighterRuntime:
         spread_table.add_column(col_win_30m, justify="right")
         spread_table.add_column(col_win_1h, justify="right")
         spread_table.add_row(
-            f"{metric_long_short}\n[dim]lighter_bid - var_ask[/dim]",
+            f"{metric_long_short}\n[dim]lighter_vwap_bid - var_ask[/dim]",
             self._fmt_signal_pct(
                 long_var_short_lighter_pct,
                 spread_color_baseline,
@@ -1346,6 +1387,7 @@ class VariationalToLighterRuntime:
                     row.side,
                     row.var_fill_price,
                     row.lighter_fill_price,
+                    row.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
@@ -1431,6 +1473,7 @@ class VariationalToLighterRuntime:
                     record.side,
                     record.var_fill_price,
                     record.lighter_fill_price,
+                    record.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
                 side_zh, side_en = self._direction_labels(record.side)
                 rows.append(
@@ -1448,8 +1491,9 @@ class VariationalToLighterRuntime:
                         "lighter_client_order_id": payload["lighter_client_order_id"],
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
-                        "fill_diff_var_minus_lighter": decimal_to_str(fill_diff),
-                        "fill_diff_pct_vs_var": decimal_to_str(fill_diff_pct),
+                        "fill_usdc_usdt_rate": payload["fill_usdc_usdt_rate"],
+                        "fill_diff_var_minus_lighter_norm": decimal_to_str(fill_diff),
+                        "fill_diff_pct_vs_var_norm": decimal_to_str(fill_diff_pct),
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
@@ -1474,8 +1518,9 @@ class VariationalToLighterRuntime:
             "lighter_client_order_id",
             "lighter_filled_price",
             "lighter_filled_at",
-            "fill_diff_var_minus_lighter",
-            "fill_diff_pct_vs_var",
+            "fill_usdc_usdt_rate",
+            "fill_diff_var_minus_lighter_norm",
+            "fill_diff_pct_vs_var_norm",
             "auto_hedge_enabled",
             "hedge_error",
             "last_variational_status",
@@ -1587,6 +1632,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         dest="auto_hedge",
         help="Disable automatic Lighter hedge placement (default: enabled)",
+    )
+    parser.add_argument(
+        "--depth-notional",
+        type=float,
+        default=2000.0,
+        help="Lighter VWAP depth notional in USD used as the effective bid/ask for spreads (default: 2000)",
     )
     parser.set_defaults(auto_hedge=True)
     return parser.parse_args()
