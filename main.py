@@ -39,6 +39,7 @@ from variational.listener import (
     VariationalMonitor,
     run_receiver_server,
 )
+from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 
 VARIATIONAL_TICKER_OVERRIDES = {
@@ -49,6 +50,7 @@ VARIATIONAL_ASSET_TO_LIGHTER_TICKER = {v: k for k, v in VARIATIONAL_TICKER_OVERR
 FORWARDER_HOST = "127.0.0.1"
 FORWARDER_WS_PORT = 8766
 FORWARDER_REST_PORT = 8767
+BROWSER_ORDER_BROKER_PORT = 8768
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
@@ -258,6 +260,8 @@ class VariationalToLighterRuntime:
             output_dir=None,
             quiet=True,
         )
+        self.browser_order_broker = BrowserOrderBroker()
+        self.browser_order_server = None
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
@@ -314,6 +318,7 @@ class VariationalToLighterRuntime:
 
         self.gradient_strategy = GradientStrategyState.default()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._browser_order_task: asyncio.Task[None] | None = None
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -1238,7 +1243,37 @@ class VariationalToLighterRuntime:
                 decimal_to_str(signal.target_qty),
                 decimal_to_str(signal.delta_qty),
             )
+            self._schedule_browser_order_dry_run(signal)
         return signal
+
+    def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
+        if self._browser_order_task is not None and not self._browser_order_task.done():
+            return
+        self._browser_order_task = asyncio.create_task(self._send_browser_order_dry_run(signal))
+
+    async def _send_browser_order_dry_run(self, signal: GradientSignal) -> None:
+        side = "buy" if signal.action == "open" else "sell"
+        command = BrowserOrderCommand(side=side, qty=signal.delta_qty, dry_run=True)
+        try:
+            result = await self.browser_order_broker.place_order(command, timeout=25.0)
+        except Exception as exc:
+            self.logger.warning(
+                "Browser order dry-run failed: action=%s side=%s qty=%s error=%s",
+                signal.action,
+                side,
+                decimal_to_str(signal.delta_qty),
+                exc,
+            )
+            return
+        self.logger.info(
+            "Browser order dry-run result: action=%s side=%s qty=%s ok=%s blocked=%s error=%s",
+            signal.action,
+            side,
+            decimal_to_str(signal.delta_qty),
+            result.get("ok"),
+            result.get("blockedReason"),
+            result.get("error"),
+        )
 
     def _render_strategy_panel(
         self,
@@ -1684,13 +1719,20 @@ class VariationalToLighterRuntime:
         self.setup_keyboard()
         self.usdc_usdt_task = asyncio.create_task(self.update_usdc_usdt_rate_loop())
         await self.runtime.start()
+        self.browser_order_server = await run_browser_order_broker(
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
+            self.browser_order_broker,
+        )
         self.print_startup_next_steps()
         self.logger.info(
-            "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s",
+            "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s; browser orders on ws://%s:%s",
             FORWARDER_HOST,
             FORWARDER_WS_PORT,
             FORWARDER_HOST,
             FORWARDER_REST_PORT,
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
         )
 
         await self.wait_for_variational_ready()
@@ -1728,6 +1770,10 @@ class VariationalToLighterRuntime:
             self.lighter_ws_task.cancel()
             await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
 
+        if self._browser_order_task and not self._browser_order_task.done():
+            self._browser_order_task.cancel()
+            await asyncio.gather(self._browser_order_task, return_exceptions=True)
+
         if self.lighter_client is not None:
             close_method = getattr(self.lighter_client, "close", None)
             if callable(close_method):
@@ -1735,6 +1781,11 @@ class VariationalToLighterRuntime:
                     close_result = close_method()
                     if asyncio.iscoroutine(close_result):
                         await close_result
+
+        if self.browser_order_server is not None:
+            self.browser_order_server.close()
+            await self.browser_order_server.wait_closed()
+            self.browser_order_server = None
 
         await self.runtime.stop()
 

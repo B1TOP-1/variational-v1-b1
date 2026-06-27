@@ -95,6 +95,8 @@ python main.py --lang en
 
 开仓区默认信号源为“做多 Variational / 做空 Lighter”，清仓区默认信号源为“做空 Variational / 做多 Lighter”。每个梯度的仓位表示目标总仓位；触发信号只记录应开/应清的差额，不会直接下单。
 
+Chrome 插件启动后会同时连接浏览器下单 broker，默认地址为 `ws://127.0.0.1:8768`。当前策略信号只执行 dry-run：插件会在 Variational 页面选择买卖方向并填入数量，但不会点击提交真实订单。
+
 ### 输出日志
 默认目录：`./log`
 - `runtime.log`（程序运行日志）
@@ -197,6 +199,8 @@ The strategy is disabled by default. Entering values only saves configuration; p
 - `-`: delete the selected gradient row; the last row in a section is cleared instead of removed.
 
 The open section uses `Long Variational / Short Lighter`; the close section uses `Short Variational / Long Lighter`. Each row's position is the target total position. Trigger signals only log the required open/close delta and do not place orders.
+
+After the Chrome extension starts, it also connects to the browser order broker at `ws://127.0.0.1:8768` by default. Strategy signals currently run dry-run browser orders only: the extension selects the side and fills the quantity on the Variational page, but it does not submit live orders.
 
 ### Output Logs
 Default path: `./log`
