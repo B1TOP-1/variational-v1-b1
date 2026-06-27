@@ -81,14 +81,13 @@ python main.py --lang en
 
 ### 第二页触发策略
 第二页提供运行中的梯度触发策略配置，默认开仓区和清仓区各一行空参数，不会在未填完整前触发。
-策略默认未启动；录入参数只会保存配置，必须按 `s` 启动后才会产生触发信号。
+策略默认未启动；录入参数只会保存配置，必须把光标移动到启动行并按 `Enter` 后才会产生触发信号。
 
 - `Tab`：切换第一页/第二页。
-- `s`：启动/停止触发策略。
 - `↑/↓`：在可编辑梯度行之间移动光标。
 - `←/→`：切换当前行的“价差%”和“仓位”字段。
 - 数字与 `.`：直接编辑当前字段。
-- `Enter`：确认当前字段。
+- `Enter`：在启动行切换启动/停止；在梯度行确认当前字段。
 - `Esc`：取消当前字段编辑。
 - `+`：在当前区新增一条梯度。
 - `-`：删除当前梯度；每个区至少保留一行，删除最后一行会清空参数。
@@ -186,14 +185,13 @@ python main.py --lang zh
 
 ### Page 2 Trigger Strategy
 Page 2 provides live gradient trigger configuration. The open and close sections each start with one empty row and do not trigger until a row is complete.
-The strategy is disabled by default. Entering values only saves configuration; press `s` to enable trigger signals.
+The strategy is disabled by default. Entering values only saves configuration; move the cursor to the start row and press `Enter` to enable trigger signals.
 
 - `Tab`: switch between page 1 and page 2.
-- `s`: start/stop the trigger strategy.
 - `↑/↓`: move the cursor across editable gradient rows.
 - `←/→`: switch between the spread % and position fields on the selected row.
 - Digits and `.`: edit the selected field.
-- `Enter`: commit the selected field.
+- `Enter`: start/stop on the start row; commit the selected field on gradient rows.
 - `Esc`: cancel the selected field edit.
 - `+`: add one gradient row in the current section.
 - `-`: delete the selected gradient row; the last row in a section is cleared instead of removed.

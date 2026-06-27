@@ -1,7 +1,7 @@
 import unittest
 from decimal import Decimal
 
-from variational.gradient_strategy import EditableField, GradientStrategyState, StrategySection
+from variational.gradient_strategy import CursorTarget, EditableField, GradientStrategyState, StrategySection
 
 
 class GradientStrategyStateTest(unittest.TestCase):
@@ -10,6 +10,15 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         self.assertEqual(len(state.open_rows), 1)
         self.assertEqual(len(state.close_rows), 1)
+        self.assertEqual(state.cursor_target, CursorTarget.ENABLED)
+        self.assertFalse(state.enabled)
+
+        state.handle_key("\r")
+        self.assertTrue(state.enabled)
+        state.handle_key("\r")
+        self.assertFalse(state.enabled)
+        state.handle_key("\x1b[B")
+
         self.assertEqual(state.cursor_section, StrategySection.OPEN)
         self.assertEqual(state.cursor_index, 0)
         self.assertEqual(state.cursor_field, EditableField.THRESHOLD)
@@ -32,6 +41,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_add_delete_and_navigation(self):
         state = GradientStrategyState.default()
+        state.handle_key("\x1b[B")
 
         state.handle_key("+")
         self.assertEqual(len(state.open_rows), 2)
@@ -46,7 +56,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_open_signal_uses_target_position_delta(self):
         state = GradientStrategyState.default()
-        state.handle_key("s")
+        state.handle_key("\r")
         state.open_rows[0].threshold_pct = Decimal("0.11")
         state.open_rows[0].target_qty = Decimal("0.001")
         state.add_row(StrategySection.OPEN)
@@ -79,7 +89,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_close_signal_fires_on_downward_crossing(self):
         state = GradientStrategyState.default()
-        state.handle_key("s")
+        state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("0.09")
         state.close_rows[0].target_qty = Decimal("0.002")
         state.add_row(StrategySection.CLOSE)

@@ -15,6 +15,11 @@ class EditableField(str, Enum):
     QUANTITY = "quantity"
 
 
+class CursorTarget(str, Enum):
+    ENABLED = "enabled"
+    ROW = "row"
+
+
 @dataclass(slots=True)
 class GradientRow:
     threshold_pct: Decimal | None = None
@@ -48,6 +53,7 @@ class GradientSignal:
 class GradientStrategyState:
     open_rows: list[GradientRow] = field(default_factory=lambda: [GradientRow()])
     close_rows: list[GradientRow] = field(default_factory=lambda: [GradientRow()])
+    cursor_target: CursorTarget = CursorTarget.ENABLED
     cursor_section: StrategySection = StrategySection.OPEN
     cursor_index: int = 0
     cursor_field: EditableField = EditableField.THRESHOLD
@@ -64,6 +70,7 @@ class GradientStrategyState:
         return self.open_rows if section == StrategySection.OPEN else self.close_rows
 
     def current_row(self) -> GradientRow:
+        self.cursor_target = CursorTarget.ROW
         rows = self.rows_for(self.cursor_section)
         self.cursor_index = min(max(self.cursor_index, 0), len(rows) - 1)
         return rows[self.cursor_index]
@@ -72,14 +79,17 @@ class GradientStrategyState:
         self._commit_edit()
         target_section = section or self.cursor_section
         rows = self.rows_for(target_section)
-        insert_at = self.cursor_index + 1 if target_section == self.cursor_section else len(rows)
+        insert_at = self.cursor_index + 1 if self.cursor_target == CursorTarget.ROW and target_section == self.cursor_section else len(rows)
         rows.insert(insert_at, GradientRow())
+        self.cursor_target = CursorTarget.ROW
         self.cursor_section = target_section
         self.cursor_index = insert_at
         self.cursor_field = EditableField.THRESHOLD
 
     def delete_current_row(self) -> None:
         self._commit_edit()
+        if self.cursor_target == CursorTarget.ENABLED:
+            return
         rows = self.rows_for(self.cursor_section)
         if len(rows) == 1:
             rows[0] = GradientRow()
@@ -96,10 +106,16 @@ class GradientStrategyState:
             return
         current = self._flat_cursor_position(flat)
         next_pos = min(max(current + delta, 0), len(flat) - 1)
-        self.cursor_section, self.cursor_index = flat[next_pos]
+        target, section, index = flat[next_pos]
+        self.cursor_target = target
+        if section is not None and index is not None:
+            self.cursor_section = section
+            self.cursor_index = index
 
     def switch_field(self, delta: int) -> None:
         self._commit_edit()
+        if self.cursor_target == CursorTarget.ENABLED:
+            return
         if self.cursor_field == EditableField.THRESHOLD:
             self.cursor_field = EditableField.QUANTITY
         else:
@@ -114,16 +130,18 @@ class GradientStrategyState:
         if key == "-":
             self.delete_current_row()
             return True
-        if key in ("s", "S"):
-            self.enabled = not self.enabled
-            return True
         if key in ("\r", "\n"):
+            if self.cursor_target == CursorTarget.ENABLED:
+                self.enabled = not self.enabled
+                return True
             self._commit_edit()
             return True
         if key in ("\x7f", "\x08"):
             self._backspace()
             return True
         if key.isdigit() or key == ".":
+            if self.cursor_target == CursorTarget.ENABLED:
+                return True
             self._append_edit_char(key)
             return True
         return False
@@ -148,6 +166,7 @@ class GradientStrategyState:
         if (
             section == self.cursor_section
             and index == self.cursor_index
+            and self.cursor_target == CursorTarget.ROW
             and field_name == self.cursor_field
             and self.edit_buffer is not None
         ):
@@ -157,7 +176,10 @@ class GradientStrategyState:
         return "-" if value is None else format(value, "f")
 
     def selected(self, section: StrategySection, index: int) -> bool:
-        return section == self.cursor_section and index == self.cursor_index
+        return self.cursor_target == CursorTarget.ROW and section == self.cursor_section and index == self.cursor_index
+
+    def enabled_selected(self) -> bool:
+        return self.cursor_target == CursorTarget.ENABLED
 
     def _evaluate_open(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
         if spread_pct is None:
@@ -266,6 +288,8 @@ class GradientStrategyState:
         self.edit_buffer = None
 
     def _current_field_value(self) -> Decimal | None:
+        if self.cursor_target == CursorTarget.ENABLED:
+            return None
         row = self.current_row()
         return row.threshold_pct if self.cursor_field == EditableField.THRESHOLD else row.target_qty
 
@@ -282,14 +306,17 @@ class GradientStrategyState:
             return None
         return value
 
-    def _flat_cursor_rows(self) -> list[tuple[StrategySection, int]]:
-        rows: list[tuple[StrategySection, int]] = []
-        rows.extend((StrategySection.OPEN, index) for index in range(len(self.open_rows)))
-        rows.extend((StrategySection.CLOSE, index) for index in range(len(self.close_rows)))
+    def _flat_cursor_rows(self) -> list[tuple[CursorTarget, StrategySection | None, int | None]]:
+        rows: list[tuple[CursorTarget, StrategySection | None, int | None]] = [(CursorTarget.ENABLED, None, None)]
+        rows.extend((CursorTarget.ROW, StrategySection.OPEN, index) for index in range(len(self.open_rows)))
+        rows.extend((CursorTarget.ROW, StrategySection.CLOSE, index) for index in range(len(self.close_rows)))
         return rows
 
-    def _flat_cursor_position(self, flat: list[tuple[StrategySection, int]]) -> int:
+    def _flat_cursor_position(self, flat: list[tuple[CursorTarget, StrategySection | None, int | None]]) -> int:
+        if self.cursor_target == CursorTarget.ENABLED:
+            return 0
         current = (self.cursor_section, self.cursor_index)
-        if current in flat:
-            return flat.index(current)
+        for index, (target, section, row_index) in enumerate(flat):
+            if target == CursorTarget.ROW and (section, row_index) == current:
+                return index
         return 0
