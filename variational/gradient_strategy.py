@@ -124,6 +124,8 @@ class GradientStrategyState:
     def handle_key(self, key: str) -> bool:
         if self._handle_escape_sequence(key):
             return True
+        if self.cursor_target == CursorTarget.ENABLED and key not in ("\r", "\n"):
+            return key in ("+", "-", "\x7f", "\x08", ".") or key.isdigit()
         if key == "+":
             self.add_row()
             return True
@@ -140,8 +142,6 @@ class GradientStrategyState:
             self._backspace()
             return True
         if key.isdigit() or key == ".":
-            if self.cursor_target == CursorTarget.ENABLED:
-                return True
             self._append_edit_char(key)
             return True
         return False

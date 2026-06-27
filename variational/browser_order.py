@@ -5,9 +5,12 @@ import json
 import uuid
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Any
+from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 import websockets
+
+
+T = TypeVar("T")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +52,9 @@ class BrowserOrderBroker:
     def is_connected(self) -> bool:
         return self._websocket is not None
 
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     async def on_connect(self, websocket: Any) -> None:
         self._websocket = websocket
         try:
@@ -57,10 +63,10 @@ class BrowserOrderBroker:
         finally:
             if self._websocket is websocket:
                 self._websocket = None
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(RuntimeError("browser order broker disconnected"))
-            self._pending.clear()
+                for future in self._pending.values():
+                    if not future.done():
+                        future.set_exception(RuntimeError("browser order broker disconnected"))
+                self._pending.clear()
 
     async def handle_raw_message(self, raw: str | bytes) -> None:
         if isinstance(raw, bytes):
@@ -83,17 +89,52 @@ class BrowserOrderBroker:
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
         self._pending[message_id] = future
-        await self._websocket.send(
-            json.dumps(
-                {
-                    "id": message_id,
-                    "action": "place_browser_order",
-                    "payload": command.to_payload(),
-                },
-                ensure_ascii=True,
+        try:
+            await self._websocket.send(
+                json.dumps(
+                    {
+                        "id": message_id,
+                        "action": "place_browser_order",
+                        "payload": command.to_payload(),
+                    },
+                    ensure_ascii=True,
+                )
             )
-        )
-        return await asyncio.wait_for(future, timeout=timeout)
+            return await asyncio.wait_for(future, timeout=timeout)
+        finally:
+            self._pending.pop(message_id, None)
+
+
+class BrowserOrderDispatchQueue(Generic[T]):
+    def __init__(self, handler: Callable[[T], Awaitable[None]]) -> None:
+        self._handler = handler
+        self._queue: asyncio.Queue[T] = asyncio.Queue()
+        self._task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    def submit(self, item: T) -> None:
+        self._queue.put_nowait(item)
+
+    async def join(self) -> None:
+        await self._queue.join()
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    async def _run(self) -> None:
+        while True:
+            item = await self._queue.get()
+            try:
+                await self._handler(item)
+            finally:
+                self._queue.task_done()
 
 
 async def run_browser_order_broker(host: str, port: int, broker: BrowserOrderBroker) -> Any:

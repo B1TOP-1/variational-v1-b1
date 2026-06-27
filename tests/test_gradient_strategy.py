@@ -39,6 +39,23 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(state.open_rows[0].threshold_pct, Decimal("1.11"))
         self.assertEqual(state.open_rows[0].target_qty, Decimal("0.001"))
 
+    def test_enabled_row_ignores_editing_keys(self):
+        state = GradientStrategyState.default()
+
+        state.handle_key("+")
+        state.handle_key("-")
+        state.handle_key("1")
+        state.handle_key(".")
+        state.handle_key("\x7f")
+        state.handle_key("\x1b[B")
+
+        self.assertEqual(len(state.open_rows), 1)
+        self.assertEqual(len(state.close_rows), 1)
+        self.assertEqual(state.cursor_target, CursorTarget.ROW)
+        self.assertEqual(state.cursor_section, StrategySection.OPEN)
+        self.assertEqual(state.cursor_index, 0)
+        self.assertIsNone(state.edit_buffer)
+
     def test_add_delete_and_navigation(self):
         state = GradientStrategyState.default()
         state.handle_key("\x1b[B")

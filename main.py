@@ -39,7 +39,7 @@ from variational.listener import (
     VariationalMonitor,
     run_receiver_server,
 )
-from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, run_browser_order_broker
+from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 
 VARIATIONAL_TICKER_OVERRIDES = {
@@ -318,7 +318,9 @@ class VariationalToLighterRuntime:
 
         self.gradient_strategy = GradientStrategyState.default()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
-        self._browser_order_task: asyncio.Task[None] | None = None
+        self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal] = BrowserOrderDispatchQueue(
+            self._send_browser_order_dry_run
+        )
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -1247,9 +1249,7 @@ class VariationalToLighterRuntime:
         return signal
 
     def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
-        if self._browser_order_task is not None and not self._browser_order_task.done():
-            return
-        self._browser_order_task = asyncio.create_task(self._send_browser_order_dry_run(signal))
+        self._browser_order_queue.submit(signal)
 
     async def _send_browser_order_dry_run(self, signal: GradientSignal) -> None:
         side = "buy" if signal.action == "open" else "sell"
@@ -1734,6 +1734,7 @@ class VariationalToLighterRuntime:
             BROWSER_ORDER_BROKER_PORT,
             self.browser_order_broker,
         )
+        self._browser_order_queue.start()
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s; browser orders on ws://%s:%s",
@@ -1780,9 +1781,7 @@ class VariationalToLighterRuntime:
             self.lighter_ws_task.cancel()
             await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
 
-        if self._browser_order_task and not self._browser_order_task.done():
-            self._browser_order_task.cancel()
-            await asyncio.gather(self._browser_order_task, return_exceptions=True)
+        await self._browser_order_queue.stop()
 
         if self.lighter_client is not None:
             close_method = getattr(self.lighter_client, "close", None)
