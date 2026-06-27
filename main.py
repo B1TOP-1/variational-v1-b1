@@ -1250,6 +1250,7 @@ class VariationalToLighterRuntime:
         strategy_table = Table.grid(expand=True)
         strategy_table.add_column(ratio=1)
 
+        status_text = "[bold green]已启动[/]" if self.gradient_strategy.enabled else "[bold red]未启动[/]"
         signal_text = "无信号"
         if signal is not None:
             action_text = "开仓" if signal.action == "open" else "清仓"
@@ -1258,7 +1259,7 @@ class VariationalToLighterRuntime:
                 f"目标 {signal.target_qty:f} | 当前 {signal.current_qty:f} | "
                 f"触发 {signal.threshold_pct:f}%"
             )
-        strategy_table.add_row(f"当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
+        strategy_table.add_row(f"策略状态: {status_text} | 当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
         strategy_table.add_row("")
         strategy_table.add_row(
             "开仓区: 信号源 做多 Var / 做空 Lighter | "
@@ -1274,7 +1275,7 @@ class VariationalToLighterRuntime:
         for index, _row in enumerate(self.gradient_strategy.close_rows):
             strategy_table.add_row(self._strategy_row_text(StrategySection.CLOSE, index))
         strategy_table.add_row("")
-        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认  Esc取消  Tab切页  q退出")
+        strategy_table.add_row("按键: s启动/停止  ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认  Esc取消  Tab切页  q退出")
         return Panel(strategy_table, title="触发策略", border_style="magenta")
 
     def _strategy_row_text(self, section: StrategySection, index: int) -> str:

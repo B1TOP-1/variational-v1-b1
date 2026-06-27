@@ -46,6 +46,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_open_signal_uses_target_position_delta(self):
         state = GradientStrategyState.default()
+        state.handle_key("s")
         state.open_rows[0].threshold_pct = Decimal("0.11")
         state.open_rows[0].target_qty = Decimal("0.001")
         state.add_row(StrategySection.OPEN)
@@ -63,8 +64,22 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(signal.delta_qty, Decimal("0.001"))
         self.assertEqual(signal.target_qty, Decimal("0.002"))
 
+    def test_strategy_is_disabled_by_default(self):
+        state = GradientStrategyState.default()
+        state.open_rows[0].threshold_pct = Decimal("0.11")
+        state.open_rows[0].target_qty = Decimal("0.001")
+
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.12"),
+            close_spread_pct=Decimal("0.00"),
+            current_position_qty=Decimal("0"),
+        )
+
+        self.assertIsNone(signal)
+
     def test_close_signal_fires_on_downward_crossing(self):
         state = GradientStrategyState.default()
+        state.handle_key("s")
         state.close_rows[0].threshold_pct = Decimal("0.09")
         state.close_rows[0].target_qty = Decimal("0.002")
         state.add_row(StrategySection.CLOSE)

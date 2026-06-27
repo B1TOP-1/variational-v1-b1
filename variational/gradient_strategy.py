@@ -51,6 +51,7 @@ class GradientStrategyState:
     cursor_section: StrategySection = StrategySection.OPEN
     cursor_index: int = 0
     cursor_field: EditableField = EditableField.THRESHOLD
+    enabled: bool = False
     edit_buffer: str | None = None
     _escape_buffer: str = ""
     _last_close_spread_pct: Decimal | None = None
@@ -113,6 +114,9 @@ class GradientStrategyState:
         if key == "-":
             self.delete_current_row()
             return True
+        if key in ("s", "S"):
+            self.enabled = not self.enabled
+            return True
         if key in ("\r", "\n"):
             self._commit_edit()
             return True
@@ -130,6 +134,9 @@ class GradientStrategyState:
         close_spread_pct: Decimal | None,
         current_position_qty: Decimal,
     ) -> GradientSignal | None:
+        if not self.enabled:
+            self._last_close_spread_pct = close_spread_pct
+            return None
         current_long_qty = max(current_position_qty, Decimal("0"))
         close_signal = self._evaluate_close(close_spread_pct, current_long_qty)
         self._last_close_spread_pct = close_spread_pct

@@ -81,8 +81,10 @@ python main.py --lang en
 
 ### 第二页触发策略
 第二页提供运行中的梯度触发策略配置，默认开仓区和清仓区各一行空参数，不会在未填完整前触发。
+策略默认未启动；录入参数只会保存配置，必须按 `s` 启动后才会产生触发信号。
 
 - `Tab`：切换第一页/第二页。
+- `s`：启动/停止触发策略。
 - `↑/↓`：在可编辑梯度行之间移动光标。
 - `←/→`：切换当前行的“价差%”和“仓位”字段。
 - 数字与 `.`：直接编辑当前字段。
@@ -182,8 +184,10 @@ python main.py --lang zh
 
 ### Page 2 Trigger Strategy
 Page 2 provides live gradient trigger configuration. The open and close sections each start with one empty row and do not trigger until a row is complete.
+The strategy is disabled by default. Entering values only saves configuration; press `s` to enable trigger signals.
 
 - `Tab`: switch between page 1 and page 2.
+- `s`: start/stop the trigger strategy.
 - `↑/↓`: move the cursor across editable gradient rows.
 - `←/→`: switch between the spread % and position fields on the selected row.
 - Digits and `.`: edit the selected field.
