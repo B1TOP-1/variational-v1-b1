@@ -79,6 +79,20 @@ Python 脚本开始运行后，打开 Variational 的交易页面，
 python main.py --lang en
 ```
 
+### 第二页触发策略
+第二页提供运行中的梯度触发策略配置，默认开仓区和清仓区各一行空参数，不会在未填完整前触发。
+
+- `Tab`：切换第一页/第二页。
+- `↑/↓`：在可编辑梯度行之间移动光标。
+- `←/→`：切换当前行的“价差%”和“仓位”字段。
+- 数字与 `.`：直接编辑当前字段。
+- `Enter`：确认当前字段。
+- `Esc`：取消当前字段编辑。
+- `+`：在当前区新增一条梯度。
+- `-`：删除当前梯度；每个区至少保留一行，删除最后一行会清空参数。
+
+开仓区默认信号源为“做多 Variational / 做空 Lighter”，清仓区默认信号源为“做空 Variational / 做多 Lighter”。每个梯度的仓位表示目标总仓位；触发信号只记录应开/应清的差额，不会直接下单。
+
 ### 输出日志
 默认目录：`./log`
 - `runtime.log`（程序运行日志）
@@ -165,6 +179,20 @@ Switch dashboard language to Chinese:
 ```bash
 python main.py --lang zh
 ```
+
+### Page 2 Trigger Strategy
+Page 2 provides live gradient trigger configuration. The open and close sections each start with one empty row and do not trigger until a row is complete.
+
+- `Tab`: switch between page 1 and page 2.
+- `↑/↓`: move the cursor across editable gradient rows.
+- `←/→`: switch between the spread % and position fields on the selected row.
+- Digits and `.`: edit the selected field.
+- `Enter`: commit the selected field.
+- `Esc`: cancel the selected field edit.
+- `+`: add one gradient row in the current section.
+- `-`: delete the selected gradient row; the last row in a section is cleared instead of removed.
+
+The open section uses `Long Variational / Short Lighter`; the close section uses `Short Variational / Long Lighter`. Each row's position is the target total position. Trigger signals only log the required open/close delta and do not place orders.
 
 ### Output Logs
 Default path: `./log`

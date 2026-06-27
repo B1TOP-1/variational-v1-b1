@@ -39,6 +39,7 @@ from variational.listener import (
     VariationalMonitor,
     run_receiver_server,
 )
+from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -311,6 +312,9 @@ class VariationalToLighterRuntime:
         self._stdin_old_settings: Any = None
         self._keyboard_active = False
 
+        self.gradient_strategy = GradientStrategyState.default()
+        self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
+
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
         if is_zh:
@@ -371,14 +375,16 @@ class VariationalToLighterRuntime:
         if not data:
             return
         key = data.decode("utf-8", errors="ignore")
-        if key == "1":
+        if key in ("q", "Q", "\x03"):  # q / Ctrl-C
+            self.shutdown()
+        elif key == "\t":
+            self.current_page = 2 if self.current_page == 1 else 1
+        elif self.current_page == 2:
+            self.gradient_strategy.handle_key(key)
+        elif key == "1":
             self.current_page = 1
         elif key == "2":
             self.current_page = 2
-        elif key == "\t":
-            self.current_page = 2 if self.current_page == 1 else 1
-        elif key in ("q", "Q", "\x03"):  # q / Ctrl-C
-            self.shutdown()
 
     def restore_keyboard(self) -> None:
         if self._stdin_fd is None:
@@ -1209,6 +1215,88 @@ class VariationalToLighterRuntime:
             f"{lo_l} {self._fmt_median_pct(p10_v)}"
         )
 
+    def _evaluate_gradient_signal(
+        self,
+        open_spread_pct: Decimal | None,
+        close_spread_pct: Decimal | None,
+        position_qty: Decimal,
+    ) -> GradientSignal | None:
+        signal = self.gradient_strategy.evaluate(open_spread_pct, close_spread_pct, position_qty)
+        if signal is None:
+            self._last_gradient_signal_sig = None
+            return None
+        signal_sig = signal.signature()
+        if signal_sig != self._last_gradient_signal_sig:
+            self._last_gradient_signal_sig = signal_sig
+            self.logger.info(
+                "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
+                signal.action,
+                signal.section.value,
+                decimal_to_str(signal.spread_pct),
+                decimal_to_str(signal.threshold_pct),
+                decimal_to_str(signal.current_qty),
+                decimal_to_str(signal.target_qty),
+                decimal_to_str(signal.delta_qty),
+            )
+        return signal
+
+    def _render_strategy_panel(
+        self,
+        open_spread_pct: Decimal | None,
+        close_spread_pct: Decimal | None,
+        position_qty: Decimal,
+        signal: GradientSignal | None,
+    ) -> Panel:
+        strategy_table = Table.grid(expand=True)
+        strategy_table.add_column(ratio=1)
+
+        signal_text = "无信号"
+        if signal is not None:
+            action_text = "开仓" if signal.action == "open" else "清仓"
+            signal_text = (
+                f"[bold yellow]{action_text} {signal.delta_qty:f} {self.ticker}[/] "
+                f"目标 {signal.target_qty:f} | 当前 {signal.current_qty:f} | "
+                f"触发 {signal.threshold_pct:f}%"
+            )
+        strategy_table.add_row(f"当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
+        strategy_table.add_row("")
+        strategy_table.add_row(
+            "开仓区: 信号源 做多 Var / 做空 Lighter | "
+            f"当前价差: {self._fmt_pct(open_spread_pct)}"
+        )
+        for index, _row in enumerate(self.gradient_strategy.open_rows):
+            strategy_table.add_row(self._strategy_row_text(StrategySection.OPEN, index))
+        strategy_table.add_row("")
+        strategy_table.add_row(
+            "清仓区: 信号源 做空 Var / 做多 Lighter | "
+            f"当前价差: {self._fmt_pct(close_spread_pct)}"
+        )
+        for index, _row in enumerate(self.gradient_strategy.close_rows):
+            strategy_table.add_row(self._strategy_row_text(StrategySection.CLOSE, index))
+        strategy_table.add_row("")
+        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认  Esc取消  Tab切页  q退出")
+        return Panel(strategy_table, title="触发策略", border_style="magenta")
+
+    def _strategy_row_text(self, section: StrategySection, index: int) -> str:
+        selected = self.gradient_strategy.selected(section, index)
+        cursor = ">" if selected else " "
+        threshold_text = self.gradient_strategy.display_value(section, index, EditableField.THRESHOLD)
+        qty_text = self.gradient_strategy.display_value(section, index, EditableField.QUANTITY)
+        threshold_cell = f"价差 {threshold_text}%"
+        qty_cell = f"仓位 {qty_text} {self.ticker}"
+        if selected and self.gradient_strategy.cursor_field == EditableField.THRESHOLD:
+            threshold_cell = f"[black on yellow]{threshold_cell}[/]"
+        elif selected:
+            threshold_cell = f"[bold]{threshold_cell}[/]"
+        if selected and self.gradient_strategy.cursor_field == EditableField.QUANTITY:
+            qty_cell = f"[black on yellow]{qty_cell}[/]"
+        elif selected:
+            qty_cell = f"[bold]{qty_cell}[/]"
+        row_text = f"{cursor} {index + 1}. {threshold_cell} -> {qty_cell}"
+        if selected:
+            return f"[reverse]{row_text}[/]"
+        return row_text
+
     async def render_dashboard(self) -> Group:
         var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
@@ -1467,16 +1555,27 @@ class VariationalToLighterRuntime:
                     short_dn,
                 )
 
+        signal = self._evaluate_gradient_signal(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+            position_qty,
+        )
+        strategy_panel = self._render_strategy_panel(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+            position_qty,
+            signal,
+        )
         if is_zh:
-            page_hint = "[1] 实时  [2] 历史  Tab 切换  q 退出"
-            page_label = f"当前: 第{self.current_page}页"
+            page_hint = "[1]实时 [2]策略 Tab切换 q退出"
+            page_label = f"第{self.current_page}页"
         else:
-            page_hint = "[1] Live  [2] History  Tab toggle  q quit"
+            page_hint = "[1]Live [2]Strategy Tab q"
             page_label = f"Page {self.current_page}"
         footer = Panel(f"{page_hint}  |  {page_label}", border_style="dim")
 
         if self.current_page == 2:
-            return Group(header, hourly_table, footer)
+            return Group(header, hourly_table, strategy_panel, footer)
         return Group(header, quote_table, spread_table, orders_table, footer)
 
     async def export_trade_records_csv(self) -> None:
