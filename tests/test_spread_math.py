@@ -3,12 +3,14 @@ import time
 from decimal import Decimal
 
 from main import (
+    BrowserOrderCommand,
     OrderLifecycle,
     PENDING_TRIGGER_SPREAD_TTL_SECONDS,
     PendingTriggerSpread,
     VariationalToLighterRuntime,
     cross_spread_percentages,
 )
+from variational.gradient_strategy import GradientStrategyState
 
 
 class SpreadMathTest(unittest.TestCase):
@@ -108,6 +110,51 @@ class SpreadMathTest(unittest.TestCase):
         runtime._record_live_trigger_spread(side="buy", spread_pct=Decimal("0.0125"))
 
         self.assertEqual(runtime._consume_pending_trigger_spread("buy"), Decimal("0.0125"))
+
+    def test_prepare_browser_order_uses_single_order_qty(self):
+        class Queue:
+            def __init__(self):
+                self.items = []
+
+            def submit(self, item):
+                self.items.append(item)
+
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime._last_prepared_order_sig = None
+        runtime._browser_order_queue = Queue()
+
+        runtime._schedule_prepare_browser_order()
+
+        self.assertEqual(len(runtime._browser_order_queue.items), 1)
+        command = runtime._browser_order_queue.items[0]
+        self.assertIsInstance(command, BrowserOrderCommand)
+        self.assertEqual(command.side, "buy")
+        self.assertEqual(command.qty, Decimal("0.001"))
+        self.assertTrue(command.prepare_only)
+
+    def test_prepare_browser_order_dedupes_only_after_success(self):
+        class Queue:
+            def __init__(self):
+                self.items = []
+
+            def submit(self, item):
+                self.items.append(item)
+
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime._last_prepared_order_sig = None
+        runtime._browser_order_queue = Queue()
+
+        runtime._schedule_prepare_browser_order()
+        runtime._schedule_prepare_browser_order()
+
+        self.assertEqual(len(runtime._browser_order_queue.items), 2)
+
+        runtime._last_prepared_order_sig = ("buy", "0.001")
+        runtime._schedule_prepare_browser_order()
+
+        self.assertEqual(len(runtime._browser_order_queue.items), 2)
 
 
 if __name__ == "__main__":

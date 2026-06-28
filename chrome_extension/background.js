@@ -629,6 +629,7 @@ async function handlePlaceBrowserOrder(payload) {
   const tabId = state.attachedTabId ?? (await getActiveTabId());
   const side = String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
   const qty = payload?.qty == null ? null : String(payload.qty).trim();
+  const prepareOnly = Boolean(payload?.prepareOnly);
   const dryRun = payload?.dryRun !== false;
   if (!dryRun) {
     return {
@@ -670,15 +671,16 @@ async function handlePlaceBrowserOrder(payload) {
     side,
     qty,
     dryRun,
+    prepareOnly,
     submitMethod: payload?.submitMethod || "js_dispatch_mouse",
     before,
     after,
-    blockedReason: "dry_run"
+    blockedReason: prepareOnly ? "prepare_only" : "dry_run"
   };
 }
 
 async function handleBrokerCommand(action, payload) {
-  if (action === "place_browser_order") {
+  if (action === "place_browser_order" || action === "prepare_browser_order") {
     return await handlePlaceBrowserOrder(payload);
   }
   if (action === "ping") {

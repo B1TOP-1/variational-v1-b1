@@ -20,6 +20,16 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["skipInputWhenMatched"], True)
         json.dumps(payload)
 
+    def test_builds_prepare_browser_order_payload(self):
+        command = BrowserOrderCommand(side="sell", qty=Decimal("0.002"), prepare_only=True)
+
+        self.assertEqual(command.action, "prepare_browser_order")
+        payload = command.to_payload()
+        self.assertEqual(payload["side"], "sell")
+        self.assertEqual(payload["qty"], "0.002")
+        self.assertEqual(payload["dryRun"], True)
+        self.assertEqual(payload["prepareOnly"], True)
+
     def test_normalizes_unknown_side_to_buy(self):
         command = BrowserOrderCommand(side="invalid", qty=Decimal("0.002"))
 

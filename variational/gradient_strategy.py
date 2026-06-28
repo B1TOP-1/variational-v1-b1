@@ -17,6 +17,7 @@ class EditableField(str, Enum):
 
 class CursorTarget(str, Enum):
     ENABLED = "enabled"
+    ORDER_SIZE = "order_size"
     ROW = "row"
 
 
@@ -53,6 +54,7 @@ class GradientSignal:
 class GradientStrategyState:
     open_rows: list[GradientRow] = field(default_factory=lambda: [GradientRow()])
     close_rows: list[GradientRow] = field(default_factory=lambda: [GradientRow()])
+    single_order_qty: Decimal = Decimal("0.001")
     cursor_target: CursorTarget = CursorTarget.ENABLED
     cursor_section: StrategySection = StrategySection.OPEN
     cursor_index: int = 0
@@ -114,7 +116,7 @@ class GradientStrategyState:
 
     def switch_field(self, delta: int) -> None:
         self._commit_edit()
-        if self.cursor_target == CursorTarget.ENABLED:
+        if self.cursor_target != CursorTarget.ROW:
             return
         if self.cursor_field == EditableField.THRESHOLD:
             self.cursor_field = EditableField.QUANTITY
@@ -127,9 +129,13 @@ class GradientStrategyState:
         if self.cursor_target == CursorTarget.ENABLED and key not in ("\r", "\n"):
             return key in ("+", "-", "\x7f", "\x08", ".") or key.isdigit()
         if key == "+":
+            if self.cursor_target == CursorTarget.ORDER_SIZE:
+                return True
             self.add_row()
             return True
         if key == "-":
+            if self.cursor_target == CursorTarget.ORDER_SIZE:
+                return True
             self.delete_current_row()
             return True
         if key in ("\r", "\n"):
@@ -175,11 +181,19 @@ class GradientStrategyState:
         value = row.threshold_pct if field_name == EditableField.THRESHOLD else row.target_qty
         return "-" if value is None else format(value, "f")
 
+    def display_single_order_qty(self) -> str:
+        if self.cursor_target == CursorTarget.ORDER_SIZE and self.edit_buffer is not None:
+            return self.edit_buffer or "_"
+        return format(self.single_order_qty, "f")
+
     def selected(self, section: StrategySection, index: int) -> bool:
         return self.cursor_target == CursorTarget.ROW and section == self.cursor_section and index == self.cursor_index
 
     def enabled_selected(self) -> bool:
         return self.cursor_target == CursorTarget.ENABLED
+
+    def order_size_selected(self) -> bool:
+        return self.cursor_target == CursorTarget.ORDER_SIZE
 
     def _evaluate_open(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
         if spread_pct is None:
@@ -279,17 +293,23 @@ class GradientStrategyState:
     def _commit_edit(self) -> None:
         if self.edit_buffer is None:
             return
-        row = self.current_row()
         value = self._parse_decimal(self.edit_buffer)
-        if self.cursor_field == EditableField.THRESHOLD:
-            row.threshold_pct = value
+        if self.cursor_target == CursorTarget.ORDER_SIZE:
+            if value is not None:
+                self.single_order_qty = value
         else:
-            row.target_qty = value
+            row = self.current_row()
+            if self.cursor_field == EditableField.THRESHOLD:
+                row.threshold_pct = value
+            else:
+                row.target_qty = value
         self.edit_buffer = None
 
     def _current_field_value(self) -> Decimal | None:
         if self.cursor_target == CursorTarget.ENABLED:
             return None
+        if self.cursor_target == CursorTarget.ORDER_SIZE:
+            return self.single_order_qty
         row = self.current_row()
         return row.threshold_pct if self.cursor_field == EditableField.THRESHOLD else row.target_qty
 
@@ -307,7 +327,10 @@ class GradientStrategyState:
         return value
 
     def _flat_cursor_rows(self) -> list[tuple[CursorTarget, StrategySection | None, int | None]]:
-        rows: list[tuple[CursorTarget, StrategySection | None, int | None]] = [(CursorTarget.ENABLED, None, None)]
+        rows: list[tuple[CursorTarget, StrategySection | None, int | None]] = [
+            (CursorTarget.ENABLED, None, None),
+            (CursorTarget.ORDER_SIZE, None, None),
+        ]
         rows.extend((CursorTarget.ROW, StrategySection.OPEN, index) for index in range(len(self.open_rows)))
         rows.extend((CursorTarget.ROW, StrategySection.CLOSE, index) for index in range(len(self.close_rows)))
         return rows
@@ -315,6 +338,8 @@ class GradientStrategyState:
     def _flat_cursor_position(self, flat: list[tuple[CursorTarget, StrategySection | None, int | None]]) -> int:
         if self.cursor_target == CursorTarget.ENABLED:
             return 0
+        if self.cursor_target == CursorTarget.ORDER_SIZE:
+            return 1
         current = (self.cursor_section, self.cursor_index)
         for index, (target, section, row_index) in enumerate(flat):
             if target == CursorTarget.ROW and (section, row_index) == current:

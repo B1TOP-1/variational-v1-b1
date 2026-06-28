@@ -373,9 +373,10 @@ class VariationalToLighterRuntime:
 
         self.gradient_strategy = GradientStrategyState.default()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._last_prepared_order_sig: tuple[str, str] | None = None
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
-        self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal] = BrowserOrderDispatchQueue(
-            self._send_browser_order_dry_run
+        self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal | BrowserOrderCommand] = (
+            BrowserOrderDispatchQueue(self._send_browser_order_task)
         )
 
     def print_startup_next_steps(self) -> None:
@@ -442,12 +443,16 @@ class VariationalToLighterRuntime:
             self.shutdown()
         elif key == "\t":
             self.current_page = 2 if self.current_page == 1 else 1
+            if self.current_page == 2:
+                self._schedule_prepare_browser_order()
         elif self.current_page == 2:
-            self.gradient_strategy.handle_key(key)
+            if self.gradient_strategy.handle_key(key):
+                self._schedule_prepare_browser_order()
         elif key == "1":
             self.current_page = 1
         elif key == "2":
             self.current_page = 2
+            self._schedule_prepare_browser_order()
 
     def restore_keyboard(self) -> None:
         if self._stdin_fd is None:
@@ -1331,9 +1336,54 @@ class VariationalToLighterRuntime:
     def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
         self._browser_order_queue.submit(signal)
 
+    def _prepared_order_side(self) -> str:
+        if self.gradient_strategy.cursor_section == StrategySection.CLOSE:
+            return "sell"
+        return "buy"
+
+    def _schedule_prepare_browser_order(self) -> None:
+        qty = self.gradient_strategy.single_order_qty
+        if qty <= 0:
+            return
+        side = self._prepared_order_side()
+        prepare_sig = (side, format(qty, "f"))
+        if prepare_sig == self._last_prepared_order_sig:
+            return
+        self._browser_order_queue.submit(BrowserOrderCommand(side=side, qty=qty, dry_run=True, prepare_only=True))
+
+    async def _send_browser_order_task(self, task: GradientSignal | BrowserOrderCommand) -> None:
+        if isinstance(task, BrowserOrderCommand):
+            await self._send_prepare_browser_order(task)
+            return
+        await self._send_browser_order_dry_run(task)
+
+    async def _send_prepare_browser_order(self, command: BrowserOrderCommand) -> None:
+        try:
+            result = await self.browser_order_broker.place_order(command, timeout=25.0)
+        except Exception as exc:
+            self.logger.warning(
+                "Browser order prepare failed: side=%s qty=%s error=%s",
+                command.side,
+                decimal_to_str(command.qty),
+                exc,
+            )
+            return
+        self.logger.info(
+            "Browser order prepare result: side=%s qty=%s ok=%s blocked=%s error=%s",
+            command.side,
+            decimal_to_str(command.qty),
+            result.get("ok"),
+            result.get("blockedReason"),
+            result.get("error"),
+        )
+        if result.get("ok"):
+            side = "sell" if command.side.strip().lower() == "sell" else "buy"
+            self._last_prepared_order_sig = (side, format(command.qty, "f"))
+
     async def _send_browser_order_dry_run(self, signal: GradientSignal) -> None:
         side = "buy" if signal.action == "open" else "sell"
-        command = BrowserOrderCommand(side=side, qty=signal.delta_qty, dry_run=True)
+        qty = min(self.gradient_strategy.single_order_qty, signal.delta_qty)
+        command = BrowserOrderCommand(side=side, qty=qty, dry_run=True)
         try:
             result = await self.browser_order_broker.place_order(command, timeout=25.0)
         except Exception as exc:
@@ -1374,6 +1424,7 @@ class VariationalToLighterRuntime:
                 f"触发 {signal.threshold_pct:f}%"
             )
         strategy_table.add_row(self._strategy_enabled_row_text())
+        strategy_table.add_row(self._strategy_single_order_qty_row_text())
         strategy_table.add_row(f"当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
         strategy_table.add_row("")
         strategy_table.add_row(
@@ -1399,6 +1450,15 @@ class VariationalToLighterRuntime:
         icon = "[OK]" if self.gradient_strategy.enabled else "[ ]"
         status_text = "启动触发策略"
         row_text = f"{cursor} {icon} {status_text}"
+        if selected:
+            return f"[reverse]{row_text}[/]"
+        return row_text
+
+    def _strategy_single_order_qty_row_text(self) -> str:
+        selected = self.gradient_strategy.order_size_selected()
+        cursor = ">" if selected else " "
+        qty_text = self.gradient_strategy.display_single_order_qty()
+        row_text = f"{cursor} 单次下单数量: {qty_text} {self.ticker}"
         if selected:
             return f"[reverse]{row_text}[/]"
         return row_text
@@ -1818,6 +1878,7 @@ class VariationalToLighterRuntime:
             self.browser_order_broker,
         )
         self._browser_order_queue.start()
+        self._schedule_prepare_browser_order()
         self.print_startup_next_steps()
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s; browser orders on ws://%s:%s",

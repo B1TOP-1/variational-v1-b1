@@ -10,6 +10,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         self.assertEqual(len(state.open_rows), 1)
         self.assertEqual(len(state.close_rows), 1)
+        self.assertEqual(state.single_order_qty, Decimal("0.001"))
         self.assertEqual(state.cursor_target, CursorTarget.ENABLED)
         self.assertFalse(state.enabled)
 
@@ -17,6 +18,7 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertTrue(state.enabled)
         state.handle_key("\r")
         self.assertFalse(state.enabled)
+        state.handle_key("\x1b[B")
         state.handle_key("\x1b[B")
 
         self.assertEqual(state.cursor_section, StrategySection.OPEN)
@@ -39,6 +41,26 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(state.open_rows[0].threshold_pct, Decimal("1.11"))
         self.assertEqual(state.open_rows[0].target_qty, Decimal("0.001"))
 
+    def test_single_order_qty_is_editable_before_gradient_rows(self):
+        state = GradientStrategyState.default()
+
+        state.handle_key("\x1b[B")
+        self.assertEqual(state.cursor_target, CursorTarget.ORDER_SIZE)
+
+        state.handle_key("0")
+        state.handle_key(".")
+        state.handle_key("0")
+        state.handle_key("0")
+        state.handle_key("2")
+        state.handle_key("\r")
+
+        self.assertEqual(state.single_order_qty, Decimal("0.002"))
+
+        state.handle_key("\x1b[B")
+        self.assertEqual(state.cursor_target, CursorTarget.ROW)
+        self.assertEqual(state.cursor_section, StrategySection.OPEN)
+        self.assertEqual(state.cursor_index, 0)
+
     def test_enabled_row_ignores_editing_keys(self):
         state = GradientStrategyState.default()
 
@@ -47,6 +69,7 @@ class GradientStrategyStateTest(unittest.TestCase):
         state.handle_key("1")
         state.handle_key(".")
         state.handle_key("\x7f")
+        state.handle_key("\x1b[B")
         state.handle_key("\x1b[B")
 
         self.assertEqual(len(state.open_rows), 1)
@@ -58,6 +81,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_add_delete_and_navigation(self):
         state = GradientStrategyState.default()
+        state.handle_key("\x1b[B")
         state.handle_key("\x1b[B")
 
         state.handle_key("+")

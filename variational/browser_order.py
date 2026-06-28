@@ -18,6 +18,7 @@ class BrowserOrderCommand:
     side: str
     qty: Decimal
     dry_run: bool = True
+    prepare_only: bool = False
     submit_method: str = "js_dispatch_mouse"
     timeout_ms: int = 20000
     wait_after_side_ms: int = 30
@@ -26,12 +27,17 @@ class BrowserOrderCommand:
     wait_before_submit_ms: int = 0
     wait_after_click_ms: int = 0
 
+    @property
+    def action(self) -> str:
+        return "prepare_browser_order" if self.prepare_only else "place_browser_order"
+
     def to_payload(self) -> dict[str, Any]:
         side = "sell" if self.side.strip().lower() == "sell" else "buy"
         return {
             "side": side,
             "qty": format(self.qty, "f"),
             "dryRun": bool(self.dry_run),
+            "prepareOnly": bool(self.prepare_only),
             "simulateOnly": False,
             "timeoutMs": int(self.timeout_ms),
             "waitAfterSideMs": int(self.wait_after_side_ms),
@@ -94,7 +100,7 @@ class BrowserOrderBroker:
                 json.dumps(
                     {
                         "id": message_id,
-                        "action": "place_browser_order",
+                        "action": command.action,
                         "payload": command.to_payload(),
                     },
                     ensure_ascii=True,
