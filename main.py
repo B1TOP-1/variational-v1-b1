@@ -67,9 +67,8 @@ CST_TZ = timezone(timedelta(hours=8))
 # the hourly/orders table frames). Remaining terminal height is split between
 # the hourly-history and recent-orders rows so the dashboard fits one screen.
 DASHBOARD_FIXED_OVERHEAD_LINES = 30
-# Binance USDCUSDT spot price = USDT per 1 USDC; used to normalize Lighter's
-# USDT-quoted prices into Variational's USDC quote so the cross-venue spread no
-# longer drifts with the stablecoin basis.
+# Binance USDCUSDT spot price = USDT per 1 USDC. This is displayed and logged as
+# a reference basis signal; it must not rewrite the raw cross-venue price spread.
 BINANCE_USDCUSDT_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
 USDC_USDT_POLL_SECONDS = 10.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
@@ -152,6 +151,17 @@ def book_spread_percent(bid: Decimal | None, ask: Decimal | None) -> Decimal | N
     return ((ask - bid) / mid) * Decimal("100")
 
 
+def cross_spread_percentages(
+    var_bid: Decimal | None,
+    var_ask: Decimal | None,
+    lighter_bid: Decimal | None,
+    lighter_ask: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
+    short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+    return long_var_short_lighter_pct, short_var_long_lighter_pct
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
     if lowered == "confirmed":
@@ -179,8 +189,8 @@ class OrderLifecycle:
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
 
-    # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills, so the
-    # directional fill spread and PnL normalize at the real fill-time rate.
+    # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills. This is a
+    # reference basis value only; raw price spread and PnL do not normalize by it.
     fill_usdc_usdt_rate: Decimal | None = None
 
     def to_payload(self) -> dict[str, Any]:
@@ -307,7 +317,7 @@ class VariationalToLighterRuntime:
         self.dashboard_task: asyncio.Task[None] | None = None
         self.usdc_usdt_task: asyncio.Task[None] | None = None
 
-        # USDT->USDC normalization (Binance USDCUSDT = USDT per 1 USDC).
+        # USDC/USDT basis reference (Binance USDCUSDT = USDT per 1 USDC).
         self.usdc_usdt_rate: Decimal | None = None
 
         # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
@@ -405,7 +415,7 @@ class VariationalToLighterRuntime:
         self._stdin_fd = None
 
     async def update_usdc_usdt_rate_loop(self) -> None:
-        """Poll Binance USDCUSDT (USDT per 1 USDC) for spread normalization."""
+        """Poll Binance USDCUSDT (USDT per 1 USDC) as an independent basis signal."""
         while not self.stop_flag:
             try:
                 rate = await asyncio.to_thread(self._fetch_usdc_usdt_rate)
@@ -1016,12 +1026,7 @@ class VariationalToLighterRuntime:
         lighter_fill_price: Decimal | None,
         rate: Decimal | None = None,
     ) -> tuple[Decimal | None, Decimal | None]:
-        # Only the derived spread is normalized: the Lighter (USDT) leg is
-        # converted to USDC for the subtraction. Displayed fill prices are
-        # untouched elsewhere — these are the real venue fills.
         lighter = lighter_fill_price
-        if lighter is not None and rate and rate > 0:
-            lighter = lighter / rate
         side_n = side.strip().lower()
         if side_n == "buy":
             # Long Var / Short Lighter: lighter_fill - var_fill
@@ -1145,14 +1150,11 @@ class VariationalToLighterRuntime:
         return HOURLY_HISTORY_HOURS, order_rows
 
     def _record_unit_spread(self, record: OrderLifecycle) -> Decimal | None:
-        """Direction-adjusted, USDC-normalized per-unit captured spread for a fully
+        """Direction-adjusted raw per-unit captured spread for a fully
         filled round (both legs). None if either leg is missing."""
         if record.var_fill_price is None or record.lighter_fill_price is None:
             return None
         lighter = record.lighter_fill_price
-        rate = record.fill_usdc_usdt_rate or self.usdc_usdt_rate
-        if rate and rate > 0:
-            lighter = lighter / rate
         side = record.side.strip().lower()
         if side == "buy":  # long Var / short Lighter: lighter - var
             return lighter - record.var_fill_price
@@ -1353,22 +1355,19 @@ class VariationalToLighterRuntime:
         if var_book_spread_pct is not None and lighter_book_spread_pct is not None:
             spread_color_baseline = (var_book_spread_pct + lighter_book_spread_pct) / Decimal("2")
 
-        # Depth-aware signal: use the VWAP to fill --depth-notional along the
-        # Lighter book (not just top-of-book), then normalize that USDT VWAP into
-        # Variational's USDC quote. Var leg stays top-of-book (no Var depth feed).
+        # Depth-aware signal: use the raw VWAP to fill --depth-notional along the
+        # Lighter book (not just top-of-book). USDC/USDT basis is displayed as a
+        # separate reference signal and does not rewrite the trigger spread.
         depth_notional = Decimal(str(self.args.depth_notional))
         vwap_bid, vwap_ask = await self.get_lighter_depth_quote(depth_notional)
         sig_bid = vwap_bid if vwap_bid is not None else lighter_bid
         sig_ask = vwap_ask if vwap_ask is not None else lighter_ask
-        rate = self.usdc_usdt_rate
-        if rate and rate > 0:
-            sig_bid_usdc = sig_bid / rate if sig_bid is not None else None
-            sig_ask_usdc = sig_ask / rate if sig_ask is not None else None
-        else:
-            sig_bid_usdc, sig_ask_usdc = sig_bid, sig_ask
-
-        long_var_short_lighter_pct = spread_percent(spread_value(var_ask, sig_bid_usdc), var_ask)
-        short_var_long_lighter_pct = spread_percent(spread_value(sig_ask_usdc, var_bid), sig_ask_usdc)
+        long_var_short_lighter_pct, short_var_long_lighter_pct = cross_spread_percentages(
+            var_bid,
+            var_ask,
+            sig_bid,
+            sig_ask,
+        )
         self._record_cross_spreads(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
@@ -1431,8 +1430,8 @@ class VariationalToLighterRuntime:
         col_qty = "数量" if is_zh else "Qty"
         col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
         col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
-        col_fill_diff = "成交价差(归一)" if is_zh else "Fill Diff (norm)"
-        col_fill_diff_pct = "成交价差%(归一)" if is_zh else "Fill Diff % (norm)"
+        col_fill_diff = "成交价差" if is_zh else "Fill Diff"
+        col_fill_diff_pct = "成交价差%" if is_zh else "Fill Diff %"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = f"Lighter (深度${depth_n})" if is_zh else f"Lighter (depth ${depth_n})"
@@ -1659,8 +1658,8 @@ class VariationalToLighterRuntime:
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "fill_usdc_usdt_rate": payload["fill_usdc_usdt_rate"],
-                        "fill_diff_var_minus_lighter_norm": decimal_to_str(fill_diff),
-                        "fill_diff_pct_vs_var_norm": decimal_to_str(fill_diff_pct),
+                        "fill_diff": decimal_to_str(fill_diff),
+                        "fill_diff_pct": decimal_to_str(fill_diff_pct),
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
@@ -1686,8 +1685,8 @@ class VariationalToLighterRuntime:
             "lighter_filled_price",
             "lighter_filled_at",
             "fill_usdc_usdt_rate",
-            "fill_diff_var_minus_lighter_norm",
-            "fill_diff_pct_vs_var_norm",
+            "fill_diff",
+            "fill_diff_pct",
             "auto_hedge_enabled",
             "hedge_error",
             "last_variational_status",
