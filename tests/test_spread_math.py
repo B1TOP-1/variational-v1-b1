@@ -1,7 +1,14 @@
 import unittest
+import time
 from decimal import Decimal
 
-from main import OrderLifecycle, VariationalToLighterRuntime, cross_spread_percentages
+from main import (
+    OrderLifecycle,
+    PENDING_TRIGGER_SPREAD_TTL_SECONDS,
+    PendingTriggerSpread,
+    VariationalToLighterRuntime,
+    cross_spread_percentages,
+)
 
 
 class SpreadMathTest(unittest.TestCase):
@@ -44,6 +51,47 @@ class SpreadMathTest(unittest.TestCase):
         )
 
         self.assertEqual(runtime._record_unit_spread(record), Decimal("1"))
+
+    def test_spread_slippage_is_actual_fill_pct_minus_trigger_pct(self):
+        record = OrderLifecycle(
+            trade_key="trade",
+            trade_id="trade",
+            side="buy",
+            qty=Decimal("1"),
+            asset="BTC",
+            auto_hedge_enabled=False,
+            last_variational_status="filled",
+            var_fill_price=Decimal("100"),
+            lighter_fill_price=Decimal("100.011"),
+            trigger_spread_pct=Decimal("0.0100"),
+        )
+
+        self.assertEqual(record.spread_slippage_pct(), Decimal("0.00100"))
+
+    def test_pending_trigger_spread_binds_by_side_fifo(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        now = time.monotonic()
+        runtime._pending_trigger_spreads = [
+            PendingTriggerSpread(side="buy", spread_pct=Decimal("0.0125"), created_at_monotonic=now),
+            PendingTriggerSpread(side="sell", spread_pct=Decimal("0.0300"), created_at_monotonic=now),
+        ]
+
+        self.assertEqual(runtime._consume_pending_trigger_spread("buy"), Decimal("0.0125"))
+        self.assertEqual(len(runtime._pending_trigger_spreads), 1)
+        self.assertEqual(runtime._pending_trigger_spreads[0].side, "sell")
+
+    def test_expired_pending_trigger_spread_is_not_bound(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime._pending_trigger_spreads = [
+            PendingTriggerSpread(
+                side="buy",
+                spread_pct=Decimal("0.0125"),
+                created_at_monotonic=time.monotonic() - PENDING_TRIGGER_SPREAD_TTL_SECONDS - 1,
+            ),
+        ]
+
+        self.assertIsNone(runtime._consume_pending_trigger_spread("buy"))
+        self.assertEqual(runtime._pending_trigger_spreads, [])
 
 
 if __name__ == "__main__":

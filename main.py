@@ -72,6 +72,7 @@ DASHBOARD_FIXED_OVERHEAD_LINES = 30
 BINANCE_USDCUSDT_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
 USDC_USDT_POLL_SECONDS = 10.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
+PENDING_TRIGGER_SPREAD_TTL_SECONDS = 30.0
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
@@ -162,6 +163,28 @@ def cross_spread_percentages(
     return long_var_short_lighter_pct, short_var_long_lighter_pct
 
 
+def fill_diff_by_direction(
+    side: str,
+    var_fill_price: Decimal | None,
+    lighter_fill_price: Decimal | None,
+) -> tuple[Decimal | None, Decimal | None]:
+    lighter = lighter_fill_price
+    side_n = side.strip().lower()
+    if side_n == "buy":
+        # Long Var / Short Lighter: lighter_fill - var_fill
+        diff = spread_value(var_fill_price, lighter)
+        pct = spread_percent(diff, var_fill_price)
+        return diff, pct
+    if side_n == "sell":
+        # Short Var / Long Lighter: var_fill - lighter_fill
+        diff = spread_value(lighter, var_fill_price)
+        pct = spread_percent(diff, lighter)
+        return diff, pct
+    diff = spread_value(lighter, var_fill_price)
+    pct = spread_percent(diff, var_fill_price)
+    return diff, pct
+
+
 def normalize_variational_status(status: str) -> str:
     lowered = status.strip().lower()
     if lowered == "confirmed":
@@ -192,6 +215,7 @@ class OrderLifecycle:
     # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills. This is a
     # reference basis value only; raw price spread and PnL do not normalize by it.
     fill_usdc_usdt_rate: Decimal | None = None
+    trigger_spread_pct: Decimal | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -207,10 +231,31 @@ class OrderLifecycle:
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "fill_usdc_usdt_rate": decimal_to_str(self.fill_usdc_usdt_rate),
+            "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
+            "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
             "auto_hedge_enabled": self.auto_hedge_enabled,
             "hedge_error": self.hedge_error,
             "last_variational_status": self.last_variational_status,
         }
+
+    def spread_slippage_pct(self) -> Decimal | None:
+        if self.trigger_spread_pct is None:
+            return None
+        _diff, fill_pct = fill_diff_by_direction(
+            self.side,
+            self.var_fill_price,
+            self.lighter_fill_price,
+        )
+        if fill_pct is None:
+            return None
+        return fill_pct - self.trigger_spread_pct
+
+
+@dataclass(frozen=True, slots=True)
+class PendingTriggerSpread:
+    side: str
+    spread_pct: Decimal
+    created_at_monotonic: float
 
 
 class VariationalRuntime:
@@ -328,6 +373,7 @@ class VariationalToLighterRuntime:
 
         self.gradient_strategy = GradientStrategyState.default()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._pending_trigger_spreads: list[PendingTriggerSpread] = []
         self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal] = BrowserOrderDispatchQueue(
             self._send_browser_order_dry_run
         )
@@ -918,6 +964,7 @@ class VariationalToLighterRuntime:
                     asset=asset if asset else "UNKNOWN",
                     auto_hedge_enabled=self.args.auto_hedge,
                     last_variational_status=status,
+                    trigger_spread_pct=self._consume_pending_trigger_spread(side),
                 )
                 self.records[key] = record
                 self.record_order.append(key)
@@ -998,6 +1045,14 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
+    def _fmt_fill_pct_with_slippage(self, fill_pct: Decimal | None, slippage_pct: Decimal | None) -> str:
+        fill_text = self._fmt_pct(fill_pct)
+        if slippage_pct is None:
+            return fill_text
+        color = "green" if slippage_pct >= 0 else "red"
+        sign = "+" if slippage_pct >= 0 else ""
+        return f"{fill_text} [{color}]({sign}{slippage_pct:.4f}%)[/{color}]"
+
     def _fmt_signal_pct(
         self,
         current: Decimal | None,
@@ -1026,21 +1081,7 @@ class VariationalToLighterRuntime:
         lighter_fill_price: Decimal | None,
         rate: Decimal | None = None,
     ) -> tuple[Decimal | None, Decimal | None]:
-        lighter = lighter_fill_price
-        side_n = side.strip().lower()
-        if side_n == "buy":
-            # Long Var / Short Lighter: lighter_fill - var_fill
-            diff = spread_value(var_fill_price, lighter)
-            pct = spread_percent(diff, var_fill_price)
-            return diff, pct
-        if side_n == "sell":
-            # Short Var / Long Lighter: var_fill - lighter_fill
-            diff = spread_value(lighter, var_fill_price)
-            pct = spread_percent(diff, lighter)
-            return diff, pct
-        diff = spread_value(lighter, var_fill_price)
-        pct = spread_percent(diff, var_fill_price)
-        return diff, pct
+        return fill_diff_by_direction(side, var_fill_price, lighter_fill_price)
 
     @staticmethod
     def _decimal_as_float(value: Decimal | None) -> float | None:
@@ -1247,8 +1288,32 @@ class VariationalToLighterRuntime:
                 decimal_to_str(signal.target_qty),
                 decimal_to_str(signal.delta_qty),
             )
+            self._record_pending_trigger_spread(signal)
             self._schedule_browser_order_dry_run(signal)
         return signal
+
+    def _record_pending_trigger_spread(self, signal: GradientSignal) -> None:
+        side = "buy" if signal.action == "open" else "sell"
+        self._drop_expired_pending_trigger_spreads()
+        self._pending_trigger_spreads.append(
+            PendingTriggerSpread(side=side, spread_pct=signal.spread_pct, created_at_monotonic=time.monotonic())
+        )
+        if len(self._pending_trigger_spreads) > 100:
+            del self._pending_trigger_spreads[:-100]
+
+    def _consume_pending_trigger_spread(self, side: str) -> Decimal | None:
+        self._drop_expired_pending_trigger_spreads()
+        side_n = side.strip().lower()
+        for index, pending in enumerate(self._pending_trigger_spreads):
+            if pending.side == side_n:
+                return self._pending_trigger_spreads.pop(index).spread_pct
+        return None
+
+    def _drop_expired_pending_trigger_spreads(self) -> None:
+        cutoff = time.monotonic() - PENDING_TRIGGER_SPREAD_TTL_SECONDS
+        self._pending_trigger_spreads = [
+            pending for pending in self._pending_trigger_spreads if pending.created_at_monotonic >= cutoff
+        ]
 
     def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
         self._browser_order_queue.submit(signal)
@@ -1544,6 +1609,7 @@ class VariationalToLighterRuntime:
                     row.lighter_fill_price,
                     row.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
+                slippage_pct = row.spread_slippage_pct()
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
                 orders_table.add_row(
@@ -1553,7 +1619,7 @@ class VariationalToLighterRuntime:
                     payload["variational_filled_price"] or "-",
                     payload["lighter_filled_price"] or "-",
                     self._fmt_price(fill_diff),
-                    self._fmt_pct(fill_diff_pct),
+                    self._fmt_fill_pct_with_slippage(fill_diff_pct, slippage_pct),
                 )
 
         hourly_title = (
@@ -1641,6 +1707,7 @@ class VariationalToLighterRuntime:
                     record.lighter_fill_price,
                     record.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
+                slippage_pct = record.spread_slippage_pct()
                 side_zh, side_en = self._direction_labels(record.side)
                 rows.append(
                     {
@@ -1658,8 +1725,10 @@ class VariationalToLighterRuntime:
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "fill_usdc_usdt_rate": payload["fill_usdc_usdt_rate"],
+                        "trigger_spread_pct": payload["trigger_spread_pct"],
                         "fill_diff": decimal_to_str(fill_diff),
                         "fill_diff_pct": decimal_to_str(fill_diff_pct),
+                        "spread_slippage_pct": decimal_to_str(slippage_pct),
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
@@ -1685,8 +1754,10 @@ class VariationalToLighterRuntime:
             "lighter_filled_price",
             "lighter_filled_at",
             "fill_usdc_usdt_rate",
+            "trigger_spread_pct",
             "fill_diff",
             "fill_diff_pct",
+            "spread_slippage_pct",
             "auto_hedge_enabled",
             "hedge_error",
             "last_variational_status",
