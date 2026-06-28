@@ -631,15 +631,6 @@ async function handlePlaceBrowserOrder(payload) {
   const qty = payload?.qty == null ? null : String(payload.qty).trim();
   const prepareOnly = Boolean(payload?.prepareOnly);
   const dryRun = payload?.dryRun !== false;
-  if (!dryRun) {
-    return {
-      ok: false,
-      side,
-      qty,
-      dryRun,
-      error: "live_submit_disabled"
-    };
-  }
 
   const locate = await runInTab(tabId, locateOrderElementsInPage, [side]);
   if (!locate?.sideButtonRect) {
@@ -665,6 +656,36 @@ async function handlePlaceBrowserOrder(payload) {
     }
   }
   const after = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side }]);
+  if (!dryRun && !prepareOnly) {
+    if (!after?.submitButtonRect) {
+      return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_missing" };
+    }
+    if (after.submitButtonDisabled) {
+      return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_disabled" };
+    }
+    const waitBeforeSubmitMs = Math.max(0, Number(payload?.waitBeforeSubmitMs ?? 0));
+    if (waitBeforeSubmitMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitBeforeSubmitMs));
+    }
+    await dispatchTrustedClick(tabId, after.submitButtonRect);
+    const waitAfterClickMs = Math.max(0, Number(payload?.waitAfterClickMs ?? 0));
+    if (waitAfterClickMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, waitAfterClickMs));
+    }
+    const submitted = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side }]);
+    return {
+      ok: true,
+      attachedTabId: tabId,
+      side,
+      qty,
+      dryRun,
+      prepareOnly,
+      submitMethod: payload?.submitMethod || "js_dispatch_mouse",
+      before,
+      after: submitted,
+      blockedReason: null
+    };
+  }
   return {
     ok: true,
     attachedTabId: tabId,

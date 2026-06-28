@@ -92,9 +92,9 @@ python main.py --lang en
 - `+`：在当前区新增一条梯度。
 - `-`：删除当前梯度；每个区至少保留一行，删除最后一行会清空参数。
 
-开仓区默认信号源为“做多 Variational / 做空 Lighter”，清仓区默认信号源为“做空 Variational / 做多 Lighter”。每个梯度的仓位表示目标总仓位；触发信号只记录应开/应清的差额，不会直接下单。
+开仓区默认信号源为“做多 Variational / 做空 Lighter”，清仓区默认信号源为“做空 Variational / 做多 Lighter”。每个梯度的仓位表示目标总仓位；触发信号会按 `min(单次下单数量, 距离目标仓位差额)` 执行。
 
-Chrome 插件启动后会同时连接浏览器下单 broker，默认地址为 `ws://127.0.0.1:8768`。当前策略信号只执行 dry-run：插件会在 Variational 页面选择买卖方向并填入数量，但不会点击提交真实订单。
+Chrome 插件启动后会同时连接浏览器下单 broker，默认地址为 `ws://127.0.0.1:8768`。策略信号触发后会创建一条本地策略订单记录，并同时提交 Variational 浏览器订单和 Lighter 对冲单；Lighter 不等待 Variational 成交确认。后续两边成交事件会分别回填到同一条策略记录，用于成交价差和滑点统计。`--no-hedge` 只关闭 Lighter 自动对冲，不会关闭 Variational 浏览器下单。
 
 ### 输出日志
 默认目录：`./log`
@@ -196,9 +196,9 @@ The strategy is disabled by default. Entering values only saves configuration; m
 - `+`: add one gradient row in the current section.
 - `-`: delete the selected gradient row; the last row in a section is cleared instead of removed.
 
-The open section uses `Long Variational / Short Lighter`; the close section uses `Short Variational / Long Lighter`. Each row's position is the target total position. Trigger signals only log the required open/close delta and do not place orders.
+The open section uses `Long Variational / Short Lighter`; the close section uses `Short Variational / Long Lighter`. Each row's position is the target total position. Trigger signals execute `min(single order qty, distance to target position)`.
 
-After the Chrome extension starts, it also connects to the browser order broker at `ws://127.0.0.1:8768` by default. Strategy signals currently run dry-run browser orders only: the extension selects the side and fills the quantity on the Variational page, but it does not submit live orders.
+After the Chrome extension starts, it also connects to the browser order broker at `ws://127.0.0.1:8768` by default. A strategy signal creates one local strategy order record, submits the Variational browser order, and submits the Lighter hedge immediately; Lighter does not wait for Variational fill confirmation. Later fills from both venues update the same strategy record for fill spread and slippage statistics. `--no-hedge` disables only Lighter auto-hedging, not the Variational browser order.
 
 ### Output Logs
 Default path: `./log`

@@ -211,11 +211,15 @@ class OrderLifecycle:
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
+    var_order_error: str | None = None
 
     # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills. This is a
     # reference basis value only; raw price spread and PnL do not normalize by it.
     fill_usdc_usdt_rate: Decimal | None = None
     trigger_spread_pct: Decimal | None = None
+    strategy_action: str | None = None
+    strategy_target_qty: Decimal | None = None
+    strategy_current_qty: Decimal | None = None
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -233,7 +237,11 @@ class OrderLifecycle:
             "fill_usdc_usdt_rate": decimal_to_str(self.fill_usdc_usdt_rate),
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
             "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
+            "strategy_action": self.strategy_action,
+            "strategy_target_qty": decimal_to_str(self.strategy_target_qty),
+            "strategy_current_qty": decimal_to_str(self.strategy_current_qty),
             "auto_hedge_enabled": self.auto_hedge_enabled,
+            "var_order_error": self.var_order_error,
             "hedge_error": self.hedge_error,
             "last_variational_status": self.last_variational_status,
         }
@@ -327,6 +335,7 @@ class VariationalToLighterRuntime:
         self.records: dict[str, OrderLifecycle] = {}
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
+        self._pending_variational_strategy_order_keys: deque[str] = deque()
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         self.hourly_spread_buckets: dict[int, dict[str, list[float]]] = {}
@@ -376,7 +385,7 @@ class VariationalToLighterRuntime:
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
-        self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal | BrowserOrderCommand] = (
+        self._browser_order_queue: BrowserOrderDispatchQueue[BrowserOrderCommand] = (
             BrowserOrderDispatchQueue(self._send_browser_order_task)
         )
 
@@ -547,6 +556,8 @@ class VariationalToLighterRuntime:
             self.records.clear()
             self.record_order.clear()
             self.lighter_client_order_to_trade_key.clear()
+            self._pending_variational_strategy_order_keys.clear()
+            self._pending_trigger_spreads.clear()
         self.cross_spread_history.clear()
         self.hourly_spread_buckets.clear()
         async with self._trade_csv_write_lock:
@@ -925,6 +936,116 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
 
+    def _make_strategy_trade_key(self) -> str:
+        return f"strategy:{time.time_ns()}"
+
+    def _create_strategy_order_from_signal(self, signal: GradientSignal, side: str, qty: Decimal) -> OrderLifecycle:
+        trade_key = self._make_strategy_trade_key()
+        while trade_key in self.records:
+            trade_key = f"strategy:{int(time.time() * 1000) + len(self.records)}"
+        asset = self.variational_ticker or self.ticker or "UNKNOWN"
+        record = OrderLifecycle(
+            trade_key=trade_key,
+            trade_id="",
+            side=side,
+            qty=qty,
+            asset=asset,
+            auto_hedge_enabled=self.args.auto_hedge,
+            last_variational_status="strategy_submitted",
+            lighter_side="SELL" if side == "buy" else "BUY",
+            trigger_spread_pct=signal.spread_pct,
+            strategy_action=signal.action,
+            strategy_target_qty=signal.target_qty,
+            strategy_current_qty=signal.current_qty,
+        )
+        self.records[trade_key] = record
+        self.record_order.append(trade_key)
+        self._queue_pending_variational_strategy_order(record)
+        return record
+
+    def _queue_pending_variational_strategy_order(self, record: OrderLifecycle) -> None:
+        self._pending_variational_strategy_order_keys.append(record.trade_key)
+        while len(self._pending_variational_strategy_order_keys) > 100:
+            if isinstance(self._pending_variational_strategy_order_keys, deque):
+                self._pending_variational_strategy_order_keys.popleft()
+            else:
+                self._pending_variational_strategy_order_keys.pop(0)
+
+    def _match_pending_variational_strategy_order(self, side: str, qty: Decimal, asset: str) -> OrderLifecycle | None:
+        side_n = side.strip().lower()
+        asset_n = asset.strip().upper()
+        for trade_key in list(self._pending_variational_strategy_order_keys):
+            record = self.records.get(trade_key)
+            if record is None:
+                with contextlib.suppress(ValueError):
+                    self._pending_variational_strategy_order_keys.remove(trade_key)
+                continue
+            record_assets = self._equivalent_assets(record.asset)
+            if record.side == side_n and record.qty == qty and asset_n in record_assets:
+                with contextlib.suppress(ValueError):
+                    self._pending_variational_strategy_order_keys.remove(trade_key)
+                return record
+        return None
+
+    @staticmethod
+    def _equivalent_assets(asset: str) -> set[str]:
+        normalized = asset.strip().upper()
+        if not normalized:
+            return set()
+        return {
+            normalized,
+            resolve_lighter_ticker(normalized),
+            resolve_variational_ticker(normalized),
+        }
+
+    def _handle_new_gradient_signal(self, signal: GradientSignal) -> OrderLifecycle | None:
+        side = "buy" if signal.action == "open" else "sell"
+        qty = min(self.gradient_strategy.single_order_qty, signal.delta_qty)
+        if qty <= 0:
+            return None
+
+        record = self._create_strategy_order_from_signal(signal, side, qty)
+        self._browser_order_queue.submit(BrowserOrderCommand(side=side, qty=qty, dry_run=False, trade_key=record.trade_key))
+        self._schedule_background_task(self._log_strategy_order_created(record))
+        if self.args.auto_hedge:
+            self._schedule_background_task(self.place_lighter_order(record))
+
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "Strategy order created: key=%s action=%s var_side=%s lighter_side=%s qty=%s trigger_spread=%s",
+                record.trade_key,
+                signal.action,
+                record.side,
+                record.lighter_side,
+                decimal_to_str(record.qty),
+                decimal_to_str(record.trigger_spread_pct),
+            )
+        return record
+
+    async def _log_strategy_order_created(self, record: OrderLifecycle) -> None:
+        await self.append_order_log("strategy_order_created", record.to_payload())
+
+    @staticmethod
+    def _schedule_background_task(coro: Any) -> None:
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            close = getattr(coro, "close", None)
+            if close is not None:
+                close()
+
+    async def _record_var_order_error(self, trade_key: str | None, error: str) -> None:
+        if not trade_key:
+            return
+        async with self._record_lock:
+            record = self.records.get(trade_key)
+            if record is None:
+                return
+            record.var_order_error = error
+            payload = record.to_payload()
+        await self.append_order_log("variational_order_error", payload)
+
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -957,10 +1078,11 @@ class VariationalToLighterRuntime:
         fill_iso = str(event.get("timestamp") or now_iso)
 
         created = False
-        created_record: OrderLifecycle | None = None
 
         async with self._record_lock:
-            record = self.records.get(key)
+            record = self._match_pending_variational_strategy_order(side, qty, asset if asset else "UNKNOWN")
+            if record is None:
+                record = self.records.get(key)
             if record is None:
                 record = OrderLifecycle(
                     trade_key=key,
@@ -975,9 +1097,10 @@ class VariationalToLighterRuntime:
                 self.records[key] = record
                 self.record_order.append(key)
                 created = True
-                created_record = record
             else:
                 previous_status = record.last_variational_status
+                if trade_id:
+                    record.trade_id = trade_id
                 record.last_variational_status = status
 
             if created:
@@ -999,9 +1122,6 @@ class VariationalToLighterRuntime:
 
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
-
-        if created and created_record is not None and self.args.auto_hedge:
-            await self.place_lighter_order(created_record)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1294,9 +1414,7 @@ class VariationalToLighterRuntime:
                 decimal_to_str(signal.target_qty),
                 decimal_to_str(signal.delta_qty),
             )
-            side = "buy" if signal.action == "open" else "sell"
-            self._record_dry_run_trigger_spread(side=side, spread_pct=signal.spread_pct)
-            self._schedule_browser_order_dry_run(signal)
+            self._handle_new_gradient_signal(signal)
         return signal
 
     def _record_dry_run_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
@@ -1334,9 +1452,6 @@ class VariationalToLighterRuntime:
             pending for pending in self._pending_trigger_spreads if pending.created_at_monotonic >= cutoff
         ]
 
-    def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
-        self._browser_order_queue.submit(signal)
-
     def _schedule_prepare_browser_order(self) -> None:
         qty = self.gradient_strategy.single_order_qty
         if qty <= 0:
@@ -1347,11 +1462,11 @@ class VariationalToLighterRuntime:
             return
         self._browser_order_queue.submit(BrowserOrderCommand(side=side, qty=qty, dry_run=True, prepare_only=True))
 
-    async def _send_browser_order_task(self, task: GradientSignal | BrowserOrderCommand) -> None:
-        if isinstance(task, BrowserOrderCommand):
-            await self._send_prepare_browser_order(task)
+    async def _send_browser_order_task(self, command: BrowserOrderCommand) -> None:
+        if command.prepare_only:
+            await self._send_prepare_browser_order(command)
             return
-        await self._send_browser_order_dry_run(task)
+        await self._send_browser_order(command)
 
     async def _send_prepare_browser_order(self, command: BrowserOrderCommand) -> None:
         try:
@@ -1377,33 +1492,34 @@ class VariationalToLighterRuntime:
             self._last_prepared_order_sig = (side, format(command.qty, "f"))
             self._prepared_order_side = side
 
-    async def _send_browser_order_dry_run(self, signal: GradientSignal) -> None:
-        side = "buy" if signal.action == "open" else "sell"
-        qty = min(self.gradient_strategy.single_order_qty, signal.delta_qty)
-        command = BrowserOrderCommand(side=side, qty=qty, dry_run=True)
+    async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
+        side = "sell" if command.side.strip().lower() == "sell" else "buy"
         try:
             result = await self.browser_order_broker.place_order(command, timeout=25.0)
         except Exception as exc:
+            await self._record_var_order_error(command.trade_key, str(exc))
             self.logger.warning(
-                "Browser order dry-run failed: action=%s side=%s qty=%s error=%s",
-                signal.action,
+                "Browser order failed: side=%s qty=%s dry_run=%s error=%s",
                 side,
-                decimal_to_str(signal.delta_qty),
+                decimal_to_str(command.qty),
+                command.dry_run,
                 exc,
             )
             return
         self.logger.info(
-            "Browser order dry-run result: action=%s side=%s qty=%s ok=%s blocked=%s error=%s",
-            signal.action,
+            "Browser order result: side=%s qty=%s dry_run=%s ok=%s blocked=%s error=%s",
             side,
-            decimal_to_str(signal.delta_qty),
+            decimal_to_str(command.qty),
+            command.dry_run,
             result.get("ok"),
             result.get("blockedReason"),
             result.get("error"),
         )
+        if not result.get("ok"):
+            await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
         if result.get("ok"):
             self._prepared_order_side = side
-            self._last_prepared_order_sig = (side, format(qty, "f"))
+            self._last_prepared_order_sig = (side, format(command.qty, "f"))
 
     def _render_strategy_panel(
         self,
@@ -1799,10 +1915,14 @@ class VariationalToLighterRuntime:
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "fill_usdc_usdt_rate": payload["fill_usdc_usdt_rate"],
                         "trigger_spread_pct": payload["trigger_spread_pct"],
+                        "strategy_action": payload["strategy_action"],
+                        "strategy_target_qty": payload["strategy_target_qty"],
+                        "strategy_current_qty": payload["strategy_current_qty"],
                         "fill_diff": decimal_to_str(fill_diff),
                         "fill_diff_pct": decimal_to_str(fill_diff_pct),
                         "spread_slippage_pct": decimal_to_str(slippage_pct),
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
+                        "var_order_error": payload["var_order_error"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
                     }
@@ -1828,10 +1948,14 @@ class VariationalToLighterRuntime:
             "lighter_filled_at",
             "fill_usdc_usdt_rate",
             "trigger_spread_pct",
+            "strategy_action",
+            "strategy_target_qty",
+            "strategy_current_qty",
             "fill_diff",
             "fill_diff_pct",
             "spread_slippage_pct",
             "auto_hedge_enabled",
+            "var_order_error",
             "hedge_error",
             "last_variational_status",
         ]

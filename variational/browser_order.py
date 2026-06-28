@@ -19,6 +19,7 @@ class BrowserOrderCommand:
     qty: Decimal
     dry_run: bool = True
     prepare_only: bool = False
+    trade_key: str | None = None
     submit_method: str = "js_dispatch_mouse"
     timeout_ms: int = 20000
     wait_after_side_ms: int = 30
