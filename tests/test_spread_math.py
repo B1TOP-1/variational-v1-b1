@@ -93,6 +93,22 @@ class SpreadMathTest(unittest.TestCase):
         self.assertIsNone(runtime._consume_pending_trigger_spread("buy"))
         self.assertEqual(runtime._pending_trigger_spreads, [])
 
+    def test_dry_run_gradient_signal_does_not_create_bindable_pending_spread(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime._pending_trigger_spreads = []
+
+        runtime._record_dry_run_trigger_spread(side="buy", spread_pct=Decimal("0.0125"))
+
+        self.assertEqual(runtime._pending_trigger_spreads, [])
+
+    def test_live_trigger_spread_can_be_bound_later(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime._pending_trigger_spreads = []
+
+        runtime._record_live_trigger_spread(side="buy", spread_pct=Decimal("0.0125"))
+
+        self.assertEqual(runtime._consume_pending_trigger_spread("buy"), Decimal("0.0125"))
+
 
 if __name__ == "__main__":
     unittest.main()

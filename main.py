@@ -1288,15 +1288,28 @@ class VariationalToLighterRuntime:
                 decimal_to_str(signal.target_qty),
                 decimal_to_str(signal.delta_qty),
             )
-            self._record_pending_trigger_spread(signal)
+            side = "buy" if signal.action == "open" else "sell"
+            self._record_dry_run_trigger_spread(side=side, spread_pct=signal.spread_pct)
             self._schedule_browser_order_dry_run(signal)
         return signal
 
-    def _record_pending_trigger_spread(self, signal: GradientSignal) -> None:
-        side = "buy" if signal.action == "open" else "sell"
+    def _record_dry_run_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "Dry-run trigger spread not bound to orders: side=%s spread=%s",
+                side,
+                decimal_to_str(spread_pct),
+            )
+
+    def _record_live_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
         self._drop_expired_pending_trigger_spreads()
         self._pending_trigger_spreads.append(
-            PendingTriggerSpread(side=side, spread_pct=signal.spread_pct, created_at_monotonic=time.monotonic())
+            PendingTriggerSpread(
+                side=side.strip().lower(),
+                spread_pct=spread_pct,
+                created_at_monotonic=time.monotonic(),
+            )
         )
         if len(self._pending_trigger_spreads) > 100:
             del self._pending_trigger_spreads[:-100]
