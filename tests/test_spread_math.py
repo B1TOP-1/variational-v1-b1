@@ -11,6 +11,7 @@ from main import (
     cross_spread_percentages,
 )
 from variational.gradient_strategy import GradientStrategyState
+from variational.gradient_strategy import StrategySection
 
 
 class SpreadMathTest(unittest.TestCase):
@@ -121,6 +122,7 @@ class SpreadMathTest(unittest.TestCase):
 
         runtime = object.__new__(VariationalToLighterRuntime)
         runtime.gradient_strategy = GradientStrategyState.default()
+        runtime._prepared_order_side = "buy"
         runtime._last_prepared_order_sig = None
         runtime._browser_order_queue = Queue()
 
@@ -133,6 +135,26 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(command.qty, Decimal("0.001"))
         self.assertTrue(command.prepare_only)
 
+    def test_prepare_browser_order_keeps_current_panel_side_when_cursor_moves_to_close_section(self):
+        class Queue:
+            def __init__(self):
+                self.items = []
+
+            def submit(self, item):
+                self.items.append(item)
+
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime.gradient_strategy.cursor_section = StrategySection.CLOSE
+        runtime._prepared_order_side = "buy"
+        runtime._last_prepared_order_sig = None
+        runtime._browser_order_queue = Queue()
+
+        runtime._schedule_prepare_browser_order()
+
+        command = runtime._browser_order_queue.items[0]
+        self.assertEqual(command.side, "buy")
+
     def test_prepare_browser_order_dedupes_only_after_success(self):
         class Queue:
             def __init__(self):
@@ -143,6 +165,7 @@ class SpreadMathTest(unittest.TestCase):
 
         runtime = object.__new__(VariationalToLighterRuntime)
         runtime.gradient_strategy = GradientStrategyState.default()
+        runtime._prepared_order_side = "buy"
         runtime._last_prepared_order_sig = None
         runtime._browser_order_queue = Queue()
 

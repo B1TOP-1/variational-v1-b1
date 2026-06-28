@@ -374,6 +374,7 @@ class VariationalToLighterRuntime:
         self.gradient_strategy = GradientStrategyState.default()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
+        self._prepared_order_side: str = "buy"
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
         self._browser_order_queue: BrowserOrderDispatchQueue[GradientSignal | BrowserOrderCommand] = (
             BrowserOrderDispatchQueue(self._send_browser_order_task)
@@ -1336,16 +1337,11 @@ class VariationalToLighterRuntime:
     def _schedule_browser_order_dry_run(self, signal: GradientSignal) -> None:
         self._browser_order_queue.submit(signal)
 
-    def _prepared_order_side(self) -> str:
-        if self.gradient_strategy.cursor_section == StrategySection.CLOSE:
-            return "sell"
-        return "buy"
-
     def _schedule_prepare_browser_order(self) -> None:
         qty = self.gradient_strategy.single_order_qty
         if qty <= 0:
             return
-        side = self._prepared_order_side()
+        side = self._prepared_order_side
         prepare_sig = (side, format(qty, "f"))
         if prepare_sig == self._last_prepared_order_sig:
             return
@@ -1379,6 +1375,7 @@ class VariationalToLighterRuntime:
         if result.get("ok"):
             side = "sell" if command.side.strip().lower() == "sell" else "buy"
             self._last_prepared_order_sig = (side, format(command.qty, "f"))
+            self._prepared_order_side = side
 
     async def _send_browser_order_dry_run(self, signal: GradientSignal) -> None:
         side = "buy" if signal.action == "open" else "sell"
@@ -1404,6 +1401,9 @@ class VariationalToLighterRuntime:
             result.get("blockedReason"),
             result.get("error"),
         )
+        if result.get("ok"):
+            self._prepared_order_side = side
+            self._last_prepared_order_sig = (side, format(qty, "f"))
 
     def _render_strategy_panel(
         self,
