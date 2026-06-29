@@ -61,12 +61,12 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(state.cursor_section, StrategySection.OPEN)
         self.assertEqual(state.cursor_index, 0)
 
-    def test_threshold_leading_dot_enters_negative_value(self):
+    def test_threshold_slash_enters_negative_value(self):
         state = GradientStrategyState.default()
         state.handle_key("\x1b[B")
         state.handle_key("\x1b[B")
 
-        state.handle_key(".")
+        state.handle_key("/")
         self.assertEqual(state.display_value(StrategySection.OPEN, 0, EditableField.THRESHOLD), "-")
 
         state.handle_key("0")
