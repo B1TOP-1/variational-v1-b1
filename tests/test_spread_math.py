@@ -274,6 +274,50 @@ class SpreadMathTest(unittest.TestCase):
 
 
 class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_submit_result_updates_strategy_record(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.records = {}
+        runtime.logged = []
+
+        record = OrderLifecycle(
+            trade_key="strategy:submit",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="XAU",
+            auto_hedge_enabled=False,
+            last_variational_status="strategy_submitted",
+        )
+        runtime.records[record.trade_key] = record
+        runtime._record_lock = asyncio.Lock()
+
+        async def append_order_log(event_type, payload):
+            runtime.logged.append((event_type, payload))
+
+        runtime.append_order_log = append_order_log
+
+        result = {
+            "ok": True,
+            "clickStartedAt": "2026-06-29T01:02:03.000Z",
+            "clickStartedAtMs": 1782694923000,
+            "timing": {"totalDuration": 88.5},
+            "lastQuote": {"bid": 4058.45, "ask": 4058.98, "quoteId": "q1"},
+            "orderResponse": {
+                "status": 200,
+                "json": {"id": "var-order-1"},
+                "capturedAt": "2026-06-29T01:02:03.090Z",
+            },
+        }
+
+        await runtime._record_var_submit_result(record.trade_key, result)
+
+        self.assertEqual(record.var_submit_ok, True)
+        self.assertEqual(record.var_submit_order_id, "var-order-1")
+        self.assertEqual(record.var_submit_status, 200)
+        self.assertEqual(record.var_submit_quote_snapshot["quoteId"], "q1")
+        self.assertEqual(record.var_submit_timing["totalDuration"], 88.5)
+        self.assertEqual(runtime.logged[0][0], "variational_order_submitted")
+
     async def test_no_hedge_activate_asset_uses_market_config_and_readonly_ws(self):
         runtime = object.__new__(VariationalToLighterRuntime)
         runtime.args = argparse.Namespace(auto_hedge=False)

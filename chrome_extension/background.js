@@ -1,6 +1,8 @@
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
+const QUOTE_URL_PATH = "/api/quotes/indicative";
+const ORDER_URL_PATH = "/orders/new/market";
 
 const DEFAULT_CONFIG = {
   wsEndpoint: "ws://127.0.0.1:8766",
@@ -8,7 +10,8 @@ const DEFAULT_CONFIG = {
   brokerEndpoint: "ws://127.0.0.1:8768",
   domainFilter: "variational",
   restAllowlist: [
-    "https://omni.variational.io/api/quotes/indicative"
+    "https://omni.variational.io/api/quotes/indicative",
+    "https://omni.variational.io/orders/new/market"
   ],
   wsAllowlist: [
     "wss://omni-ws-server.prod.ap-northeast-1.variational.io/events",
@@ -23,6 +26,9 @@ const state = {
   configLoaded: false,
   pendingResponses: new Map(),
   websocketMeta: new Map(),
+  lastQuote: null,
+  lastOrderResponse: null,
+  pendingOrderWaiters: [],
   lastError: null,
   lastAutoReloadAt: 0
 };
@@ -336,11 +342,39 @@ function sanitizeAllowlist(value, fallback) {
 
 function sanitizeRestAllowlist(value) {
   const cleaned = sanitizeAllowlist(value, DEFAULT_CONFIG.restAllowlist);
-  const strict = cleaned.filter((item) => item === DEFAULT_CONFIG.restAllowlist[0]);
-  if (!strict.length) {
-    return [...DEFAULT_CONFIG.restAllowlist];
+  const allowed = new Set(DEFAULT_CONFIG.restAllowlist);
+  const strict = cleaned.filter((item) => allowed.has(item));
+  return [...new Set([...strict, ...DEFAULT_CONFIG.restAllowlist])];
+}
+
+function tryParseJson(text) {
+  if (typeof text !== "string") {
+    return null;
   }
-  return strict;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function decodeDebuggerBody(body, base64Encoded) {
+  if (!base64Encoded) {
+    return body ?? "";
+  }
+  try {
+    return atob(body ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function isQuoteUrl(url) {
+  return typeof url === "string" && url.includes(QUOTE_URL_PATH);
+}
+
+function isOrderUrl(url) {
+  return typeof url === "string" && url.includes(ORDER_URL_PATH);
 }
 
 function matchesDomainFilter(url) {
@@ -389,6 +423,72 @@ function getMatchedPattern(url, patterns) {
     }
   }
   return null;
+}
+
+function updateLastQuote(meta, bodyText) {
+  const payload = tryParseJson(bodyText);
+  if (!payload || typeof payload !== "object") {
+    return;
+  }
+  state.lastQuote = {
+    timestamp: nowIso(),
+    capturedAt: meta.capturedAt,
+    requestId: meta.requestId,
+    url: meta.url,
+    status: meta.status,
+    statusCode: meta.status,
+    quoteId: payload.quote_id || "",
+    bid: payload.bid != null ? Number(payload.bid) : null,
+    ask: payload.ask != null ? Number(payload.ask) : null,
+    bodyTimestamp: payload.timestamp || null,
+    instrument: payload.instrument || null
+  };
+}
+
+function makeOrderResponseSummary(meta, bodyText) {
+  const payload = tryParseJson(bodyText);
+  return {
+    timestamp: nowIso(),
+    capturedAt: meta.capturedAt,
+    requestId: meta.requestId,
+    url: meta.url,
+    status: meta.status,
+    statusCode: meta.status,
+    statusText: meta.statusText,
+    bodyText,
+    json: payload
+  };
+}
+
+function resolvePendingOrderWaiters(orderResponse) {
+  const eventMs = Date.parse(orderResponse.capturedAt || orderResponse.timestamp || nowIso());
+  state.pendingOrderWaiters = state.pendingOrderWaiters.filter((waiter) => {
+    if (waiter.tabId != null && waiter.tabId !== orderResponse.tabId) {
+      return true;
+    }
+    if (eventMs + 100 < waiter.startedAtMs) {
+      return true;
+    }
+    clearTimeout(waiter.timer);
+    waiter.resolve(orderResponse);
+    return false;
+  });
+}
+
+function waitForNextOrderResponse(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    const waiter = {
+      tabId,
+      startedAtMs: Date.now(),
+      resolve,
+      timer: null
+    };
+    waiter.timer = setTimeout(() => {
+      state.pendingOrderWaiters = state.pendingOrderWaiters.filter((item) => item !== waiter);
+      resolve(null);
+    }, timeoutMs);
+    state.pendingOrderWaiters.push(waiter);
+  });
 }
 
 async function debuggerAttach(tabId) {
@@ -784,12 +884,35 @@ function interactWithSubmitButtonInPage(payload) {
   };
 }
 
+function buildBrowserOrderTiming(timing) {
+  const stages = timing?.stages || {};
+  const end = performance.now();
+  const duration = (to, from) => (
+    typeof stages[to] === "number" && typeof stages[from] === "number"
+      ? stages[to] - stages[from]
+      : null
+  );
+  return {
+    locateDuration: duration("afterLocate", "beforeLocate"),
+    sideClickDuration: duration("afterSideClick", "beforeSideClick"),
+    sideWaitDuration: duration("afterSideWait", "afterSideClick"),
+    prepareDuration: duration("afterPrepare", "beforePrepare"),
+    inputPrepareDuration: duration("afterInputPrepare", "beforeInputPrepare"),
+    submitSnapshotDuration: duration("afterSubmitSnapshot", "beforeSubmitSnapshot"),
+    submitClickDuration: duration("afterSubmitClick", "beforeSubmitClick"),
+    orderWaitDuration: duration("afterOrderWait", "afterSubmitClick"),
+    totalDuration: end - (timing?.start || end)
+  };
+}
+
 async function handlePlaceBrowserOrder(payload) {
+  const timing = { start: performance.now(), stages: {} };
   const tabId = state.attachedTabId ?? (await getActiveTabId());
   const side = String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
   const qty = payload?.qty == null ? null : String(payload.qty).trim();
   const prepareOnly = Boolean(payload?.prepareOnly);
   const dryRun = payload?.dryRun !== false;
+  const timeoutMs = Math.max(1000, Number(payload?.timeoutMs ?? 20000));
 
   function inferSnapshotSide(snapshot) {
     const activeSide = String(snapshot?.activeSide || "").trim().toLowerCase();
@@ -810,28 +933,45 @@ async function handlePlaceBrowserOrder(payload) {
     return "";
   }
 
+  timing.stages.beforeLocate = performance.now();
   const locate = await runInTab(tabId, locateOrderElementsInPage, [side]);
+  timing.stages.afterLocate = performance.now();
   if (!locate?.sideAlreadyActive && !locate?.sideButtonRect) {
     return { ok: false, side, qty, dryRun, locate, error: "side_button_missing" };
   }
+  timing.stages.beforeSideClick = performance.now();
   if (!locate.sideAlreadyActive) {
     await dispatchTrustedClick(tabId, locate.sideButtonRect);
+    timing.stages.afterSideClick = performance.now();
     await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(payload?.waitAfterSideMs ?? 30))));
+    timing.stages.afterSideWait = performance.now();
+  } else {
+    timing.stages.afterSideClick = timing.stages.beforeSideClick;
+    timing.stages.afterSideWait = timing.stages.beforeSideClick;
   }
 
+  timing.stages.beforePrepare = performance.now();
   let before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+  timing.stages.afterPrepare = performance.now();
   if (qty && String(before?.qtyInputValue || "").trim() !== qty) {
     const waitBeforeInputMs = Math.max(0, Number(payload?.waitBeforeInputMs ?? 0));
     if (waitBeforeInputMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitBeforeInputMs));
     }
+    timing.stages.beforeInputPrepare = performance.now();
     before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty }]);
+    timing.stages.afterInputPrepare = performance.now();
     const waitAfterInputMs = Math.max(0, Number(payload?.waitAfterInputMs ?? 10));
     if (waitAfterInputMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitAfterInputMs));
     }
+  } else {
+    timing.stages.beforeInputPrepare = timing.stages.afterPrepare;
+    timing.stages.afterInputPrepare = timing.stages.afterPrepare;
   }
+  timing.stages.beforeSubmitSnapshot = performance.now();
   const after = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+  timing.stages.afterSubmitSnapshot = performance.now();
   if (!dryRun && !prepareOnly) {
     if (!after?.submitButtonRect) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_missing" };
@@ -848,15 +988,33 @@ async function handlePlaceBrowserOrder(payload) {
       await new Promise((resolve) => setTimeout(resolve, waitBeforeSubmitMs));
     }
     const submitMethod = payload?.submitMethod || "js_click";
+    let orderResponse = null;
+    const waitForOrder = waitForNextOrderResponse(tabId, timeoutMs);
+    const clickStartedAtMs = Date.now();
+    const clickStartedAt = new Date(clickStartedAtMs).toISOString();
+    timing.stages.beforeSubmitClick = performance.now();
     const clickResult = await runInTab(tabId, interactWithSubmitButtonInPage, [{ method: submitMethod }]);
+    timing.stages.afterSubmitClick = performance.now();
     if (!clickResult?.ok) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, clickResult, error: clickResult?.error || "submit_click_failed" };
     }
+    const clickAttempts = [{
+      method: submitMethod,
+      clickAt: clickStartedAt,
+      clickAtMs: clickStartedAtMs,
+      methodResult: clickResult,
+      submitButtonText: after?.submitButtonText || "",
+      submitButtonDisabled: after?.submitButtonDisabled,
+      submitButtonMeta: after?.submitButtonMeta || null
+    }];
+    orderResponse = await waitForOrder;
     const waitAfterClickMs = Math.max(0, Number(payload?.waitAfterClickMs ?? 0));
     if (waitAfterClickMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitAfterClickMs));
     }
+    timing.stages.afterOrderWait = performance.now();
     const submitted = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+    const detailedTiming = buildBrowserOrderTiming(timing);
     return {
       ok: true,
       attachedTabId: tabId,
@@ -866,6 +1024,13 @@ async function handlePlaceBrowserOrder(payload) {
       prepareOnly,
       submitMethod,
       clickResult,
+      clickStartedAt,
+      clickStartedAtMs,
+      clickAttempts,
+      timing: detailedTiming,
+      orderResponse,
+      lastQuote: state.lastQuote,
+      lastOrderResponse: state.lastOrderResponse,
       before,
       after: submitted,
       blockedReason: null
@@ -879,6 +1044,9 @@ async function handlePlaceBrowserOrder(payload) {
     dryRun,
     prepareOnly,
     submitMethod: payload?.submitMethod || "js_click",
+    timing: buildBrowserOrderTiming(timing),
+    lastQuote: state.lastQuote,
+    lastOrderResponse: state.lastOrderResponse,
     before,
     after,
     blockedReason: prepareOnly ? "prepare_only" : "dry_run"
@@ -930,6 +1098,9 @@ function getStatus() {
       rest: restForwarder.status,
       broker: brokerSocket.status
     },
+    lastQuote: state.lastQuote,
+    lastOrderResponse: state.lastOrderResponse,
+    pendingOrderWaiters: state.pendingOrderWaiters.length,
     lastError: state.lastError
   };
 }
@@ -975,14 +1146,25 @@ async function forwardResponseBody(requestId, encodedDataLength) {
 
   try {
     const result = await sendDebuggerCommand(state.attachedTabId, "Network.getResponseBody", { requestId });
+    const bodyText = decodeDebuggerBody(result.body ?? "", Boolean(result.base64Encoded));
+    if (isQuoteUrl(meta.url)) {
+      updateLastQuote(meta, bodyText);
+    }
+    if (isOrderUrl(meta.url)) {
+      state.lastOrderResponse = {
+        ...makeOrderResponseSummary(meta, bodyText),
+        tabId: state.attachedTabId
+      };
+      resolvePendingOrderWaiters(state.lastOrderResponse);
+    }
     restForwarder.send({
       kind: "rest_response",
       requestId,
       timestamp: nowIso(),
       encodedDataLength,
       ...meta,
-      body: result.body ?? "",
-      base64Encoded: Boolean(result.base64Encoded)
+      body: bodyText,
+      base64Encoded: false
     });
   } catch (error) {
     restForwarder.send({

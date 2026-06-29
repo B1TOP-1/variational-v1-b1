@@ -3,6 +3,7 @@ import json
 import unittest
 from asyncio import Future
 from decimal import Decimal
+from pathlib import Path
 
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
@@ -39,6 +40,12 @@ class BrowserOrderCommandTest(unittest.TestCase):
         command = BrowserOrderCommand(side="sell", qty=Decimal("0.003"))
 
         self.assertEqual(command.to_payload()["side"], "sell")
+
+    def test_extension_allows_quote_and_order_responses(self):
+        background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("https://omni.variational.io/api/quotes/indicative", background)
+        self.assertIn("https://omni.variational.io/orders/new/market", background)
 
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):

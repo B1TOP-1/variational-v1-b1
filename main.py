@@ -212,6 +212,15 @@ class OrderLifecycle:
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
     var_order_error: str | None = None
+    var_submit_ok: bool | None = None
+    var_submit_status: int | None = None
+    var_submit_order_id: str | None = None
+    var_submit_error: str | None = None
+    var_submit_click_started_at: str | None = None
+    var_submit_click_started_at_ms: int | None = None
+    var_submit_timing: dict[str, Any] | None = None
+    var_submit_quote_snapshot: dict[str, Any] | None = None
+    var_submit_order_response: dict[str, Any] | None = None
 
     # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills. This is a
     # reference basis value only; raw price spread and PnL do not normalize by it.
@@ -242,6 +251,15 @@ class OrderLifecycle:
             "strategy_current_qty": decimal_to_str(self.strategy_current_qty),
             "auto_hedge_enabled": self.auto_hedge_enabled,
             "var_order_error": self.var_order_error,
+            "var_submit_ok": self.var_submit_ok,
+            "var_submit_status": self.var_submit_status,
+            "var_submit_order_id": self.var_submit_order_id,
+            "var_submit_error": self.var_submit_error,
+            "var_submit_click_started_at": self.var_submit_click_started_at,
+            "var_submit_click_started_at_ms": self.var_submit_click_started_at_ms,
+            "var_submit_timing": self.var_submit_timing,
+            "var_submit_quote_snapshot": self.var_submit_quote_snapshot,
+            "var_submit_order_response": self.var_submit_order_response,
             "hedge_error": self.hedge_error,
             "last_variational_status": self.last_variational_status,
         }
@@ -1519,8 +1537,41 @@ class VariationalToLighterRuntime:
             self.logger.warning("Browser order diagnostic: %s", self._browser_order_result_summary(result))
             await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
         if result.get("ok"):
+            await self._record_var_submit_result(command.trade_key, result)
             self._prepared_order_side = side
             self._last_prepared_order_sig = (side, format(command.qty, "f"))
+
+    async def _record_var_submit_result(self, trade_key: str | None, result: dict[str, Any]) -> None:
+        if not trade_key:
+            return
+        order_response = result.get("orderResponse")
+        order_json = order_response.get("json") if isinstance(order_response, dict) and isinstance(order_response.get("json"), dict) else {}
+        order_id = (
+            order_json.get("id")
+            or order_json.get("order_id")
+            or order_json.get("orderId")
+            or order_json.get("trade_id")
+            or order_json.get("tradeId")
+        )
+        submit_status = None
+        if isinstance(order_response, dict) and order_response.get("status") is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                submit_status = int(order_response.get("status"))
+        async with self._record_lock:
+            record = self.records.get(trade_key)
+            if record is None:
+                return
+            record.var_submit_ok = bool(result.get("ok"))
+            record.var_submit_error = str(result.get("error") or result.get("blockedReason") or "") or None
+            record.var_submit_click_started_at = result.get("clickStartedAt")
+            record.var_submit_click_started_at_ms = result.get("clickStartedAtMs")
+            record.var_submit_timing = result.get("timing") if isinstance(result.get("timing"), dict) else None
+            record.var_submit_quote_snapshot = result.get("lastQuote") if isinstance(result.get("lastQuote"), dict) else None
+            record.var_submit_order_response = order_response if isinstance(order_response, dict) else None
+            record.var_submit_status = submit_status
+            record.var_submit_order_id = str(order_id) if order_id else None
+            payload = record.to_payload()
+        await self.append_order_log("variational_order_submitted", payload)
 
     @staticmethod
     def _browser_order_result_summary(result: dict[str, Any]) -> str:
@@ -1955,6 +2006,15 @@ class VariationalToLighterRuntime:
                         "spread_slippage_pct": decimal_to_str(slippage_pct),
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "var_order_error": payload["var_order_error"],
+                        "var_submit_ok": payload["var_submit_ok"],
+                        "var_submit_status": payload["var_submit_status"],
+                        "var_submit_order_id": payload["var_submit_order_id"],
+                        "var_submit_error": payload["var_submit_error"],
+                        "var_submit_click_started_at": payload["var_submit_click_started_at"],
+                        "var_submit_click_started_at_ms": payload["var_submit_click_started_at_ms"],
+                        "var_submit_timing": json.dumps(payload["var_submit_timing"], ensure_ascii=False, default=str) if payload["var_submit_timing"] is not None else "",
+                        "var_submit_quote_snapshot": json.dumps(payload["var_submit_quote_snapshot"], ensure_ascii=False, default=str) if payload["var_submit_quote_snapshot"] is not None else "",
+                        "var_submit_order_response": json.dumps(payload["var_submit_order_response"], ensure_ascii=False, default=str) if payload["var_submit_order_response"] is not None else "",
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
                     }
@@ -1988,6 +2048,15 @@ class VariationalToLighterRuntime:
             "spread_slippage_pct",
             "auto_hedge_enabled",
             "var_order_error",
+            "var_submit_ok",
+            "var_submit_status",
+            "var_submit_order_id",
+            "var_submit_error",
+            "var_submit_click_started_at",
+            "var_submit_click_started_at_ms",
+            "var_submit_timing",
+            "var_submit_quote_snapshot",
+            "var_submit_order_response",
             "hedge_error",
             "last_variational_status",
         ]
