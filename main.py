@@ -1527,28 +1527,62 @@ class VariationalToLighterRuntime:
 
     async def run_browser_smoke_test(self) -> None:
         qty = Decimal(str(self.args.browser_smoke_qty))
-        self.print_startup_next_steps()
-        await self.runtime.start()
-        self.browser_order_server = await run_browser_order_broker(
-            FORWARDER_HOST,
-            BROWSER_ORDER_BROKER_PORT,
-            self.browser_order_broker,
-        )
-        self.logger.info(
-            "Browser smoke test waiting for extension broker on ws://%s:%s",
-            FORWARDER_HOST,
-            BROWSER_ORDER_BROKER_PORT,
-        )
-        await self._wait_for_browser_order_broker_connected(timeout=120.0)
-        self.logger.info("Browser smoke test broker connected; waiting 3.0s before first browser command")
-        await asyncio.sleep(3.0)
         steps = [
             ("buy_submit", BrowserOrderCommand(side="buy", qty=qty, dry_run=False, wait_after_click_ms=0)),
             ("sell_submit", BrowserOrderCommand(side="sell", qty=qty, dry_run=False, wait_after_click_ms=0)),
             ("restore_buy_prepare", BrowserOrderCommand(side="buy", qty=qty, dry_run=True, prepare_only=True)),
         ]
-        for step_name, command in steps:
-            await self._run_browser_smoke_step(step_name, command)
+        total_steps = 5 + len(steps)
+        await self._log_browser_smoke_progress(
+            1,
+            total_steps,
+            "startup",
+            "start",
+            "printing startup guide and starting Python runtime",
+        )
+        self.print_startup_next_steps()
+        await self.runtime.start()
+        await self._log_browser_smoke_progress(1, total_steps, "startup", "done", "Python runtime started")
+        await self._log_browser_smoke_progress(
+            2,
+            total_steps,
+            "broker_server",
+            "start",
+            f"starting browser order broker on ws://{FORWARDER_HOST}:{BROWSER_ORDER_BROKER_PORT}",
+        )
+        self.browser_order_server = await run_browser_order_broker(
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
+            self.browser_order_broker,
+        )
+        await self._log_browser_smoke_progress(2, total_steps, "broker_server", "done", "broker server is listening")
+        self.logger.info(
+            "Browser smoke test waiting for extension broker on ws://%s:%s",
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
+        )
+        await self._log_browser_smoke_progress(
+            3,
+            total_steps,
+            "extension_connect",
+            "start",
+            "waiting for Chrome extension to connect",
+        )
+        await self._wait_for_browser_order_broker_connected(timeout=120.0)
+        await self._log_browser_smoke_progress(3, total_steps, "extension_connect", "done", "Chrome extension connected")
+        self.logger.info("Browser smoke test broker connected; waiting 3.0s before first browser command")
+        await self._log_browser_smoke_progress(
+            4,
+            total_steps,
+            "post_connect_wait",
+            "start",
+            "waiting 3.0s after extension connection before first browser command",
+        )
+        await asyncio.sleep(3.0)
+        await self._log_browser_smoke_progress(4, total_steps, "post_connect_wait", "done", "post-connect wait finished")
+        for offset, (step_name, command) in enumerate(steps, start=5):
+            await self._run_browser_smoke_step(step_name, command, step_no=offset, total_steps=total_steps)
+        await self._log_browser_smoke_progress(total_steps, total_steps, "complete", "done", "browser smoke test completed")
         self.logger.info("Browser smoke test completed")
 
     async def _wait_for_browser_order_broker_connected(self, timeout: float) -> None:
@@ -1560,8 +1594,23 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(0.25)
         raise RuntimeError("Timed out waiting for Chrome extension browser order broker connection")
 
-    async def _run_browser_smoke_step(self, step_name: str, command: BrowserOrderCommand) -> None:
+    async def _run_browser_smoke_step(
+        self,
+        step_name: str,
+        command: BrowserOrderCommand,
+        step_no: int | None = None,
+        total_steps: int | None = None,
+    ) -> None:
         started = time.perf_counter()
+        if step_no is not None and total_steps is not None:
+            await self._log_browser_smoke_progress(
+                step_no,
+                total_steps,
+                step_name,
+                "start",
+                f"side={command.side} qty={decimal_to_str(command.qty)} dry_run={command.dry_run} prepare_only={command.prepare_only}",
+                command,
+            )
         self.logger.info(
             "Browser smoke step start: step=%s side=%s qty=%s dry_run=%s prepare_only=%s",
             step_name,
@@ -1571,6 +1620,15 @@ class VariationalToLighterRuntime:
             command.prepare_only,
         )
         try:
+            if step_no is not None and total_steps is not None:
+                await self._log_browser_smoke_progress(
+                    step_no,
+                    total_steps,
+                    step_name,
+                    "waiting_extension_result",
+                    "browser command sent; waiting for Chrome extension result",
+                    command,
+                )
             result = await self.browser_order_broker.place_order(command, timeout=30.0)
             elapsed_ms = (time.perf_counter() - started) * 1000
             summary = self._browser_order_result_summary(result)
@@ -1585,7 +1643,25 @@ class VariationalToLighterRuntime:
             )
             await self._append_browser_smoke_log(step_name, command, result, elapsed_ms)
             if not result.get("ok"):
+                if step_no is not None and total_steps is not None:
+                    await self._log_browser_smoke_progress(
+                        step_no,
+                        total_steps,
+                        step_name,
+                        "failed",
+                        f"error={result.get('error') or result.get('blockedReason') or result}",
+                        command,
+                    )
                 raise RuntimeError(f"{step_name} failed: {result.get('error') or result.get('blockedReason') or result}")
+            if step_no is not None and total_steps is not None:
+                await self._log_browser_smoke_progress(
+                    step_no,
+                    total_steps,
+                    step_name,
+                    "done",
+                    f"elapsed_ms={elapsed_ms:.1f}",
+                    command,
+                )
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started) * 1000
             self.logger.warning(
@@ -1595,7 +1671,49 @@ class VariationalToLighterRuntime:
                 exc,
             )
             await self._append_browser_smoke_log(step_name, command, {"ok": False, "error": str(exc)}, elapsed_ms)
+            if step_no is not None and total_steps is not None:
+                await self._log_browser_smoke_progress(
+                    step_no,
+                    total_steps,
+                    step_name,
+                    "failed",
+                    f"elapsed_ms={elapsed_ms:.1f} error={exc}",
+                    command,
+                )
             raise
+
+    async def _log_browser_smoke_progress(
+        self,
+        step_no: int,
+        total_steps: int,
+        step_name: str,
+        status: str,
+        detail: str = "",
+        command: BrowserOrderCommand | None = None,
+    ) -> None:
+        self.logger.info(
+            "Browser smoke progress [%s/%s] step=%s status=%s detail=%s",
+            step_no,
+            total_steps,
+            step_name,
+            status,
+            detail,
+        )
+        row = {
+            "event": "browser_smoke_progress",
+            "logged_at": utc_now(),
+            "step_no": step_no,
+            "total_steps": total_steps,
+            "step": step_name,
+            "status": status,
+            "detail": detail,
+        }
+        if command is not None:
+            row["command"] = command.to_payload()
+        line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
+        async with self._order_write_lock:
+            await asyncio.to_thread(BROWSER_SMOKE_TEST_FILE.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, BROWSER_SMOKE_TEST_FILE, line)
 
     async def _append_browser_smoke_log(
         self,
