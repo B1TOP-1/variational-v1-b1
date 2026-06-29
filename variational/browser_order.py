@@ -23,8 +23,8 @@ class BrowserOrderCommand:
     submit_method: str = "js_click"
     timeout_ms: int = 20000
     wait_after_side_ms: int = 30
-    wait_before_input_ms: int = 3000
-    wait_after_input_ms: int = 120
+    wait_before_input_ms: int = 0
+    wait_after_input_ms: int = 3000
     disabled_retry_wait_ms: int = 3000
     wait_before_submit_ms: int = 0
     wait_after_click_ms: int = 0
