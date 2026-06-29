@@ -24,7 +24,7 @@ class BrowserOrderCommand:
     timeout_ms: int = 20000
     wait_after_side_ms: int = 30
     wait_before_input_ms: int = 0
-    wait_after_input_ms: int = 10
+    wait_after_input_ms: int = 120
     wait_before_submit_ms: int = 0
     wait_after_click_ms: int = 0
 

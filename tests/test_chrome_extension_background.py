@@ -157,6 +157,12 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
                 getAttribute(name) {
                   return attrs[name] || null;
                 },
+                hasAttribute(name) {
+                  return Object.prototype.hasOwnProperty.call(attrs, name);
+                },
+                closest() {
+                  return null;
+                },
                 getBoundingClientRect() {
                   return rect;
                 },
@@ -174,7 +180,11 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
               document: {
                 title: "Variational",
                 readyState: "complete",
-                body: {},
+                body: {
+                  dispatchEvent() {
+                    return true;
+                  }
+                },
                 activeElement: null,
                 querySelector(selector) {
                   if (selector === "[data-testid='submit-button'], [data-testid=\"submit-button\"]" || selector === "button[data-testid='submit-button']") {
@@ -208,6 +218,7 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
               Event: function Event() {},
               InputEvent: function InputEvent() {},
               KeyboardEvent: function KeyboardEvent() {},
+              MouseEvent: function MouseEvent() {},
               console
             };
             vm.createContext(sandbox);

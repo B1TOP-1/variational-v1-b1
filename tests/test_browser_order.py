@@ -34,6 +34,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["qty"], "0.001")
         self.assertEqual(payload["dryRun"], True)
         self.assertEqual(payload["submitMethod"], "js_click")
+        self.assertEqual(payload["waitAfterInputMs"], 120)
         self.assertEqual(payload["skipInputWhenMatched"], True)
         json.dumps(payload)
 

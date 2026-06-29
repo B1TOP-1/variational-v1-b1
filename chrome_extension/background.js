@@ -868,14 +868,19 @@ function prepareOrderSnapshotInPage(payload) {
     if (!button) {
       return null;
     }
+    const parent = button.closest("form, section, div");
     return {
       text: textOf(button),
       disabled: isDisabled(button),
+      disabledAttr: button.hasAttribute("disabled"),
       rect: rectOf(button),
       dataTestId: button.getAttribute("data-testid") || "",
+      ariaKeyShortcuts: button.getAttribute("aria-keyshortcuts") || "",
       ariaPressed: button.getAttribute("aria-pressed") || "",
       ariaLabel: button.getAttribute("aria-label") || "",
-      className: String(button.className || "").replace(/\s+/g, " ").slice(0, 160)
+      title: button.getAttribute("title") || "",
+      className: String(button.className || "").replace(/\s+/g, " ").slice(0, 160),
+      parentText: textOf(parent).slice(0, 240)
     };
   }
 
@@ -902,6 +907,30 @@ function prepareOrderSnapshotInPage(payload) {
     input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
   }
 
+  function settleFormState(input, value) {
+    if (!input) {
+      return { ok: false, reason: "quantity_input_missing" };
+    }
+    if (value != null && String(input.value || "") !== String(value)) {
+      setReactInputValue(input, value);
+    } else {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    input.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", code: "Tab", bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { key: "Tab", code: "Tab", bubbles: true }));
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    if (document.activeElement === input && typeof input.blur === "function") {
+      input.blur();
+    }
+    document.body?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    return {
+      ok: true,
+      activeTag: document.activeElement ? String(document.activeElement.tagName || "").toLowerCase() : "",
+      currentValue: input.value ?? ""
+    };
+  }
+
   function findQtyInput(inputs) {
     return document.querySelector("input[data-testid='quantity-input']") || inputs.find((candidate) => {
       const hint = `${candidate.placeholder || ""} ${candidate.name || ""} ${candidate.getAttribute("aria-label") || ""}`.toLowerCase();
@@ -911,13 +940,13 @@ function prepareOrderSnapshotInPage(payload) {
 
   const visibleInputsBefore = Array.from(document.querySelectorAll("input")).filter(isVisible);
   const input = findQtyInput(visibleInputsBefore);
+  let qtySettleResult = null;
   if (qty != null && input && String(input.value || "").trim() !== qty) {
     input.focus();
     setReactInputValue(input, qty);
-    input.dispatchEvent(new Event("blur", { bubbles: true }));
-    if (document.activeElement === input && typeof input.blur === "function") {
-      input.blur();
-    }
+    qtySettleResult = settleFormState(input, qty);
+  } else if (qty != null && input) {
+    qtySettleResult = settleFormState(input, qty);
   }
 
   const buttons = Array.from(document.querySelectorAll("button, [role='button']")).filter(isVisible);
@@ -949,6 +978,9 @@ function prepareOrderSnapshotInPage(payload) {
     ariaLabel: candidate.getAttribute("aria-label") || "",
     type: String(candidate.type || ""),
     inputMode: String(candidate.inputMode || ""),
+    disabled: Boolean(candidate.disabled || candidate.getAttribute("aria-disabled") === "true"),
+    readOnly: Boolean(candidate.readOnly),
+    parentText: textOf(candidate.closest("[data-testid='quantity-input-container']") || candidate.closest("label, div, form, section")).slice(0, 220),
     rect: rectOf(candidate)
   }));
 
@@ -966,6 +998,7 @@ function prepareOrderSnapshotInPage(payload) {
     sellToggleMeta: null,
     qtyInputRect: rectOf(qtyInput),
     qtyInputValue: qtyInput ? String(qtyInput.value || "") : "",
+    qtySettleResult,
     submitButtonRect: rectOf(fallbackSubmitButton),
     submitButtonText: textOf(fallbackSubmitButton),
     submitButtonDisabled: isDisabled(fallbackSubmitButton),
@@ -1074,6 +1107,7 @@ async function handlePlaceBrowserOrder(payload) {
   timing.stages.beforePrepare = performance.now();
   let before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
   timing.stages.afterPrepare = performance.now();
+  let submitSnapshotAfterInput = null;
   if (qty && String(before?.qtyInputValue || "").trim() !== qty) {
     const waitBeforeInputMs = Math.max(0, Number(payload?.waitBeforeInputMs ?? 0));
     if (waitBeforeInputMs > 0) {
@@ -1084,14 +1118,25 @@ async function handlePlaceBrowserOrder(payload) {
     timing.stages.afterInputPrepare = performance.now();
     const waitAfterInputMs = Math.max(0, Number(payload?.waitAfterInputMs ?? 10));
     if (waitAfterInputMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, waitAfterInputMs));
+      const deadline = performance.now() + waitAfterInputMs;
+      while (true) {
+        submitSnapshotAfterInput = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+        if (submitSnapshotAfterInput?.submitButtonRect && !submitSnapshotAfterInput?.submitButtonDisabled) {
+          break;
+        }
+        const remainingMs = deadline - performance.now();
+        if (remainingMs <= 0) {
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, Math.min(10, remainingMs)));
+      }
     }
   } else {
     timing.stages.beforeInputPrepare = timing.stages.afterPrepare;
     timing.stages.afterInputPrepare = timing.stages.afterPrepare;
   }
   timing.stages.beforeSubmitSnapshot = performance.now();
-  const after = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+  const after = submitSnapshotAfterInput || await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
   timing.stages.afterSubmitSnapshot = performance.now();
   if (!dryRun && !prepareOnly) {
     if (!after?.submitButtonRect) {
