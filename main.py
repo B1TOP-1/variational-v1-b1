@@ -1643,13 +1643,18 @@ class VariationalToLighterRuntime:
             )
             await self._append_browser_smoke_log(step_name, command, result, elapsed_ms)
             if not result.get("ok"):
+                diagnostic = self._browser_order_failure_hint(result)
+                if diagnostic:
+                    prefix = f"[{step_no}/{total_steps}] " if step_no is not None and total_steps is not None else ""
+                    self.dashboard_console.print(f"{prefix}{step_name} diagnostic: {diagnostic}")
+                    self.logger.warning("Browser smoke diagnostic hint: %s", diagnostic)
                 if step_no is not None and total_steps is not None:
                     await self._log_browser_smoke_progress(
                         step_no,
                         total_steps,
                         step_name,
                         "failed",
-                        f"error={result.get('error') or result.get('blockedReason') or result}",
+                        f"error={result.get('error') or result.get('blockedReason') or result}; {diagnostic}".rstrip("; "),
                         command,
                     )
                 raise RuntimeError(f"{step_name} failed: {result.get('error') or result.get('blockedReason') or result}")
@@ -1682,6 +1687,25 @@ class VariationalToLighterRuntime:
                 )
             raise
 
+    @staticmethod
+    def _browser_order_failure_hint(result: dict[str, Any]) -> str:
+        error = str(result.get("error") or result.get("blockedReason") or "")
+        if error != "submit_button_disabled":
+            return ""
+        snapshot = result.get("after") if isinstance(result.get("after"), dict) else result.get("before")
+        if not isinstance(snapshot, dict):
+            return "submit button is disabled, but no DOM snapshot was returned"
+        meta = snapshot.get("submitButtonMeta") if isinstance(snapshot.get("submitButtonMeta"), dict) else {}
+        parent_text = str(meta.get("parentText") or "")
+        submit_text = str(snapshot.get("submitButtonText") or "")
+        qty_value = str(snapshot.get("qtyInputValue") or "")
+        hints = [f"button='{submit_text}'", f"qty='{qty_value}'"]
+        if "仅减仓" in parent_text and "当前仓位 -" in parent_text:
+            hints.append("疑似仅减仓开启且当前无仓位，Var 页面禁止开仓")
+        elif "仅减仓" in parent_text:
+            hints.append("页面出现仅减仓状态，请确认 Reduce Only 是否关闭")
+        return "; ".join(hints)
+
     async def _log_browser_smoke_progress(
         self,
         step_no: int,
@@ -1691,6 +1715,8 @@ class VariationalToLighterRuntime:
         detail: str = "",
         command: BrowserOrderCommand | None = None,
     ) -> None:
+        message = f"[{step_no}/{total_steps}] {step_name} {status}: {detail}"
+        self.dashboard_console.print(message)
         self.logger.info(
             "Browser smoke progress [%s/%s] step=%s status=%s detail=%s",
             step_no,
