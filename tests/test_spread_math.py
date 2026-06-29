@@ -266,8 +266,65 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(record.lighter_side, "BUY")
         self.assertEqual(record.qty, Decimal("0.003"))
 
+    def test_no_hedge_lighter_ws_url_is_readonly(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.args = argparse.Namespace(auto_hedge=False)
+
+        self.assertEqual(runtime.build_lighter_ws_url(), "wss://mainnet.zklighter.elliot.ai/stream?readonly=true")
+
 
 class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def test_no_hedge_activate_asset_uses_market_config_and_readonly_ws(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.args = argparse.Namespace(auto_hedge=False)
+        runtime.variational_ticker = None
+        runtime.ticker = None
+        runtime._asset_switch_lock = asyncio.Lock()
+        runtime.lighter_ws_task = None
+        runtime.calls = []
+
+        def get_lighter_market_config():
+            runtime.calls.append("get_lighter_market_config")
+            return 92, 1000, 100
+
+        async def handle_lighter_ws():
+            runtime.calls.append("handle_lighter_ws")
+
+        async def wait_for_lighter_order_book_ready():
+            await asyncio.sleep(0)
+            runtime.calls.append("wait_for_lighter_order_book_ready")
+
+        async def reset_lighter_order_book():
+            runtime.calls.append("reset_lighter_order_book")
+
+        async def reset_state_for_asset_switch():
+            runtime.calls.append("reset_state_for_asset_switch")
+
+        runtime.get_lighter_market_config = get_lighter_market_config
+        runtime.handle_lighter_ws = handle_lighter_ws
+        runtime.wait_for_lighter_order_book_ready = wait_for_lighter_order_book_ready
+        runtime.reset_lighter_order_book = reset_lighter_order_book
+        runtime._reset_state_for_asset_switch = reset_state_for_asset_switch
+        runtime.logger = type("Logger", (), {"info": lambda *args, **kwargs: None})()
+
+        await runtime.activate_asset("BTC", reason="test")
+
+        self.assertEqual(runtime.ticker, "BTC")
+        self.assertEqual(runtime.variational_ticker, "BTC")
+        self.assertEqual(runtime.lighter_market_index, 92)
+        self.assertEqual(runtime.base_amount_multiplier, 1000)
+        self.assertEqual(runtime.price_multiplier, 100)
+        self.assertEqual(
+            runtime.calls,
+            [
+                "get_lighter_market_config",
+                "reset_lighter_order_book",
+                "reset_state_for_asset_switch",
+                "handle_lighter_ws",
+                "wait_for_lighter_order_book_ready",
+            ],
+        )
+
     async def test_variational_fill_binds_to_pending_strategy_record(self):
         runtime = object.__new__(VariationalToLighterRuntime)
         runtime.args = argparse.Namespace(auto_hedge=True)

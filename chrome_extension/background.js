@@ -552,6 +552,10 @@ async function startForwarding(tabId = null) {
 }
 
 function locateOrderElementsInPage(side) {
+  const sideNorm = String(side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
+  const buyWords = ["buy", "long", "买", "买入", "做多"];
+  const sellWords = ["sell", "short", "卖", "卖出", "做空"];
+
   function isVisible(el) {
     if (!el) {
       return false;
@@ -562,7 +566,7 @@ function locateOrderElementsInPage(side) {
   }
 
   function rectOf(el) {
-    if (!el) {
+    if (!el || !isVisible(el)) {
       return null;
     }
     const rect = el.getBoundingClientRect();
@@ -580,49 +584,204 @@ function locateOrderElementsInPage(side) {
     return String(el?.innerText || el?.textContent || el?.value || "").replace(/\s+/g, " ").trim();
   }
 
+  function isDisabled(el) {
+    return Boolean(el?.disabled || el?.getAttribute("aria-disabled") === "true");
+  }
+
+  function hasAnyWord(text, words) {
+    const lower = text.toLowerCase();
+    return words.some((word) => lower.includes(String(word).toLowerCase()));
+  }
+
+  function sideFromText(text) {
+    const hasBuy = hasAnyWord(text, buyWords);
+    const hasSell = hasAnyWord(text, sellWords);
+    if (hasBuy && !hasSell) {
+      return "buy";
+    }
+    if (hasSell && !hasBuy) {
+      return "sell";
+    }
+    return "";
+  }
+
+  function describeButton(button) {
+    if (!button) {
+      return null;
+    }
+    return {
+      text: textOf(button),
+      disabled: isDisabled(button),
+      rect: rectOf(button),
+      dataTestId: button.getAttribute("data-testid") || "",
+      ariaPressed: button.getAttribute("aria-pressed") || "",
+      ariaLabel: button.getAttribute("aria-label") || "",
+      className: String(button.className || "").replace(/\s+/g, " ").slice(0, 160)
+    };
+  }
+
+  function findSideControls() {
+    const switchRoot = document.querySelector("[role='switch']");
+    const switchButtons = switchRoot ? Array.from(switchRoot.querySelectorAll("button")).filter(isVisible) : [];
+    const allButtons = Array.from(
+      document.querySelectorAll("button, [role='button'], input[type='button'], input[type='submit']")
+    ).filter((button) => isVisible(button) && button.getAttribute("data-testid") !== "submit-button");
+    const candidates = switchButtons.length ? switchButtons : allButtons;
+    let buyButton = null;
+    let sellButton = null;
+    for (const button of candidates) {
+      const detected = sideFromText(textOf(button) || button.getAttribute("aria-label") || "");
+      if (detected === "buy" && !buyButton) {
+        buyButton = button;
+      } else if (detected === "sell" && !sellButton) {
+        sellButton = button;
+      }
+    }
+    const activeSide = isDisabled(buyButton) ? "buy" : isDisabled(sellButton) ? "sell" : "";
+    const targetButton = sideNorm === "sell" ? sellButton : buyButton;
+    return {
+      buyButton,
+      sellButton,
+      targetButton,
+      activeSide,
+      targetAlreadyActive: activeSide === sideNorm
+    };
+  }
+
+  const submitButton = document.querySelector("button[data-testid='submit-button']");
   const buttons = Array.from(document.querySelectorAll("button, [role='button']")).filter(isVisible);
-  const buyWords = ["buy", "long", "买", "买入", "做多"];
-  const sellWords = ["sell", "short", "卖", "卖出", "做空"];
-  const targetWords = side === "sell" ? sellWords : buyWords;
-  const otherWords = side === "sell" ? buyWords : sellWords;
-  const sideButton = buttons.find((button) => {
-    const text = textOf(button).toLowerCase();
-    return targetWords.some((word) => text.includes(String(word).toLowerCase()));
-  });
-  const activeSideButton = buttons.find((button) => {
-    const text = textOf(button).toLowerCase();
-    return targetWords.some((word) => text.includes(String(word).toLowerCase())) &&
-      (button.getAttribute("aria-pressed") === "true" || /active|selected/i.test(String(button.className || "")));
-  });
+  const submitWords = ["confirm", "submit", "place", "order", "下单", "确认", "提交"];
+  const targetWords = sideNorm === "sell" ? sellWords : buyWords;
+  const otherWords = sideNorm === "sell" ? buyWords : sellWords;
+  const submitSide = sideFromText(textOf(submitButton));
+  const sideControls = findSideControls();
 
   const inputs = Array.from(document.querySelectorAll("input")).filter(isVisible);
-  const qtyInput = inputs.find((input) => {
+  const qtyInput = document.querySelector("input[data-testid='quantity-input']") || inputs.find((input) => {
     const hint = `${input.placeholder || ""} ${input.name || ""} ${input.getAttribute("aria-label") || ""}`.toLowerCase();
     return /qty|quantity|amount|size|数量|仓位/.test(hint) || input.type === "number" || input.inputMode === "decimal";
   }) || inputs[0] || null;
 
-  const submitButton = buttons.find((button) => {
-    const text = textOf(button).toLowerCase();
-    const hasTarget = targetWords.some((word) => text.includes(String(word).toLowerCase()));
-    const hasOther = otherWords.some((word) => text.includes(String(word).toLowerCase()));
+  const fallbackSubmitButton = isVisible(submitButton) ? submitButton : buttons.find((button) => {
+    const text = textOf(button);
+    return text.length > 0 && hasAnyWord(text, submitWords) && !isDisabled(button);
+  }) || buttons.find((button) => {
+    const text = textOf(button);
+    return text.length > 0 && hasAnyWord(text, submitWords);
+  }) || buttons.find((button) => {
+    const text = textOf(button);
+    const hasTarget = hasAnyWord(text, targetWords);
+    const hasOther = hasAnyWord(text, otherWords);
     return hasTarget && !hasOther && text.length > 0;
-  }) || sideButton || null;
+  }) || sideControls.targetButton || null;
+  const visibleButtons = buttons.slice(0, 30).map((button) => describeButton(button));
+  const visibleInputs = inputs.slice(0, 20).map((input) => ({
+    value: String(input.value || ""),
+    dataTestId: input.getAttribute("data-testid") || "",
+    placeholder: String(input.placeholder || ""),
+    name: String(input.name || ""),
+    ariaLabel: input.getAttribute("aria-label") || "",
+    type: String(input.type || ""),
+    inputMode: String(input.inputMode || ""),
+    rect: rectOf(input)
+  }));
 
   return {
-    side,
-    sideButtonRect: rectOf(sideButton),
-    sideAlreadyActive: Boolean(activeSideButton),
-    activeSide: activeSideButton ? side : "",
+    side: sideNorm,
+    sideButtonRect: rectOf(sideControls.targetButton),
+    sideAlreadyActive: sideControls.targetAlreadyActive || submitSide === sideNorm,
+    activeSide: sideControls.activeSide || submitSide,
+    buyToggleMeta: describeButton(sideControls.buyButton),
+    sellToggleMeta: describeButton(sideControls.sellButton),
     qtyInputRect: rectOf(qtyInput),
     qtyInputValue: qtyInput ? String(qtyInput.value || "") : "",
-    submitButtonRect: rectOf(submitButton),
-    submitButtonText: textOf(submitButton),
-    submitButtonDisabled: Boolean(submitButton?.disabled || submitButton?.getAttribute("aria-disabled") === "true")
+    submitButtonRect: rectOf(fallbackSubmitButton),
+    submitButtonText: textOf(fallbackSubmitButton),
+    submitButtonDisabled: isDisabled(fallbackSubmitButton),
+    submitButtonMeta: describeButton(fallbackSubmitButton),
+    visibleButtons,
+    visibleInputs
   };
 }
 
 function prepareOrderSnapshotInPage(payload) {
-  return locateOrderElementsInPage(String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy");
+  const side = String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
+  const qty = payload?.qty == null ? null : String(payload.qty);
+
+  function isVisible(el) {
+    if (!el) {
+      return false;
+    }
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  }
+
+  function setReactInputValue(input, value) {
+    const nextValue = String(value ?? "");
+    const previousValue = input.value ?? "";
+    const prototype = window.HTMLInputElement?.prototype || Object.getPrototypeOf(input);
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+    if (descriptor && typeof descriptor.set === "function") {
+      descriptor.set.call(input, nextValue);
+    } else {
+      input.value = nextValue;
+    }
+    const tracker = input._valueTracker;
+    if (tracker && typeof tracker.setValue === "function") {
+      tracker.setValue(previousValue);
+    }
+    try {
+      input.dispatchEvent(new InputEvent("input", { bubbles: true, data: nextValue, inputType: "insertText" }));
+    } catch {
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+  }
+
+  const input = document.querySelector("input[data-testid='quantity-input']") ||
+    Array.from(document.querySelectorAll("input")).filter(isVisible)[0] ||
+    null;
+  if (qty != null && input && String(input.value || "").trim() !== qty) {
+    input.focus();
+    setReactInputValue(input, qty);
+    input.dispatchEvent(new Event("blur", { bubbles: true }));
+    if (document.activeElement === input && typeof input.blur === "function") {
+      input.blur();
+    }
+  }
+  return locateOrderElementsInPage(side);
+}
+
+function interactWithSubmitButtonInPage(payload) {
+  const method = String(payload?.method || "js_click").trim();
+  const button = document.querySelector("button[data-testid='submit-button']");
+  if (!button) {
+    return { ok: false, method, error: "submit_button_missing" };
+  }
+  const beforeText = String(button.innerText || button.value || "").replace(/\s+/g, " ").trim();
+  if (method === "js_click") {
+    button.click();
+  } else if (method === "js_dispatch_mouse") {
+    for (const eventName of ["pointerdown", "mousedown", "pointerup", "mouseup", "click"]) {
+      const EventCtor = eventName.startsWith("pointer") && typeof PointerEvent === "function" ? PointerEvent : MouseEvent;
+      button.dispatchEvent(new EventCtor(eventName, { bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1 }));
+    }
+  } else if (method === "js_focus_enter") {
+    button.focus();
+    button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", bubbles: true }));
+    button.dispatchEvent(new KeyboardEvent("keypress", { key: "Enter", code: "Enter", bubbles: true }));
+    button.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
+  } else {
+    return { ok: false, method, error: "unknown_submit_method", beforeText };
+  }
+  return {
+    ok: true,
+    method,
+    beforeText,
+    afterText: String(button.innerText || button.value || "").replace(/\s+/g, " ").trim()
+  };
 }
 
 async function handlePlaceBrowserOrder(payload) {
@@ -632,8 +791,27 @@ async function handlePlaceBrowserOrder(payload) {
   const prepareOnly = Boolean(payload?.prepareOnly);
   const dryRun = payload?.dryRun !== false;
 
+  function inferSnapshotSide(snapshot) {
+    const activeSide = String(snapshot?.activeSide || "").trim().toLowerCase();
+    if (activeSide === "buy" || activeSide === "sell") {
+      return activeSide;
+    }
+    const text = String(snapshot?.submitButtonText || "").replace(/\s+/g, " ").trim().toLowerCase();
+    const buyWords = ["buy", "long", "买", "买入", "做多"];
+    const sellWords = ["sell", "short", "卖", "卖出", "做空"];
+    const hasBuy = buyWords.some((word) => text.includes(String(word).toLowerCase()));
+    const hasSell = sellWords.some((word) => text.includes(String(word).toLowerCase()));
+    if (hasBuy && !hasSell) {
+      return "buy";
+    }
+    if (hasSell && !hasBuy) {
+      return "sell";
+    }
+    return "";
+  }
+
   const locate = await runInTab(tabId, locateOrderElementsInPage, [side]);
-  if (!locate?.sideButtonRect) {
+  if (!locate?.sideAlreadyActive && !locate?.sideButtonRect) {
     return { ok: false, side, qty, dryRun, locate, error: "side_button_missing" };
   }
   if (!locate.sideAlreadyActive) {
@@ -641,21 +819,19 @@ async function handlePlaceBrowserOrder(payload) {
     await new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(payload?.waitAfterSideMs ?? 30))));
   }
 
-  let before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side }]);
-  if (qty && before?.qtyInputRect && String(before.qtyInputValue || "").trim() !== qty) {
+  let before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+  if (qty && String(before?.qtyInputValue || "").trim() !== qty) {
     const waitBeforeInputMs = Math.max(0, Number(payload?.waitBeforeInputMs ?? 0));
     if (waitBeforeInputMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitBeforeInputMs));
     }
-    await dispatchTrustedClick(tabId, before.qtyInputRect);
-    await new Promise((resolve) => setTimeout(resolve, 80));
-    await clearAndTypeText(tabId, qty);
+    before = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty }]);
     const waitAfterInputMs = Math.max(0, Number(payload?.waitAfterInputMs ?? 10));
     if (waitAfterInputMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitAfterInputMs));
     }
   }
-  const after = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side }]);
+  const after = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
   if (!dryRun && !prepareOnly) {
     if (!after?.submitButtonRect) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_missing" };
@@ -663,16 +839,24 @@ async function handlePlaceBrowserOrder(payload) {
     if (after.submitButtonDisabled) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_disabled" };
     }
+    const preparedSide = inferSnapshotSide(after);
+    if (preparedSide && preparedSide !== side) {
+      return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_side_mismatch" };
+    }
     const waitBeforeSubmitMs = Math.max(0, Number(payload?.waitBeforeSubmitMs ?? 0));
     if (waitBeforeSubmitMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitBeforeSubmitMs));
     }
-    await dispatchTrustedClick(tabId, after.submitButtonRect);
+    const submitMethod = payload?.submitMethod || "js_click";
+    const clickResult = await runInTab(tabId, interactWithSubmitButtonInPage, [{ method: submitMethod }]);
+    if (!clickResult?.ok) {
+      return { ok: false, side, qty, dryRun, prepareOnly, before, after, clickResult, error: clickResult?.error || "submit_click_failed" };
+    }
     const waitAfterClickMs = Math.max(0, Number(payload?.waitAfterClickMs ?? 0));
     if (waitAfterClickMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, waitAfterClickMs));
     }
-    const submitted = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side }]);
+    const submitted = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
     return {
       ok: true,
       attachedTabId: tabId,
@@ -680,7 +864,8 @@ async function handlePlaceBrowserOrder(payload) {
       qty,
       dryRun,
       prepareOnly,
-      submitMethod: payload?.submitMethod || "js_dispatch_mouse",
+      submitMethod,
+      clickResult,
       before,
       after: submitted,
       blockedReason: null
@@ -693,7 +878,7 @@ async function handlePlaceBrowserOrder(payload) {
     qty,
     dryRun,
     prepareOnly,
-    submitMethod: payload?.submitMethod || "js_dispatch_mouse",
+    submitMethod: payload?.submitMethod || "js_click",
     before,
     after,
     blockedReason: prepareOnly ? "prepare_only" : "dry_run"

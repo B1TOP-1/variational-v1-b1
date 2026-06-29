@@ -16,7 +16,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["side"], "buy")
         self.assertEqual(payload["qty"], "0.001")
         self.assertEqual(payload["dryRun"], True)
-        self.assertEqual(payload["submitMethod"], "js_dispatch_mouse")
+        self.assertEqual(payload["submitMethod"], "js_click")
         self.assertEqual(payload["skipInputWhenMatched"], True)
         json.dumps(payload)
 

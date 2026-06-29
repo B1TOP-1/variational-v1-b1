@@ -1516,10 +1516,42 @@ class VariationalToLighterRuntime:
             result.get("error"),
         )
         if not result.get("ok"):
+            self.logger.warning("Browser order diagnostic: %s", self._browser_order_result_summary(result))
             await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
         if result.get("ok"):
             self._prepared_order_side = side
             self._last_prepared_order_sig = (side, format(command.qty, "f"))
+
+    @staticmethod
+    def _browser_order_result_summary(result: dict[str, Any]) -> str:
+        def snapshot_summary(snapshot: Any) -> dict[str, Any]:
+            if not isinstance(snapshot, dict):
+                return {}
+            return {
+                "activeSide": snapshot.get("activeSide"),
+                "sideAlreadyActive": snapshot.get("sideAlreadyActive"),
+                "sideButtonRect": snapshot.get("sideButtonRect"),
+                "buyToggleMeta": snapshot.get("buyToggleMeta"),
+                "sellToggleMeta": snapshot.get("sellToggleMeta"),
+                "qtyInputValue": snapshot.get("qtyInputValue"),
+                "submitButtonText": snapshot.get("submitButtonText"),
+                "submitButtonDisabled": snapshot.get("submitButtonDisabled"),
+                "submitButtonMeta": snapshot.get("submitButtonMeta"),
+                "visibleButtons": snapshot.get("visibleButtons"),
+                "visibleInputs": snapshot.get("visibleInputs"),
+            }
+
+        summary = {
+            "error": result.get("error"),
+            "blockedReason": result.get("blockedReason"),
+            "side": result.get("side"),
+            "qty": result.get("qty"),
+            "locate": snapshot_summary(result.get("locate")),
+            "before": snapshot_summary(result.get("before")),
+            "after": snapshot_summary(result.get("after")),
+            "clickResult": result.get("clickResult"),
+        }
+        return json.dumps(summary, ensure_ascii=False, default=str)
 
     def _render_strategy_panel(
         self,
@@ -2016,7 +2048,8 @@ class VariationalToLighterRuntime:
 
         await self.wait_for_variational_ready()
         self.logger.info("Variational heartbeat is live")
-        self.initialize_lighter_client()
+        if self.args.auto_hedge:
+            self.initialize_lighter_client()
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
 

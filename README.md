@@ -71,6 +71,8 @@ python main.py
 python main.py --no-hedge
 ```
 
+`--no-hedge` 模式只连接 Lighter 只读 WebSocket：`wss://mainnet.zklighter.elliot.ai/stream?readonly=true`，不会调用 Lighter REST，也不会初始化 Lighter 签名客户端；适合仅读取盘口和运行 Var 浏览器下单。
+
 Python 脚本开始运行后，打开 Variational 的交易页面，
 打开 Chrome 插件列表，点击 “Variational CDP Forwarder” -> 点击 `Start`
 
@@ -174,6 +176,8 @@ Disable hedge:
 ```bash
 python main.py --no-hedge
 ```
+
+`--no-hedge` mode only connects to the read-only Lighter WebSocket: `wss://mainnet.zklighter.elliot.ai/stream?readonly=true`. It does not call Lighter REST and does not initialize the Lighter signer client, so it is suitable for read-only books plus Var browser orders.
 
 After the Python script starts, open the Variational trading page,
 open the Chrome extensions list, click `Variational CDP Forwarder`, then click `Start`.
