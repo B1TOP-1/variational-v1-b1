@@ -62,6 +62,9 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
             const inputs = __INPUTS_JS__;
             const sandbox = {
               document: {
+                title: "Variational",
+                readyState: "complete",
+                body: {},
                 querySelector(selector) {
                   if (selector === "[data-testid='submit-button'], [data-testid=\"submit-button\"]" || selector === "button[data-testid='submit-button']") {
                     return buttons.find((button) => button.getAttribute("data-testid") === "submit-button") || null;
@@ -82,9 +85,13 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
                 }
               },
               window: {
+                frameElement: null,
                 getComputedStyle() {
                   return { display: "block", visibility: "visible" };
                 }
+              },
+              location: {
+                href: "https://omni.variational.io/trade/XAU"
               },
               console
             };

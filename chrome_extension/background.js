@@ -788,6 +788,11 @@ function locateOrderElementsInPage(side) {
 
   return {
     side: sideNorm,
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    hasBody: Boolean(document.body),
+    frameElement: window.frameElement ? String(window.frameElement.tagName || "") : "",
     sideButtonRect: rectOf(sideControls.targetButton),
     sideAlreadyActive: sideControls.targetAlreadyActive || submitSide === sideNorm,
     activeSide: sideControls.activeSide || submitSide,

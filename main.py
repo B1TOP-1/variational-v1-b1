@@ -127,6 +127,16 @@ def required_int_env(name: str) -> int:
         raise RuntimeError(f"{name} must be an integer, got: {value}") from exc
 
 
+def optional_int_env(name: str, default: int = 0) -> int:
+    value = os.getenv(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer, got: {value}") from exc
+
+
 def env_flag(name: str) -> bool:
     value = os.getenv(name, "").strip().lower()
     return value in {"1", "true", "yes", "on"}
@@ -365,8 +375,12 @@ class VariationalToLighterRuntime:
         self.trade_event_cursor = 0
 
         self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
-        self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
-        self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
+        if self.args.browser_smoke_test:
+            self.account_index = optional_int_env("LIGHTER_ACCOUNT_INDEX", 0)
+            self.api_key_index = optional_int_env("LIGHTER_API_KEY_INDEX", 0)
+        else:
+            self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
+            self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
         self.lighter_client: SignerClient | None = None
         self._lighter_signer_lock = asyncio.Lock()
 
@@ -1671,6 +1685,11 @@ class VariationalToLighterRuntime:
             if not isinstance(snapshot, dict):
                 return {}
             return {
+                "url": snapshot.get("url"),
+                "title": snapshot.get("title"),
+                "readyState": snapshot.get("readyState"),
+                "hasBody": snapshot.get("hasBody"),
+                "frameElement": snapshot.get("frameElement"),
                 "activeSide": snapshot.get("activeSide"),
                 "sideAlreadyActive": snapshot.get("sideAlreadyActive"),
                 "sideButtonRect": snapshot.get("sideButtonRect"),

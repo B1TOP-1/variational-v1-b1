@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from main import parse_args
+from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
 
@@ -15,6 +16,14 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
         self.assertTrue(args.browser_smoke_test)
         self.assertEqual(args.browser_smoke_qty, "0.001")
+
+    def test_browser_smoke_test_does_not_require_lighter_env(self):
+        args = parse_args(["--browser-smoke-test"])
+
+        runtime = VariationalToLighterRuntime(args)
+
+        self.assertEqual(runtime.account_index, 0)
+        self.assertEqual(runtime.api_key_index, 0)
 
     def test_builds_dry_run_browser_order_payload(self):
         command = BrowserOrderCommand(side="buy", qty=Decimal("0.001"))
