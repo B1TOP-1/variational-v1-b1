@@ -61,6 +61,32 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(state.cursor_section, StrategySection.OPEN)
         self.assertEqual(state.cursor_index, 0)
 
+    def test_threshold_leading_dot_enters_negative_value(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\x1b[B")
+        state.handle_key("\x1b[B")
+
+        state.handle_key(".")
+        self.assertEqual(state.display_value(StrategySection.OPEN, 0, EditableField.THRESHOLD), "-")
+
+        state.handle_key("0")
+        state.handle_key(".")
+        state.handle_key("1")
+        state.handle_key("\r")
+
+        self.assertEqual(state.open_rows[0].threshold_pct, Decimal("-0.1"))
+        self.assertEqual(len(state.open_rows), 1)
+
+    def test_minus_still_deletes_gradient_row(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\x1b[B")
+        state.handle_key("\x1b[B")
+        state.handle_key("+")
+
+        state.handle_key("-")
+
+        self.assertEqual(len(state.open_rows), 1)
+
     def test_enabled_row_ignores_editing_keys(self):
         state = GradientStrategyState.default()
 

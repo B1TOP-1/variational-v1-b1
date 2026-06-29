@@ -176,7 +176,7 @@ class GradientStrategyState:
             and field_name == self.cursor_field
             and self.edit_buffer is not None
         ):
-            return self.edit_buffer or "_"
+            return self._display_edit_buffer(field_name)
         row = self.rows_for(section)[index]
         value = row.threshold_pct if field_name == EditableField.THRESHOLD else row.target_qty
         return "-" if value is None else format(value, "f")
@@ -280,7 +280,7 @@ class GradientStrategyState:
     def _append_edit_char(self, key: str) -> None:
         if self.edit_buffer is None:
             self.edit_buffer = ""
-        if key == "." and "." in self.edit_buffer:
+        if key == "." and "." in self.edit_buffer.lstrip("."):
             return
         self.edit_buffer += key
 
@@ -293,7 +293,8 @@ class GradientStrategyState:
     def _commit_edit(self) -> None:
         if self.edit_buffer is None:
             return
-        value = self._parse_decimal(self.edit_buffer)
+        allow_leading_dot_negative = self.cursor_target == CursorTarget.ROW and self.cursor_field == EditableField.THRESHOLD
+        value = self._parse_decimal(self.edit_buffer, allow_leading_dot_negative=allow_leading_dot_negative)
         if self.cursor_target == CursorTarget.ORDER_SIZE:
             if value is not None:
                 self.single_order_qty = value
@@ -313,16 +314,28 @@ class GradientStrategyState:
         row = self.current_row()
         return row.threshold_pct if self.cursor_field == EditableField.THRESHOLD else row.target_qty
 
+    def _display_edit_buffer(self, field_name: EditableField) -> str:
+        if self.edit_buffer is None:
+            return "_"
+        if field_name == EditableField.THRESHOLD and self.edit_buffer.startswith("."):
+            suffix = self.edit_buffer[1:]
+            return f"-{suffix}" if suffix else "-"
+        return self.edit_buffer or "_"
+
     @staticmethod
-    def _parse_decimal(raw: str) -> Decimal | None:
+    def _parse_decimal(raw: str, *, allow_leading_dot_negative: bool = False) -> Decimal | None:
         text = raw.strip()
         if not text:
             return None
+        if allow_leading_dot_negative and text.startswith("."):
+            text = f"-{text[1:]}"
+            if text == "-":
+                return None
         try:
             value = Decimal(text)
         except InvalidOperation:
             return None
-        if value < 0:
+        if value < 0 and not allow_leading_dot_negative:
             return None
         return value
 
