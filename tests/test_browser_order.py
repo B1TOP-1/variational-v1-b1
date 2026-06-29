@@ -5,10 +5,17 @@ from asyncio import Future
 from decimal import Decimal
 from pathlib import Path
 
+from main import parse_args
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
 
 class BrowserOrderCommandTest(unittest.TestCase):
+    def test_browser_smoke_test_args_are_available(self):
+        args = parse_args(["--browser-smoke-test", "--browser-smoke-qty", "0.001"])
+
+        self.assertTrue(args.browser_smoke_test)
+        self.assertEqual(args.browser_smoke_qty, "0.001")
+
     def test_builds_dry_run_browser_order_payload(self):
         command = BrowserOrderCommand(side="buy", qty=Decimal("0.001"))
 

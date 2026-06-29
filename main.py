@@ -55,6 +55,7 @@ LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
+BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
@@ -1510,6 +1511,97 @@ class VariationalToLighterRuntime:
             self._last_prepared_order_sig = (side, format(command.qty, "f"))
             self._prepared_order_side = side
 
+    async def run_browser_smoke_test(self) -> None:
+        qty = Decimal(str(self.args.browser_smoke_qty))
+        self.print_startup_next_steps()
+        await self.runtime.start()
+        self.browser_order_server = await run_browser_order_broker(
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
+            self.browser_order_broker,
+        )
+        self.logger.info(
+            "Browser smoke test waiting for extension broker on ws://%s:%s",
+            FORWARDER_HOST,
+            BROWSER_ORDER_BROKER_PORT,
+        )
+        await self._wait_for_browser_order_broker_connected(timeout=120.0)
+        steps = [
+            ("buy_submit", BrowserOrderCommand(side="buy", qty=qty, dry_run=False, wait_after_click_ms=0)),
+            ("sell_submit", BrowserOrderCommand(side="sell", qty=qty, dry_run=False, wait_after_click_ms=0)),
+            ("restore_buy_prepare", BrowserOrderCommand(side="buy", qty=qty, dry_run=True, prepare_only=True)),
+        ]
+        for step_name, command in steps:
+            await self._run_browser_smoke_step(step_name, command)
+        self.logger.info("Browser smoke test completed")
+
+    async def _wait_for_browser_order_broker_connected(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.browser_order_broker.is_connected():
+                self.logger.info("Browser order broker connected")
+                return
+            await asyncio.sleep(0.25)
+        raise RuntimeError("Timed out waiting for Chrome extension browser order broker connection")
+
+    async def _run_browser_smoke_step(self, step_name: str, command: BrowserOrderCommand) -> None:
+        started = time.perf_counter()
+        self.logger.info(
+            "Browser smoke step start: step=%s side=%s qty=%s dry_run=%s prepare_only=%s",
+            step_name,
+            command.side,
+            decimal_to_str(command.qty),
+            command.dry_run,
+            command.prepare_only,
+        )
+        try:
+            result = await self.browser_order_broker.place_order(command, timeout=30.0)
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            summary = self._browser_order_result_summary(result)
+            self.logger.info(
+                "Browser smoke step result: step=%s elapsed_ms=%.1f ok=%s blocked=%s error=%s summary=%s",
+                step_name,
+                elapsed_ms,
+                result.get("ok"),
+                result.get("blockedReason"),
+                result.get("error"),
+                summary,
+            )
+            await self._append_browser_smoke_log(step_name, command, result, elapsed_ms)
+            if not result.get("ok"):
+                raise RuntimeError(f"{step_name} failed: {result.get('error') or result.get('blockedReason') or result}")
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.warning(
+                "Browser smoke step failed: step=%s elapsed_ms=%.1f error=%s",
+                step_name,
+                elapsed_ms,
+                exc,
+            )
+            await self._append_browser_smoke_log(step_name, command, {"ok": False, "error": str(exc)}, elapsed_ms)
+            raise
+
+    async def _append_browser_smoke_log(
+        self,
+        step_name: str,
+        command: BrowserOrderCommand,
+        result: dict[str, Any],
+        elapsed_ms: float,
+    ) -> None:
+        row = {
+            "event": "browser_smoke_step",
+            "logged_at": utc_now(),
+            "step": step_name,
+            "elapsed_ms": elapsed_ms,
+            "command": command.to_payload(),
+            "result": result,
+            "summary": json.loads(self._browser_order_result_summary(result)),
+        }
+        line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
+        async with self._order_write_lock:
+            await asyncio.to_thread(BROWSER_SMOKE_TEST_FILE.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, BROWSER_SMOKE_TEST_FILE, line)
+
     async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
         side = "sell" if command.side.strip().lower() == "sell" else "buy"
         try:
@@ -2169,7 +2261,7 @@ class VariationalToLighterRuntime:
         await self.runtime.stop()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Track Variational order lifecycle and optionally auto-hedge on Lighter (ticker auto-detected)."
     )
@@ -2191,8 +2283,19 @@ def parse_args() -> argparse.Namespace:
         default=2000.0,
         help="Lighter VWAP depth notional in USD used as the effective bid/ask for spreads (default: 2000)",
     )
+    parser.add_argument(
+        "--browser-smoke-test",
+        action="store_true",
+        help="Run a live browser order smoke test: buy, sell, then restore buy form. Writes detailed logs.",
+    )
+    parser.add_argument(
+        "--browser-smoke-qty",
+        type=str,
+        default="0.001",
+        help="Quantity used by --browser-smoke-test (default: 0.001)",
+    )
     parser.set_defaults(auto_hedge=True)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 async def _amain() -> None:
@@ -2200,7 +2303,10 @@ async def _amain() -> None:
     args = parse_args()
     runtime = VariationalToLighterRuntime(args)
     try:
-        await runtime.run()
+        if args.browser_smoke_test:
+            await runtime.run_browser_smoke_test()
+        else:
+            await runtime.run()
     finally:
         await runtime.close()
 
