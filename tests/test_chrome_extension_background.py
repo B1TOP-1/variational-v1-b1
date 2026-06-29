@@ -114,6 +114,121 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         )
         return json.loads(completed.stdout)
 
+    def _run_prepare_order_snapshot(self, buttons_js: str, inputs_js: str = "[]", side: str = "buy") -> dict:
+        script = textwrap.dedent(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const source = fs.readFileSync("chrome_extension/background.js", "utf8");
+            const start = source.indexOf("function prepareOrderSnapshotInPage(payload) {");
+            if (start < 0) {
+              throw new Error("prepareOrderSnapshotInPage not found");
+            }
+            let depth = 0;
+            let end = -1;
+            for (let index = start; index < source.length; index += 1) {
+              const char = source[index];
+              if (char === "{") {
+                depth += 1;
+              } else if (char === "}") {
+                depth -= 1;
+                if (depth === 0) {
+                  end = index + 1;
+                  break;
+                }
+              }
+            }
+            if (end < 0) {
+              throw new Error("prepareOrderSnapshotInPage end not found");
+            }
+            const prepareSource = source.slice(start, end);
+
+            function element(text, rect, attrs = {}) {
+              return {
+                innerText: text,
+                textContent: text,
+                value: attrs.value || "",
+                placeholder: attrs.placeholder || "",
+                name: attrs.name || "",
+                type: attrs.type || "",
+                inputMode: attrs.inputMode || "",
+                disabled: Boolean(attrs.disabled),
+                className: attrs.className || "",
+                getAttribute(name) {
+                  return attrs[name] || null;
+                },
+                getBoundingClientRect() {
+                  return rect;
+                },
+                focus() {},
+                blur() {},
+                dispatchEvent() {
+                  return true;
+                }
+              };
+            }
+
+            const buttons = __BUTTONS_JS__;
+            const inputs = __INPUTS_JS__;
+            const sandbox = {
+              document: {
+                title: "Variational",
+                readyState: "complete",
+                body: {},
+                activeElement: null,
+                querySelector(selector) {
+                  if (selector === "[data-testid='submit-button'], [data-testid=\"submit-button\"]" || selector === "button[data-testid='submit-button']") {
+                    return buttons.find((button) => button.getAttribute("data-testid") === "submit-button") || null;
+                  }
+                  if (selector === "input[data-testid='quantity-input']") {
+                    return inputs.find((input) => input.getAttribute("data-testid") === "quantity-input") || null;
+                  }
+                  return null;
+                },
+                querySelectorAll(selector) {
+                  if (selector.includes("button") || selector.includes("[role='button']")) {
+                    return buttons;
+                  }
+                  if (selector === "input") {
+                    return inputs;
+                  }
+                  return [];
+                }
+              },
+              window: {
+                frameElement: null,
+                HTMLInputElement: function HTMLInputElement() {},
+                getComputedStyle() {
+                  return { display: "block", visibility: "visible" };
+                }
+              },
+              location: {
+                href: "https://omni.variational.io/trade/XAU"
+              },
+              Event: function Event() {},
+              InputEvent: function InputEvent() {},
+              KeyboardEvent: function KeyboardEvent() {},
+              console
+            };
+            vm.createContext(sandbox);
+            vm.runInContext(`${prepareSource}; this.result = prepareOrderSnapshotInPage({ side: "__SIDE__", qty: null });`, sandbox);
+            process.stdout.write(JSON.stringify(sandbox.result));
+            """
+        )
+        script = (
+            script.replace("__BUTTONS_JS__", buttons_js)
+            .replace("__INPUTS_JS__", inputs_js)
+            .replace("__SIDE__", side)
+        )
+        completed = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
     def test_locates_confirm_submit_button_after_side_button_disappears(self):
         result = self._run_locate_order_elements(
             buttons_js="""
@@ -178,6 +293,26 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertEqual(result["activeSide"], "buy")
         self.assertIsNone(result["sideButtonRect"])
         self.assertEqual(result["submitButtonText"], "买 XAU")
+
+    def test_prepare_snapshot_is_self_contained_when_injected(self):
+        result = self._run_prepare_order_snapshot(
+            buttons_js="""
+            [
+              element("买 $4,058.98", { left: 10, top: 10, width: 140, height: 44 }, { disabled: true, className: "border-green text-green" }),
+              element("卖 $4,058.45", { left: 160, top: 10, width: 140, height: 44 }, { className: "border-red text-red" }),
+              element("买 XAU", { left: 20, top: 240, width: 280, height: 32 }, { "data-testid": "submit-button", className: "bg-green" }),
+            ]
+            """,
+            inputs_js="""
+            [
+              element("", { left: 20, top: 100, width: 120, height: 30 }, { "data-testid": "quantity-input", value: "0.001" }),
+            ]
+            """,
+            side="buy",
+        )
+
+        self.assertEqual(result["submitButtonText"], "买 XAU")
+        self.assertEqual(result["qtyInputValue"], "0.001")
 
 
 if __name__ == "__main__":

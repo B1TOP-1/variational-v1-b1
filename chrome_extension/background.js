@@ -812,6 +812,8 @@ function locateOrderElementsInPage(side) {
 function prepareOrderSnapshotInPage(payload) {
   const side = String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
   const qty = payload?.qty == null ? null : String(payload.qty);
+  const buyWords = ["buy", "long", "买", "买入", "做多"];
+  const sellWords = ["sell", "short", "卖", "卖出", "做空"];
 
   function isVisible(el) {
     if (!el) {
@@ -820,6 +822,61 @@ function prepareOrderSnapshotInPage(payload) {
     const style = window.getComputedStyle(el);
     const rect = el.getBoundingClientRect();
     return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+  }
+
+  function rectOf(el) {
+    if (!el || !isVisible(el)) {
+      return null;
+    }
+    const rect = el.getBoundingClientRect();
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      left: rect.left,
+      top: rect.top,
+      width: rect.width,
+      height: rect.height
+    };
+  }
+
+  function textOf(el) {
+    return String(el?.innerText || el?.textContent || el?.value || "").replace(/\s+/g, " ").trim();
+  }
+
+  function isDisabled(el) {
+    return Boolean(el?.disabled || el?.getAttribute("aria-disabled") === "true");
+  }
+
+  function hasAnyWord(text, words) {
+    const lower = text.toLowerCase();
+    return words.some((word) => lower.includes(String(word).toLowerCase()));
+  }
+
+  function sideFromText(text) {
+    const hasBuy = hasAnyWord(text, buyWords);
+    const hasSell = hasAnyWord(text, sellWords);
+    if (hasBuy && !hasSell) {
+      return "buy";
+    }
+    if (hasSell && !hasBuy) {
+      return "sell";
+    }
+    return "";
+  }
+
+  function describeButton(button) {
+    if (!button) {
+      return null;
+    }
+    return {
+      text: textOf(button),
+      disabled: isDisabled(button),
+      rect: rectOf(button),
+      dataTestId: button.getAttribute("data-testid") || "",
+      ariaPressed: button.getAttribute("aria-pressed") || "",
+      ariaLabel: button.getAttribute("aria-label") || "",
+      className: String(button.className || "").replace(/\s+/g, " ").slice(0, 160)
+    };
   }
 
   function setReactInputValue(input, value) {
@@ -845,9 +902,15 @@ function prepareOrderSnapshotInPage(payload) {
     input.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", bubbles: true }));
   }
 
-  const input = document.querySelector("input[data-testid='quantity-input']") ||
-    Array.from(document.querySelectorAll("input")).filter(isVisible)[0] ||
-    null;
+  function findQtyInput(inputs) {
+    return document.querySelector("input[data-testid='quantity-input']") || inputs.find((candidate) => {
+      const hint = `${candidate.placeholder || ""} ${candidate.name || ""} ${candidate.getAttribute("aria-label") || ""}`.toLowerCase();
+      return /qty|quantity|amount|size|数量|仓位/.test(hint) || candidate.type === "number" || candidate.inputMode === "decimal";
+    }) || inputs[0] || null;
+  }
+
+  const visibleInputsBefore = Array.from(document.querySelectorAll("input")).filter(isVisible);
+  const input = findQtyInput(visibleInputsBefore);
   if (qty != null && input && String(input.value || "").trim() !== qty) {
     input.focus();
     setReactInputValue(input, qty);
@@ -856,7 +919,60 @@ function prepareOrderSnapshotInPage(payload) {
       input.blur();
     }
   }
-  return locateOrderElementsInPage(side);
+
+  const buttons = Array.from(document.querySelectorAll("button, [role='button']")).filter(isVisible);
+  const inputs = Array.from(document.querySelectorAll("input")).filter(isVisible);
+  const qtyInput = findQtyInput(inputs);
+  const submitButton = document.querySelector("button[data-testid='submit-button']");
+  const submitWords = ["confirm", "submit", "place", "order", "下单", "确认", "提交"];
+  const targetWords = side === "sell" ? sellWords : buyWords;
+  const otherWords = side === "sell" ? buyWords : sellWords;
+  const fallbackSubmitButton = isVisible(submitButton) ? submitButton : buttons.find((button) => {
+    const text = textOf(button);
+    return text.length > 0 && hasAnyWord(text, submitWords) && !isDisabled(button);
+  }) || buttons.find((button) => {
+    const text = textOf(button);
+    return text.length > 0 && hasAnyWord(text, submitWords);
+  }) || buttons.find((button) => {
+    const text = textOf(button);
+    const hasTarget = hasAnyWord(text, targetWords);
+    const hasOther = hasAnyWord(text, otherWords);
+    return hasTarget && !hasOther && text.length > 0;
+  }) || null;
+  const submitSide = sideFromText(textOf(fallbackSubmitButton));
+  const visibleButtons = buttons.slice(0, 30).map((button) => describeButton(button));
+  const visibleInputs = inputs.slice(0, 20).map((candidate) => ({
+    value: String(candidate.value || ""),
+    dataTestId: candidate.getAttribute("data-testid") || "",
+    placeholder: String(candidate.placeholder || ""),
+    name: String(candidate.name || ""),
+    ariaLabel: candidate.getAttribute("aria-label") || "",
+    type: String(candidate.type || ""),
+    inputMode: String(candidate.inputMode || ""),
+    rect: rectOf(candidate)
+  }));
+
+  return {
+    side,
+    url: location.href,
+    title: document.title,
+    readyState: document.readyState,
+    hasBody: Boolean(document.body),
+    frameElement: window.frameElement ? String(window.frameElement.tagName || "") : "",
+    sideButtonRect: null,
+    sideAlreadyActive: submitSide === side,
+    activeSide: submitSide,
+    buyToggleMeta: null,
+    sellToggleMeta: null,
+    qtyInputRect: rectOf(qtyInput),
+    qtyInputValue: qtyInput ? String(qtyInput.value || "") : "",
+    submitButtonRect: rectOf(fallbackSubmitButton),
+    submitButtonText: textOf(fallbackSubmitButton),
+    submitButtonDisabled: isDisabled(fallbackSubmitButton),
+    submitButtonMeta: describeButton(fallbackSubmitButton),
+    visibleButtons,
+    visibleInputs
+  };
 }
 
 function interactWithSubmitButtonInPage(payload) {
