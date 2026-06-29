@@ -1540,6 +1540,8 @@ class VariationalToLighterRuntime:
             BROWSER_ORDER_BROKER_PORT,
         )
         await self._wait_for_browser_order_broker_connected(timeout=120.0)
+        self.logger.info("Browser smoke test broker connected; waiting 3.0s before first browser command")
+        await asyncio.sleep(3.0)
         steps = [
             ("buy_submit", BrowserOrderCommand(side="buy", qty=qty, dry_run=False, wait_after_click_ms=0)),
             ("sell_submit", BrowserOrderCommand(side="sell", qty=qty, dry_run=False, wait_after_click_ms=0)),
