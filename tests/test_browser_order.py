@@ -36,6 +36,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["submitMethod"], "js_click")
         self.assertEqual(payload["waitBeforeInputMs"], 3000)
         self.assertEqual(payload["waitAfterInputMs"], 120)
+        self.assertEqual(payload["disabledRetryWaitMs"], 3000)
         self.assertEqual(payload["skipInputWhenMatched"], True)
         json.dumps(payload)
 
@@ -64,6 +65,11 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
         self.assertIn("https://omni.variational.io/api/quotes/indicative", background)
         self.assertIn("https://omni.variational.io/orders/new/market", background)
+
+    def test_extension_uses_submit_button_testid_selector(self):
+        background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("button[data-testid='submit-button']", background)
 
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):

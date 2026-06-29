@@ -1053,6 +1053,7 @@ function buildBrowserOrderTiming(timing) {
     prepareDuration: duration("afterPrepare", "beforePrepare"),
     inputPrepareDuration: duration("afterInputPrepare", "beforeInputPrepare"),
     submitSnapshotDuration: duration("afterSubmitSnapshot", "beforeSubmitSnapshot"),
+    disabledRetryWaitDuration: duration("afterDisabledRetryWait", "beforeDisabledRetryWait"),
     submitClickDuration: duration("afterSubmitClick", "beforeSubmitClick"),
     orderWaitDuration: duration("afterOrderWait", "afterSubmitClick"),
     totalDuration: end - (timing?.start || end)
@@ -1136,14 +1137,36 @@ async function handlePlaceBrowserOrder(payload) {
     timing.stages.afterInputPrepare = timing.stages.afterPrepare;
   }
   timing.stages.beforeSubmitSnapshot = performance.now();
-  const after = submitSnapshotAfterInput || await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+  let after = submitSnapshotAfterInput || await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
   timing.stages.afterSubmitSnapshot = performance.now();
   if (!dryRun && !prepareOnly) {
     if (!after?.submitButtonRect) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_missing" };
     }
     if (after.submitButtonDisabled) {
-      return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_disabled" };
+      const disabledRetryWaitMs = Math.max(0, Number(payload?.disabledRetryWaitMs ?? 0));
+      let afterDisabledRetry = null;
+      if (disabledRetryWaitMs > 0) {
+        timing.stages.beforeDisabledRetryWait = performance.now();
+        await new Promise((resolve) => setTimeout(resolve, disabledRetryWaitMs));
+        timing.stages.afterDisabledRetryWait = performance.now();
+        afterDisabledRetry = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+      }
+      if (!afterDisabledRetry || afterDisabledRetry.submitButtonDisabled) {
+        return {
+          ok: false,
+          side,
+          qty,
+          dryRun,
+          prepareOnly,
+          before,
+          after,
+          afterDisabledRetry,
+          timing: buildBrowserOrderTiming(timing),
+          error: "submit_button_disabled"
+        };
+      }
+      after = afterDisabledRetry;
     }
     const preparedSide = inferSnapshotSide(after);
     if (preparedSide && preparedSide !== side) {

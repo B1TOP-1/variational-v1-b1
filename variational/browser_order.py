@@ -25,6 +25,7 @@ class BrowserOrderCommand:
     wait_after_side_ms: int = 30
     wait_before_input_ms: int = 3000
     wait_after_input_ms: int = 120
+    disabled_retry_wait_ms: int = 3000
     wait_before_submit_ms: int = 0
     wait_after_click_ms: int = 0
 
@@ -44,6 +45,7 @@ class BrowserOrderCommand:
             "waitAfterSideMs": int(self.wait_after_side_ms),
             "waitBeforeInputMs": int(self.wait_before_input_ms),
             "waitAfterInputMs": int(self.wait_after_input_ms),
+            "disabledRetryWaitMs": int(self.disabled_retry_wait_ms),
             "waitBeforeSubmitMs": int(self.wait_before_submit_ms),
             "waitAfterClickMs": int(self.wait_after_click_ms),
             "submitMethod": str(self.submit_method),

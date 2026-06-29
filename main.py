@@ -1538,24 +1538,24 @@ class VariationalToLighterRuntime:
             total_steps,
             "startup",
             "start",
-            "printing startup guide and starting Python runtime",
+            "打印启动指引并启动 Python 运行时",
         )
         self.print_startup_next_steps()
         await self.runtime.start()
-        await self._log_browser_smoke_progress(1, total_steps, "startup", "done", "Python runtime started")
+        await self._log_browser_smoke_progress(1, total_steps, "startup", "done", "Python 运行时已启动")
         await self._log_browser_smoke_progress(
             2,
             total_steps,
             "broker_server",
             "start",
-            f"starting browser order broker on ws://{FORWARDER_HOST}:{BROWSER_ORDER_BROKER_PORT}",
+            f"启动浏览器下单 broker：ws://{FORWARDER_HOST}:{BROWSER_ORDER_BROKER_PORT}",
         )
         self.browser_order_server = await run_browser_order_broker(
             FORWARDER_HOST,
             BROWSER_ORDER_BROKER_PORT,
             self.browser_order_broker,
         )
-        await self._log_browser_smoke_progress(2, total_steps, "broker_server", "done", "broker server is listening")
+        await self._log_browser_smoke_progress(2, total_steps, "broker_server", "done", "broker 已开始监听")
         self.logger.info(
             "Browser smoke test waiting for extension broker on ws://%s:%s",
             FORWARDER_HOST,
@@ -1566,23 +1566,23 @@ class VariationalToLighterRuntime:
             total_steps,
             "extension_connect",
             "start",
-            "waiting for Chrome extension to connect",
+            "等待 Chrome 扩展连接 Python",
         )
         await self._wait_for_browser_order_broker_connected(timeout=120.0)
-        await self._log_browser_smoke_progress(3, total_steps, "extension_connect", "done", "Chrome extension connected")
+        await self._log_browser_smoke_progress(3, total_steps, "extension_connect", "done", "Chrome 扩展已连接")
         self.logger.info("Browser smoke test broker connected; waiting 3.0s before first browser command")
         await self._log_browser_smoke_progress(
             4,
             total_steps,
             "post_connect_wait",
             "start",
-            "waiting 3.0s after extension connection before first browser command",
+            "扩展连接后等待 3.0 秒，再发送第一条浏览器命令",
         )
         await asyncio.sleep(3.0)
-        await self._log_browser_smoke_progress(4, total_steps, "post_connect_wait", "done", "post-connect wait finished")
+        await self._log_browser_smoke_progress(4, total_steps, "post_connect_wait", "done", "连接后等待完成")
         for offset, (step_name, command) in enumerate(steps, start=5):
             await self._run_browser_smoke_step(step_name, command, step_no=offset, total_steps=total_steps)
-        await self._log_browser_smoke_progress(total_steps, total_steps, "complete", "done", "browser smoke test completed")
+        await self._log_browser_smoke_progress(total_steps, total_steps, "complete", "done", "浏览器 smoke test 完成")
         self.logger.info("Browser smoke test completed")
 
     async def _wait_for_browser_order_broker_connected(self, timeout: float) -> None:
@@ -1608,7 +1608,7 @@ class VariationalToLighterRuntime:
                 total_steps,
                 step_name,
                 "start",
-                f"side={command.side} qty={decimal_to_str(command.qty)} dry_run={command.dry_run} prepare_only={command.prepare_only}",
+                f"方向={command.side} 数量={decimal_to_str(command.qty)} dry_run={command.dry_run} prepare_only={command.prepare_only}",
                 command,
             )
         self.logger.info(
@@ -1626,7 +1626,7 @@ class VariationalToLighterRuntime:
                     total_steps,
                     step_name,
                     "waiting_extension_result",
-                    "browser command sent; waiting for Chrome extension result",
+                    "浏览器命令已发送，等待 Chrome 扩展返回结果",
                     command,
                 )
             result = await self.browser_order_broker.place_order(command, timeout=30.0)
@@ -1654,7 +1654,7 @@ class VariationalToLighterRuntime:
                         total_steps,
                         step_name,
                         "failed",
-                        f"error={result.get('error') or result.get('blockedReason') or result}; {diagnostic}".rstrip("; "),
+                        f"错误={result.get('error') or result.get('blockedReason') or result}; {diagnostic}".rstrip("; "),
                         command,
                     )
                 raise RuntimeError(f"{step_name} failed: {result.get('error') or result.get('blockedReason') or result}")
@@ -1664,7 +1664,7 @@ class VariationalToLighterRuntime:
                     total_steps,
                     step_name,
                     "done",
-                    f"elapsed_ms={elapsed_ms:.1f}",
+                    f"耗时={elapsed_ms:.1f}ms",
                     command,
                 )
         except Exception as exc:
@@ -1682,7 +1682,7 @@ class VariationalToLighterRuntime:
                     total_steps,
                     step_name,
                     "failed",
-                    f"elapsed_ms={elapsed_ms:.1f} error={exc}",
+                    f"耗时={elapsed_ms:.1f}ms 错误={exc}",
                     command,
                 )
             raise
@@ -1692,14 +1692,20 @@ class VariationalToLighterRuntime:
         error = str(result.get("error") or result.get("blockedReason") or "")
         if error != "submit_button_disabled":
             return ""
-        snapshot = result.get("after") if isinstance(result.get("after"), dict) else result.get("before")
+        snapshot = (
+            result.get("afterDisabledRetry")
+            if isinstance(result.get("afterDisabledRetry"), dict)
+            else result.get("after") if isinstance(result.get("after"), dict) else result.get("before")
+        )
         if not isinstance(snapshot, dict):
-            return "submit button is disabled, but no DOM snapshot was returned"
+            return "提交按钮仍是灰色，但没有拿到 DOM 快照"
         meta = snapshot.get("submitButtonMeta") if isinstance(snapshot.get("submitButtonMeta"), dict) else {}
         parent_text = str(meta.get("parentText") or "")
         submit_text = str(snapshot.get("submitButtonText") or "")
         qty_value = str(snapshot.get("qtyInputValue") or "")
-        hints = [f"button='{submit_text}'", f"qty='{qty_value}'"]
+        hints = [f"按钮='{submit_text}'", f"数量='{qty_value}'"]
+        if isinstance(result.get("afterDisabledRetry"), dict):
+            hints.append("已在 disabled 后额外等待 3 秒并重新检查")
         if "仅减仓" in parent_text and "当前仓位 -" in parent_text:
             hints.append("疑似仅减仓开启且当前无仓位，Var 页面禁止开仓")
         elif "仅减仓" in parent_text:
@@ -1715,7 +1721,13 @@ class VariationalToLighterRuntime:
         detail: str = "",
         command: BrowserOrderCommand | None = None,
     ) -> None:
-        message = f"[{step_no}/{total_steps}] {step_name} {status}: {detail}"
+        status_zh = {
+            "start": "开始",
+            "done": "完成",
+            "failed": "失败",
+            "waiting_extension_result": "等待扩展返回",
+        }.get(status, status)
+        message = f"[{step_no}/{total_steps}] {step_name} {status_zh}: {detail}"
         self.dashboard_console.print(message)
         self.logger.info(
             "Browser smoke progress [%s/%s] step=%s status=%s detail=%s",
@@ -1857,6 +1869,7 @@ class VariationalToLighterRuntime:
             "locate": snapshot_summary(result.get("locate")),
             "before": snapshot_summary(result.get("before")),
             "after": snapshot_summary(result.get("after")),
+            "afterDisabledRetry": snapshot_summary(result.get("afterDisabledRetry")),
             "clickResult": result.get("clickResult"),
         }
         return json.dumps(summary, ensure_ascii=False, default=str)
