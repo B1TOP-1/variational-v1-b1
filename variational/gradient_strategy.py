@@ -161,12 +161,12 @@ class GradientStrategyState:
         if not self.enabled:
             self._last_close_spread_pct = close_spread_pct
             return None
-        current_long_qty = max(current_position_qty, Decimal("0"))
-        close_signal = self._evaluate_close(close_spread_pct, current_long_qty)
+        # 单向持仓单轴语义：仓位带符号（正=多 / 负=空），不做多空钳制。
+        close_signal = self._evaluate_close(close_spread_pct, current_position_qty)
         self._last_close_spread_pct = close_spread_pct
         if close_signal is not None:
             return close_signal
-        return self._evaluate_open(open_spread_pct, current_long_qty)
+        return self._evaluate_open(open_spread_pct, current_position_qty)
 
     def display_value(self, section: StrategySection, index: int, field_name: EditableField) -> str:
         if (
@@ -219,7 +219,9 @@ class GradientStrategyState:
         )
 
     def _evaluate_close(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
-        if spread_pct is None or current_qty <= 0 or self._last_close_spread_pct is None:
+        # current_qty 带符号；清仓 target 可为 0 或负数（继续做空到 -N），
+        # 故不再用 current_qty<=0 拦截，仅靠 delta=current-target>0 触发卖出。
+        if spread_pct is None or self._last_close_spread_pct is None:
             return None
         previous_spread = self._last_close_spread_pct
         rows = sorted(
@@ -295,7 +297,7 @@ class GradientStrategyState:
     def _commit_edit(self) -> None:
         if self.edit_buffer is None:
             return
-        allow_slash_negative = self.cursor_target == CursorTarget.ROW and self.cursor_field == EditableField.THRESHOLD
+        allow_slash_negative = self.cursor_target == CursorTarget.ROW and self._field_allows_negative()
         value = self._parse_decimal(self.edit_buffer, allow_slash_negative=allow_slash_negative)
         if self.cursor_target == CursorTarget.ORDER_SIZE:
             if value is not None:
@@ -316,13 +318,19 @@ class GradientStrategyState:
         row = self.current_row()
         return row.threshold_pct if self.cursor_field == EditableField.THRESHOLD else row.target_qty
 
+    def _field_allows_negative(self) -> bool:
+        if self.cursor_field == EditableField.THRESHOLD:
+            return True
+        # 清仓段的目标仓位允许负数：代表做空上限（如 -0.1）。
+        return self.cursor_field == EditableField.QUANTITY and self.cursor_section == StrategySection.CLOSE
+
     def _allows_negative_marker(self, key: str) -> bool:
-        return key == "/" and self.cursor_target == CursorTarget.ROW and self.cursor_field == EditableField.THRESHOLD
+        return key == "/" and self.cursor_target == CursorTarget.ROW and self._field_allows_negative()
 
     def _display_edit_buffer(self, field_name: EditableField) -> str:
         if self.edit_buffer is None:
             return "_"
-        if field_name == EditableField.THRESHOLD and self.edit_buffer.startswith("/"):
+        if self.edit_buffer.startswith("/"):
             suffix = self.edit_buffer[1:]
             return f"-{suffix}" if suffix else "-"
         return self.edit_buffer or "_"

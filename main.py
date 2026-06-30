@@ -5,6 +5,7 @@ import csv
 import json
 import logging
 import os
+import re
 import signal
 import sys
 import time
@@ -57,6 +58,7 @@ APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
+DOM_POSITION_TIMEOUT_SECONDS = 5.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -414,6 +416,7 @@ class VariationalToLighterRuntime:
         self._keyboard_active = False
 
         self.gradient_strategy = GradientStrategyState.default()
+        self._last_dom_position_qty: Decimal | None = None
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -1424,6 +1427,56 @@ class VariationalToLighterRuntime:
             f"{lo_l} {self._fmt_median_pct(p10_v)}"
         )
 
+    @staticmethod
+    def _parse_dom_position_text(text: Any) -> Decimal | None:
+        """解析页面"当前仓位"文本：'0.003 XAU'/'-0.01 XAU'→带符号；'-'/空→0(平仓)。"""
+        if text is None:
+            return None
+        cleaned = str(text).strip()
+        if not cleaned:
+            return None
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        if match is None:
+            # 没有数字：'-' 表示平仓(0)，其它无法识别返回 None。
+            return Decimal("0") if cleaned.replace(" ", "") in {"-", "--", "—"} else None
+        return to_decimal(match.group(0))
+
+    async def _read_dom_position_qty(self) -> Decimal | None:
+        """通过扩展抓取页面"当前仓位"DOM 作为后备仓位源。"""
+        broker = self.browser_order_broker
+        if broker is None or not broker.is_connected():
+            return None
+        try:
+            result = await broker.read_position(timeout=DOM_POSITION_TIMEOUT_SECONDS)
+        except Exception as exc:
+            self.logger.debug("读取 DOM 仓位失败: %s", exc)
+            return None
+        if not isinstance(result, dict) or not result.get("ok") or not result.get("found"):
+            return None
+        qty = self._parse_dom_position_text(result.get("valueText"))
+        if qty is not None:
+            self._last_dom_position_qty = qty
+        return qty
+
+    async def _resolve_live_position_qty(self) -> Decimal | None:
+        """真实仓位：listener 优先 → DOM 后备。读不到返回 None（不下单）。"""
+        try:
+            state = await self.runtime.monitor.get_trading_state()
+        except Exception:
+            state = None
+        if isinstance(state, dict) and state.get("has_portfolio"):
+            row = state.get("position_row")
+            if isinstance(row, dict):
+                live = to_decimal(row.get("qty"))
+                if live is not None:
+                    return live
+            # 有组合数据但当前资产无仓位 = 平仓(0)。
+            return Decimal("0")
+        dom = await self._read_dom_position_qty()
+        if dom is not None:
+            return dom
+        return self._last_dom_position_qty
+
     def _evaluate_gradient_signal(
         self,
         open_spread_pct: Decimal | None,
@@ -2010,6 +2063,10 @@ class VariationalToLighterRuntime:
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
             realized_pnl, unrealized_pnl, _pnl_pending, position_qty, avg_open_pct = self.compute_pnl()
 
+        # 真实仓位（listener 优先→DOM 后备）；读不到则 None，不触发策略下单。
+        live_position_qty = await self._resolve_live_position_qty()
+        display_position_qty = live_position_qty if live_position_qty is not None else position_qty
+
         is_zh = self.args.lang == "zh"
         header_title = "Var↔Lit"
         auto_hedge_label = "对冲" if is_zh else "hedge"
@@ -2056,11 +2113,13 @@ class VariationalToLighterRuntime:
             pnl_text = f"PnL: [{r_color}]{realized_u}[/] ([{u_color}]{unrealized_u}[/])"
 
         pos_label = "持仓" if is_zh else "pos"
-        if avg_open_pct is None or position_qty == 0:
+        if display_position_qty == 0:
             pos_text = f"{pos_label} 0"
+        elif avg_open_pct is None:
+            pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker}"
         else:
             pos_color = "green" if avg_open_pct >= 0 else "red"
-            pos_text = f"{pos_label}{position_qty:+.3f}{self.ticker} [{pos_color}]{avg_open_pct:+.4f}%[/]"
+            pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker} [{pos_color}]{avg_open_pct:+.4f}%[/]"
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
@@ -2208,15 +2267,19 @@ class VariationalToLighterRuntime:
                     short_dn,
                 )
 
-        signal = self._evaluate_gradient_signal(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-            position_qty,
-        )
+        # 仅在拿到真实仓位时评估策略，避免在未知仓位上误下单。
+        if live_position_qty is None:
+            signal = None
+        else:
+            signal = self._evaluate_gradient_signal(
+                long_var_short_lighter_pct,
+                short_var_long_lighter_pct,
+                live_position_qty,
+            )
         strategy_panel = self._render_strategy_panel(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
-            position_qty,
+            display_position_qty,
             signal,
         )
         if is_zh:

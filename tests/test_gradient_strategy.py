@@ -196,6 +196,75 @@ class GradientStrategyStateTest(unittest.TestCase):
         )
 
         self.assertIsNone(signal)
+    def test_open_signal_uses_signed_position(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.open_rows[0].threshold_pct = Decimal("0.11")
+        state.open_rows[0].target_qty = Decimal("0.1")
+
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.12"),
+            close_spread_pct=Decimal("0.00"),
+            current_position_qty=Decimal("-0.05"),
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "open")
+        self.assertEqual(signal.delta_qty, Decimal("0.15"))
+
+    def test_close_can_go_short_to_negative_target(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.close_rows[0].threshold_pct = Decimal("0.07")
+        state.close_rows[0].target_qty = Decimal("-0.1")
+
+        state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.10"),
+            current_position_qty=Decimal("0"),
+        )
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.07"),
+            current_position_qty=Decimal("0"),
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "close")
+        self.assertEqual(signal.target_qty, Decimal("-0.1"))
+        self.assertEqual(signal.delta_qty, Decimal("0.1"))
+
+    def test_close_stops_at_negative_target(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.close_rows[0].threshold_pct = Decimal("0.07")
+        state.close_rows[0].target_qty = Decimal("-0.1")
+
+        state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.10"),
+            current_position_qty=Decimal("-0.1"),
+        )
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.07"),
+            current_position_qty=Decimal("-0.1"),
+        )
+
+        self.assertIsNone(signal)
+
+    def test_close_target_accepts_negative_input(self):
+        state = GradientStrategyState.default()
+        state.cursor_target = CursorTarget.ROW
+        state.cursor_section = StrategySection.CLOSE
+        state.cursor_index = 0
+        state.cursor_field = EditableField.QUANTITY
+
+        for key in ("/", "0", ".", "1"):
+            state.handle_key(key)
+        state.handle_key("\r")
+
+        self.assertEqual(state.close_rows[0].target_qty, Decimal("-0.1"))
 
 
 if __name__ == "__main__":

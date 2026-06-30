@@ -1246,10 +1246,43 @@ async function handleBrokerCommand(action, payload) {
   if (action === "place_browser_order" || action === "prepare_browser_order") {
     return await handlePlaceBrowserOrder(payload);
   }
+  if (action === "read_position") {
+    return await handleReadPosition(payload);
+  }
   if (action === "ping") {
     return { ok: true, attachedTabId: state.attachedTabId, status: getStatus() };
   }
   return { ok: false, error: `Unknown broker action: ${action}` };
+}
+
+function readPositionInPage() {
+  const spans = Array.from(document.querySelectorAll("span"));
+  const label = spans.find((s) => String(s.textContent || "").replace(/\s+/g, "") === "当前仓位");
+  let valueText = "";
+  if (label) {
+    const sib = label.nextElementSibling;
+    if (sib) {
+      valueText = String(sib.innerText || sib.textContent || "").replace(/\s+/g, " ").trim();
+    }
+    if (!valueText && label.parentElement) {
+      valueText = String(label.parentElement.innerText || label.parentElement.textContent || "")
+        .replace("当前仓位", "")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+  }
+  return { found: Boolean(label), valueText };
+}
+
+async function handleReadPosition(payload) {
+  const tabId = state.attachedTabId ?? (await getActiveTabId());
+  const result = await runInTab(tabId, readPositionInPage);
+  return {
+    ok: true,
+    found: Boolean(result && result.found),
+    valueText: String((result && result.valueText) || ""),
+    attachedTabId: tabId
+  };
 }
 
 async function stopForwarding() {

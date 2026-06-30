@@ -92,6 +92,12 @@ class BrowserOrderBroker:
             future.set_result(payload)
 
     async def place_order(self, command: BrowserOrderCommand, timeout: float = 25.0) -> dict[str, Any]:
+        return await self._request(command.action, command.to_payload(), timeout)
+
+    async def read_position(self, timeout: float = 5.0) -> dict[str, Any]:
+        return await self._request("read_position", {}, timeout)
+
+    async def _request(self, action: str, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
         if self._websocket is None:
             raise RuntimeError("browser order broker not connected")
         message_id = str(uuid.uuid4())
@@ -103,8 +109,8 @@ class BrowserOrderBroker:
                 json.dumps(
                     {
                         "id": message_id,
-                        "action": command.action,
-                        "payload": command.to_payload(),
+                        "action": action,
+                        "payload": payload,
                     },
                     ensure_ascii=True,
                 )

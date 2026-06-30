@@ -71,6 +71,22 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
         self.assertIn("button[data-testid='submit-button']", background)
 
+    def test_extension_handles_read_position_action(self):
+        background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn('action === "read_position"', background)
+        self.assertIn("当前仓位", background)
+
+    def test_parse_dom_position_text(self):
+        parse = VariationalToLighterRuntime._parse_dom_position_text
+
+        self.assertEqual(parse("0.003 XAU"), Decimal("0.003"))
+        self.assertEqual(parse("-0.01 XAU"), Decimal("-0.01"))
+        self.assertEqual(parse("-"), Decimal("0"))
+        self.assertEqual(parse(" - "), Decimal("0"))
+        self.assertIsNone(parse(""))
+        self.assertIsNone(parse(None))
+
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
     async def test_place_order_cleans_pending_after_timeout(self):
@@ -111,6 +127,28 @@ class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(broker._websocket, new_ws)
         self.assertEqual(broker.pending_count(), 1)
         self.assertFalse(future.done())
+
+    async def test_read_position_sends_action_and_returns_response(self):
+        class CapturingWebSocket:
+            def __init__(self, broker):
+                self.broker = broker
+                self.sent = None
+
+            async def send(self, raw):
+                self.sent = json.loads(raw)
+                message_id = self.sent["id"]
+                self.broker._pending[message_id].set_result(
+                    {"id": message_id, "ok": True, "found": True, "valueText": "0.003 XAU"}
+                )
+
+        broker = BrowserOrderBroker()
+        broker._websocket = CapturingWebSocket(broker)
+
+        result = await broker.read_position(timeout=1.0)
+
+        self.assertEqual(broker._websocket.sent["action"], "read_position")
+        self.assertEqual(result["valueText"], "0.003 XAU")
+        self.assertEqual(broker.pending_count(), 0)
 
     async def test_dispatch_queue_runs_submitted_items_in_order(self):
         handled: list[str] = []
