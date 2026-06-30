@@ -1147,10 +1147,21 @@ async function handlePlaceBrowserOrder(payload) {
       const disabledRetryWaitMs = Math.max(0, Number(payload?.disabledRetryWaitMs ?? 0));
       let afterDisabledRetry = null;
       if (disabledRetryWaitMs > 0) {
+        // 轮询而非死等：按钮一启用立刻点，最多等到上限，避免固定 3 秒延迟。
         timing.stages.beforeDisabledRetryWait = performance.now();
-        await new Promise((resolve) => setTimeout(resolve, disabledRetryWaitMs));
+        const deadline = performance.now() + disabledRetryWaitMs;
+        while (true) {
+          afterDisabledRetry = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
+          if (afterDisabledRetry?.submitButtonRect && !afterDisabledRetry?.submitButtonDisabled) {
+            break;
+          }
+          const remainingMs = deadline - performance.now();
+          if (remainingMs <= 0) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, Math.min(10, remainingMs)));
+        }
         timing.stages.afterDisabledRetryWait = performance.now();
-        afterDisabledRetry = await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
       }
       if (!afterDisabledRetry || afterDisabledRetry.submitButtonDisabled) {
         return {
