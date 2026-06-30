@@ -166,5 +166,87 @@ class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handled, ["first", "second"])
 
 
+class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _runtime():
+        return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+
+    async def test_eval_skips_and_reads_nothing_without_cached_position(self):
+        rt = self._runtime()
+        rt._cached_position_qty = None
+        called = {"spreads": False}
+
+        async def boom():
+            called["spreads"] = True
+            return (None, None)
+
+        rt._compute_signal_spreads = boom
+        await rt._run_strategy_evaluation()
+
+        self.assertIsNone(rt._latest_gradient_signal)
+        self.assertFalse(called["spreads"])  # 无缓存仓位：不评估、不读行情
+
+    async def test_eval_uses_cached_position(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.01")
+
+        async def spreads():
+            return (Decimal("0.2"), Decimal("0"))
+
+        rt._compute_signal_spreads = spreads
+        await rt._run_strategy_evaluation()
+
+        self.assertIsNotNone(rt._latest_gradient_signal)
+        self.assertEqual(rt._latest_gradient_signal.action, "open")
+
+    async def test_refresh_cache_uses_listener_without_dom(self):
+        rt = self._runtime()
+
+        async def reader():
+            return Decimal("-0.05")
+
+        async def dom_boom():
+            raise AssertionError("DOM should not be hit when listener has data")
+
+        rt._read_listener_position = reader
+        rt._read_dom_position_qty = dom_boom
+        await rt._refresh_position_cache(allow_dom=False)
+
+        self.assertEqual(rt._cached_position_qty, Decimal("-0.05"))
+
+    async def test_in_flight_blocks_duplicate_order_on_spread_flap(self):
+        rt = self._runtime()
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 1)
+        self.assertTrue(rt._strategy_order_in_flight)
+
+        # 价差抖动：信号消失(指纹重置)再出现，在途期间不得再下单。
+        rt._evaluate_gradient_signal(None, None, Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 1)
+
+    async def test_refresh_after_fill_waits_for_position_change(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        seq = [Decimal("0"), Decimal("0.01")]
+
+        async def reader():
+            return seq.pop(0) if seq else Decimal("0.01")
+
+        rt._read_listener_position = reader
+        await rt._refresh_position_cache_after_fill(Decimal("0"))
+
+        self.assertEqual(rt._cached_position_qty, Decimal("0.01"))
+
+
 if __name__ == "__main__":
     unittest.main()

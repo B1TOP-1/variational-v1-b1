@@ -58,7 +58,11 @@ APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
+BROWSER_ORDER_TIMEOUT_SECONDS = 10.0
 DOM_POSITION_TIMEOUT_SECONDS = 5.0
+STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
+POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
+POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -417,6 +421,11 @@ class VariationalToLighterRuntime:
 
         self.gradient_strategy = GradientStrategyState.default()
         self._last_dom_position_qty: Decimal | None = None
+        self._cached_position_qty: Decimal | None = None
+        self._latest_gradient_signal: GradientSignal | None = None
+        self._strategy_wake = asyncio.Event()
+        self._strategy_task: asyncio.Task[None] | None = None
+        self._strategy_order_in_flight = False
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -686,6 +695,8 @@ class VariationalToLighterRuntime:
         asks = self.lighter_order_book["asks"]
         self.lighter_best_bid = bids.peekitem(-1)[0] if bids else None
         self.lighter_best_ask = asks.peekitem(0)[0] if asks else None
+        # 盘口变动 → 唤醒事件驱动的策略评估。
+        self._strategy_wake.set()
 
     def validate_order_book_offset(self, new_offset: int) -> bool:
         return new_offset > self.lighter_order_book_offset
@@ -1458,24 +1469,47 @@ class VariationalToLighterRuntime:
             self._last_dom_position_qty = qty
         return qty
 
-    async def _resolve_live_position_qty(self) -> Decimal | None:
-        """真实仓位：listener 优先 → DOM 后备。读不到返回 None（不下单）。"""
+    async def _read_listener_position(self) -> Decimal | None:
+        """从 listener 内存读真实带符号仓位（廉价，无往返）。无组合数据返回 None。"""
         try:
             state = await self.runtime.monitor.get_trading_state()
         except Exception:
-            state = None
-        if isinstance(state, dict) and state.get("has_portfolio"):
-            row = state.get("position_row")
-            if isinstance(row, dict):
-                live = to_decimal(row.get("qty"))
-                if live is not None:
-                    return live
-            # 有组合数据但当前资产无仓位 = 平仓(0)。
-            return Decimal("0")
-        dom = await self._read_dom_position_qty()
-        if dom is not None:
-            return dom
-        return self._last_dom_position_qty
+            return None
+        if not isinstance(state, dict) or not state.get("has_portfolio"):
+            return None
+        row = state.get("position_row")
+        if isinstance(row, dict):
+            live = to_decimal(row.get("qty"))
+            if live is not None:
+                return live
+        # 有组合数据但当前资产无仓位 = 平仓(0)。
+        return Decimal("0")
+
+    async def _refresh_position_cache(self, *, allow_dom: bool = True) -> None:
+        """刷新缓存仓位：listener 优先；allow_dom 时 listener 无数据再走 DOM 往返。"""
+        pos = await self._read_listener_position()
+        if pos is None and allow_dom:
+            pos = await self._read_dom_position_qty()
+        if pos is None:
+            pos = self._last_dom_position_qty
+        if pos is not None:
+            self._cached_position_qty = pos
+
+    async def _refresh_position_cache_after_fill(self, prev_qty: Decimal | None) -> None:
+        """下单完成后刷新仓位：轮询真实仓位，等成交反映出来再放行下一步（有界）。"""
+        deadline = time.monotonic() + POSITION_FILL_REFRESH_TIMEOUT_SECONDS
+        pos: Decimal | None = None
+        while time.monotonic() < deadline and not self.stop_flag:
+            pos = await self._read_listener_position()
+            if pos is None:
+                pos = await self._read_dom_position_qty()
+            if pos is not None and pos != prev_qty:
+                self._cached_position_qty = pos
+                return
+            await asyncio.sleep(POSITION_FILL_REFRESH_POLL_SECONDS)
+        # 超时：用最后读到的真实值兜底（即便未变化），避免缓存长期失真。
+        if pos is not None:
+            self._cached_position_qty = pos
 
     def _evaluate_gradient_signal(
         self,
@@ -1488,8 +1522,8 @@ class VariationalToLighterRuntime:
             self._last_gradient_signal_sig = None
             return None
         signal_sig = signal.signature()
-        if signal_sig != self._last_gradient_signal_sig:
-            self._last_gradient_signal_sig = signal_sig
+        # 在途单未被成交反映前不发下一笔：防止价差在阈值附近抖动造成同仓位重复下单。
+        if signal_sig != self._last_gradient_signal_sig and not self._strategy_order_in_flight:
             self.logger.info(
                 "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
                 signal.action,
@@ -1500,8 +1534,44 @@ class VariationalToLighterRuntime:
                 decimal_to_str(signal.target_qty),
                 decimal_to_str(signal.delta_qty),
             )
-            self._handle_new_gradient_signal(signal)
+            record = self._handle_new_gradient_signal(signal)
+            if record is not None:
+                self._strategy_order_in_flight = True
+                self._last_gradient_signal_sig = signal_sig
         return signal
+
+    async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
+        """实时算两侧触发价差（Var 报价 × Lighter 深度 VWAP），不读仓位。"""
+        var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+        lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+        depth_notional = Decimal(str(self.args.depth_notional))
+        vwap_bid, vwap_ask = await self.get_lighter_depth_quote(depth_notional)
+        sig_bid = vwap_bid if vwap_bid is not None else lighter_bid
+        sig_ask = vwap_ask if vwap_ask is not None else lighter_ask
+        return cross_spread_percentages(var_bid, var_ask, sig_bid, sig_ask)
+
+    async def strategy_loop(self) -> None:
+        """事件驱动评估：盘口刷新唤醒，外加 200ms 兜底覆盖 Var 报价变化。"""
+        await self._refresh_position_cache()
+        while not self.stop_flag:
+            try:
+                await asyncio.wait_for(self._strategy_wake.wait(), timeout=STRATEGY_EVAL_FALLBACK_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            self._strategy_wake.clear()
+            try:
+                await self._run_strategy_evaluation()
+            except Exception:
+                self.logger.exception("策略评估异常")
+
+    async def _run_strategy_evaluation(self) -> None:
+        """单次评估：用缓存仓位（不读），触发后由下单链路刷新仓位。"""
+        pos = self._cached_position_qty
+        if pos is None:
+            self._latest_gradient_signal = None
+            return
+        open_pct, close_pct = await self._compute_signal_spreads()
+        self._latest_gradient_signal = self._evaluate_gradient_signal(open_pct, close_pct, pos)
 
     def _record_dry_run_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
         logger = getattr(self, "logger", None)
@@ -1556,7 +1626,7 @@ class VariationalToLighterRuntime:
 
     async def _send_prepare_browser_order(self, command: BrowserOrderCommand) -> None:
         try:
-            result = await self.browser_order_broker.place_order(command, timeout=25.0)
+            result = await self.browser_order_broker.place_order(command, timeout=BROWSER_ORDER_TIMEOUT_SECONDS)
         except Exception as exc:
             self.logger.warning(
                 "Browser order prepare failed: side=%s qty=%s error=%s",
@@ -1829,34 +1899,44 @@ class VariationalToLighterRuntime:
 
     async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
         side = "sell" if command.side.strip().lower() == "sell" else "buy"
+        is_live_strategy_order = not command.prepare_only and not command.dry_run
         try:
-            result = await self.browser_order_broker.place_order(command, timeout=25.0)
-        except Exception as exc:
-            await self._record_var_order_error(command.trade_key, str(exc))
-            self.logger.warning(
-                "Browser order failed: side=%s qty=%s dry_run=%s error=%s",
+            try:
+                result = await self.browser_order_broker.place_order(command, timeout=BROWSER_ORDER_TIMEOUT_SECONDS)
+            except Exception as exc:
+                await self._record_var_order_error(command.trade_key, str(exc))
+                self.logger.warning(
+                    "Browser order failed: side=%s qty=%s dry_run=%s error=%s",
+                    side,
+                    decimal_to_str(command.qty),
+                    command.dry_run,
+                    exc,
+                )
+                return
+            self.logger.info(
+                "Browser order result: side=%s qty=%s dry_run=%s ok=%s blocked=%s error=%s",
                 side,
                 decimal_to_str(command.qty),
                 command.dry_run,
-                exc,
+                result.get("ok"),
+                result.get("blockedReason"),
+                result.get("error"),
             )
-            return
-        self.logger.info(
-            "Browser order result: side=%s qty=%s dry_run=%s ok=%s blocked=%s error=%s",
-            side,
-            decimal_to_str(command.qty),
-            command.dry_run,
-            result.get("ok"),
-            result.get("blockedReason"),
-            result.get("error"),
-        )
-        if not result.get("ok"):
-            self.logger.warning("Browser order diagnostic: %s", self._browser_order_result_summary(result))
-            await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
-        if result.get("ok"):
-            await self._record_var_submit_result(command.trade_key, result)
-            self._prepared_order_side = side
-            self._last_prepared_order_sig = (side, format(command.qty, "f"))
+            if not result.get("ok"):
+                self.logger.warning("Browser order diagnostic: %s", self._browser_order_result_summary(result))
+                await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
+            if result.get("ok"):
+                await self._record_var_submit_result(command.trade_key, result)
+                self._prepared_order_side = side
+                self._last_prepared_order_sig = (side, format(command.qty, "f"))
+                # 下单后刷新仓位缓存：等成交反映出来，再让评估循环放行下一步。
+                if is_live_strategy_order:
+                    await self._refresh_position_cache_after_fill(self._cached_position_qty)
+        finally:
+            # 无论成败都释放在途单闸并唤醒评估循环，避免卡死步进。
+            if is_live_strategy_order:
+                self._strategy_order_in_flight = False
+                self._strategy_wake.set()
 
     async def _record_var_submit_result(self, trade_key: str | None, result: dict[str, Any]) -> None:
         if not trade_key:
@@ -2063,9 +2143,9 @@ class VariationalToLighterRuntime:
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
             realized_pnl, unrealized_pnl, _pnl_pending, position_qty, avg_open_pct = self.compute_pnl()
 
-        # 真实仓位（listener 优先→DOM 后备）；读不到则 None，不触发策略下单。
-        live_position_qty = await self._resolve_live_position_qty()
-        display_position_qty = live_position_qty if live_position_qty is not None else position_qty
+        # 廉价兜底刷新缓存仓位（仅 listener，无 DOM 往返），防外部手动改仓。
+        await self._refresh_position_cache(allow_dom=False)
+        display_position_qty = self._cached_position_qty if self._cached_position_qty is not None else position_qty
 
         is_zh = self.args.lang == "zh"
         header_title = "Var↔Lit"
@@ -2267,15 +2347,8 @@ class VariationalToLighterRuntime:
                     short_dn,
                 )
 
-        # 仅在拿到真实仓位时评估策略，避免在未知仓位上误下单。
-        if live_position_qty is None:
-            signal = None
-        else:
-            signal = self._evaluate_gradient_signal(
-                long_var_short_lighter_pct,
-                short_var_long_lighter_pct,
-                live_position_qty,
-            )
+        # 评估与下单已移至独立的事件驱动 strategy_loop；渲染只展示其最新信号。
+        signal = self._latest_gradient_signal
         strategy_panel = self._render_strategy_panel(
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
@@ -2460,6 +2533,7 @@ class VariationalToLighterRuntime:
 
         self.trade_task = asyncio.create_task(self.trade_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
+        self._strategy_task = asyncio.create_task(self.strategy_loop())
 
         while not self.stop_flag:
             await asyncio.sleep(0.25)
@@ -2479,6 +2553,10 @@ class VariationalToLighterRuntime:
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
             await asyncio.gather(self.trade_task, return_exceptions=True)
+
+        if self._strategy_task and not self._strategy_task.done():
+            self._strategy_task.cancel()
+            await asyncio.gather(self._strategy_task, return_exceptions=True)
 
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()
