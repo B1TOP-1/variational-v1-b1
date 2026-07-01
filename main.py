@@ -1336,8 +1336,20 @@ class VariationalToLighterRuntime:
             else:
                 filled_payload = None
 
+            # 老逻辑：策略未启动时，手动(非策略) Var 成交 → Lighter 自动对冲（仅一次）。
+            # 策略单用 "strategy:" 前缀区分，且已由 _handle_new_gradient_signal 对冲，跳过。
+            should_hedge_manual = (
+                should_set_fill
+                and self.args.auto_hedge
+                and not record.trade_key.startswith("strategy:")
+                and record.lighter_side is None
+                and not self.gradient_strategy.enabled
+            )
+
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
+        if should_hedge_manual:
+            self._schedule_background_task(self.place_lighter_order(record))
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -2249,7 +2261,10 @@ class VariationalToLighterRuntime:
             qty_cell = f"[black on yellow]{qty_cell}[/]"
         elif selected:
             qty_cell = f"[bold]{qty_cell}[/]"
-        row_text = f"{cursor} {index + 1}. {threshold_cell} -> {qty_cell}"
+        # ✅ 表示该行已完整输入（价差+仓位都填了）→ 会参与触发；空白=尚未填全。
+        complete = self.gradient_strategy.rows_for(section)[index].is_complete()
+        mark = "✅" if complete else "  "
+        row_text = f"{cursor} {index + 1}. {mark} {threshold_cell} -> {qty_cell}"
         if selected:
             return f"[reverse]{row_text}[/]"
         return row_text

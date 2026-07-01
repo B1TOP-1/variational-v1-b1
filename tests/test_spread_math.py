@@ -424,7 +424,7 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.var_fill_ts_iso, "2026-06-28T00:00:00Z")
         self.assertEqual(runtime.appended[0][0], "variational_fill")
 
-    async def test_variational_created_record_no_longer_triggers_lighter_hedge(self):
+    async def _run_manual_var_fill(self, *, strategy_enabled: bool) -> int:
         runtime = object.__new__(VariationalToLighterRuntime)
         runtime.args = argparse.Namespace(auto_hedge=True)
         runtime.accepted_assets = {"BTC"}
@@ -435,6 +435,8 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
         runtime._pending_variational_strategy_order_keys = []
         runtime._pending_trigger_spreads = []
         runtime._record_lock = asyncio.Lock()
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime.gradient_strategy.enabled = strategy_enabled
         runtime.hedge_calls = 0
 
         async def append_order_log(event_type, payload):
@@ -457,9 +459,15 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "price": "100",
             }
         )
-
-        self.assertEqual(runtime.hedge_calls, 0)
+        await asyncio.sleep(0)  # 让调度的对冲任务跑一次
         self.assertEqual(len(runtime.records), 1)
+        return runtime.hedge_calls
+
+    async def test_manual_var_fill_hedges_when_strategy_disabled(self):
+        self.assertEqual(await self._run_manual_var_fill(strategy_enabled=False), 1)
+
+    async def test_manual_var_fill_not_hedged_when_strategy_enabled(self):
+        self.assertEqual(await self._run_manual_var_fill(strategy_enabled=True), 0)
 
     async def test_variational_fill_binds_with_equivalent_asset_symbol(self):
         runtime = object.__new__(VariationalToLighterRuntime)
