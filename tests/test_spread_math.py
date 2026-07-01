@@ -11,6 +11,7 @@ from main import (
     PendingTriggerSpread,
     VariationalToLighterRuntime,
     cross_spread_percentages,
+    fill_diff_by_direction,
 )
 from variational.gradient_strategy import GradientSignal, GradientStrategyState
 from variational.gradient_strategy import StrategySection
@@ -29,11 +30,10 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(short_pct, Decimal("-2.941176470588235294117647059"))
 
     def test_fill_diff_uses_raw_lighter_price_without_stablecoin_normalization(self):
-        diff, pct = VariationalToLighterRuntime._fill_diff_by_direction(
+        diff, pct = fill_diff_by_direction(
             "buy",
             Decimal("100"),
             Decimal("101"),
-            Decimal("1.10"),
         )
 
         self.assertEqual(diff, Decimal("1"))
@@ -52,7 +52,6 @@ class SpreadMathTest(unittest.TestCase):
             last_variational_status="filled",
             var_fill_price=Decimal("100"),
             lighter_fill_price=Decimal("101"),
-            fill_usdc_usdt_rate=Decimal("1.10"),
         )
 
         self.assertEqual(runtime._record_unit_spread(record), Decimal("1"))

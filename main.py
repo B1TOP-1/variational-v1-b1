@@ -241,9 +241,6 @@ class OrderLifecycle:
     var_submit_quote_snapshot: dict[str, Any] | None = None
     var_submit_order_response: dict[str, Any] | None = None
 
-    # USDC/USDT (USDT per 1 USDC) captured when the hedge leg fills. This is a
-    # reference basis value only; raw price spread and PnL do not normalize by it.
-    fill_usdc_usdt_rate: Decimal | None = None
     trigger_spread_pct: Decimal | None = None
     strategy_action: str | None = None
     strategy_target_qty: Decimal | None = None
@@ -262,7 +259,6 @@ class OrderLifecycle:
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
-            "fill_usdc_usdt_rate": decimal_to_str(self.fill_usdc_usdt_rate),
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
             "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
             "strategy_action": self.strategy_action,
@@ -754,7 +750,6 @@ class VariationalToLighterRuntime:
 
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
-            record.fill_usdc_usdt_rate = self.usdc_usdt_rate
             payload = record.to_payload()
             # 成交已回填，映射项不再需要，弹出以释放。
             self.lighter_client_order_to_trade_key.pop(client_order_id, None)
@@ -1429,15 +1424,6 @@ class VariationalToLighterRuntime:
         return f"[{color}]{self._fmt_pct(current)}[/{color}]"
 
     @staticmethod
-    def _fill_diff_by_direction(
-        side: str,
-        var_fill_price: Decimal | None,
-        lighter_fill_price: Decimal | None,
-        rate: Decimal | None = None,
-    ) -> tuple[Decimal | None, Decimal | None]:
-        return fill_diff_by_direction(side, var_fill_price, lighter_fill_price)
-
-    @staticmethod
     def _decimal_as_float(value: Decimal | None) -> float | None:
         if value is None:
             return None
@@ -1579,9 +1565,8 @@ class VariationalToLighterRuntime:
             if unit is None:
                 pending += 1
                 continue
-            rate = record.fill_usdc_usdt_rate or self.usdc_usdt_rate
-            _, pct = self._fill_diff_by_direction(
-                record.side, record.var_fill_price, record.lighter_fill_price, rate
+            _, pct = fill_diff_by_direction(
+                record.side, record.var_fill_price, record.lighter_fill_price
             )
             side = record.side.strip().lower()
             qty = record.qty
@@ -2476,11 +2461,10 @@ class VariationalToLighterRuntime:
             for row in rows:
                 payload = row.to_payload()
                 trade_display = row.trade_id[:10] if row.trade_id else row.trade_key[:10]
-                fill_diff, fill_diff_pct = self._fill_diff_by_direction(
+                fill_diff, fill_diff_pct = fill_diff_by_direction(
                     row.side,
                     row.var_fill_price,
                     row.lighter_fill_price,
-                    row.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
                 slippage_pct = row.spread_slippage_pct()
                 side_zh, side_en = self._direction_labels(row.side)
@@ -2571,11 +2555,10 @@ class VariationalToLighterRuntime:
                 if record is None:
                     continue
                 payload = record.to_payload()
-                fill_diff, fill_diff_pct = self._fill_diff_by_direction(
+                fill_diff, fill_diff_pct = fill_diff_by_direction(
                     record.side,
                     record.var_fill_price,
                     record.lighter_fill_price,
-                    record.fill_usdc_usdt_rate or self.usdc_usdt_rate,
                 )
                 slippage_pct = record.spread_slippage_pct()
                 side_zh, side_en = self._direction_labels(record.side)
@@ -2594,7 +2577,6 @@ class VariationalToLighterRuntime:
                         "lighter_client_order_id": payload["lighter_client_order_id"],
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
-                        "fill_usdc_usdt_rate": payload["fill_usdc_usdt_rate"],
                         "trigger_spread_pct": payload["trigger_spread_pct"],
                         "strategy_action": payload["strategy_action"],
                         "strategy_target_qty": payload["strategy_target_qty"],
@@ -2636,7 +2618,6 @@ class VariationalToLighterRuntime:
             "lighter_client_order_id",
             "lighter_filled_price",
             "lighter_filled_at",
-            "fill_usdc_usdt_rate",
             "trigger_spread_pct",
             "strategy_action",
             "strategy_target_qty",
