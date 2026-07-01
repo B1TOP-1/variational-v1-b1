@@ -62,7 +62,6 @@ class GradientStrategyState:
     enabled: bool = False
     edit_buffer: str | None = None
     _escape_buffer: str = ""
-    _last_close_spread_pct: Decimal | None = None
 
     @classmethod
     def default(cls) -> GradientStrategyState:
@@ -159,11 +158,9 @@ class GradientStrategyState:
         current_position_qty: Decimal,
     ) -> GradientSignal | None:
         if not self.enabled:
-            self._last_close_spread_pct = close_spread_pct
             return None
         # 单向持仓单轴语义：仓位带符号（正=多 / 负=空），不做多空钳制。
         close_signal = self._evaluate_close(close_spread_pct, current_position_qty)
-        self._last_close_spread_pct = close_spread_pct
         if close_signal is not None:
             return close_signal
         return self._evaluate_open(open_spread_pct, current_position_qty)
@@ -219,19 +216,15 @@ class GradientStrategyState:
         )
 
     def _evaluate_close(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
-        # current_qty 带符号；清仓 target 可为 0 或负数（继续做空到 -N），
-        # 故不再用 current_qty<=0 拦截，仅靠 delta=current-target>0 触发卖出。
-        if spread_pct is None or self._last_close_spread_pct is None:
+        # 电平触发：平仓价差 >= 阈值即刻平仓（价差越高越有利；阈值 -0.1 时 -0.09/-0.08 平、-0.12 不平），
+        # 与开仓同方向，不需要穿越。current_qty 带符号；target 可为 0 或负数（继续做空到 -N），
+        # 靠 delta=current-target>0 触发卖出。
+        if spread_pct is None:
             return None
-        previous_spread = self._last_close_spread_pct
-        rows = sorted(
-            (row for row in self.close_rows if row.is_complete()),
-            key=lambda row: row.threshold_pct,
-            reverse=True,
-        )
+        rows = sorted((row for row in self.close_rows if row.is_complete()), key=lambda row: row.threshold_pct)
         selected: GradientRow | None = None
         for row in rows:
-            if row.threshold_pct is not None and previous_spread > row.threshold_pct and spread_pct <= row.threshold_pct:
+            if row.threshold_pct is not None and spread_pct >= row.threshold_pct:
                 selected = row
         if selected is None or selected.target_qty is None or selected.threshold_pct is None:
             return None

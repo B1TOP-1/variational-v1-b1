@@ -154,48 +154,70 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         self.assertIsNone(signal)
 
-    def test_close_signal_fires_on_downward_crossing(self):
+    def test_close_fires_when_spread_at_or_above_threshold(self):
+        # 阈值 -0.1：价差 -0.08（≥ -0.1）→ 平；无需穿越。
         state = GradientStrategyState.default()
         state.handle_key("\r")
-        state.close_rows[0].threshold_pct = Decimal("0.09")
+        state.close_rows[0].threshold_pct = Decimal("-0.1")
+        state.close_rows[0].target_qty = Decimal("0")
+
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("-0.08"),
+            current_position_qty=Decimal("0.05"),
+        )
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "close")
+        self.assertEqual(signal.delta_qty, Decimal("0.05"))
+        self.assertEqual(signal.target_qty, Decimal("0"))
+
+    def test_close_holds_when_spread_below_threshold(self):
+        # 阈值 -0.1：价差 -0.12（< -0.1）→ 不平。
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.close_rows[0].threshold_pct = Decimal("-0.1")
+        state.close_rows[0].target_qty = Decimal("0")
+
+        signal = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("-0.12"),
+            current_position_qty=Decimal("0.05"),
+        )
+
+        self.assertIsNone(signal)
+
+    def test_close_gradient_picks_highest_satisfied_threshold(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.close_rows[0].threshold_pct = Decimal("0.07")
         state.close_rows[0].target_qty = Decimal("0.002")
         state.add_row(StrategySection.CLOSE)
         state.close_rows[1].threshold_pct = Decimal("0.08")
         state.close_rows[1].target_qty = Decimal("0.001")
         state.add_row(StrategySection.CLOSE)
-        state.close_rows[2].threshold_pct = Decimal("0.07")
+        state.close_rows[2].threshold_pct = Decimal("0.09")
         state.close_rows[2].target_qty = Decimal("0")
 
-        state.evaluate(
+        # 只满足最低阈值 0.07 → target 0.002（平一点）
+        shallow = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.075"),
+            current_position_qty=Decimal("0.003"),
+        )
+        self.assertIsNotNone(shallow)
+        self.assertEqual(shallow.target_qty, Decimal("0.002"))
+        self.assertEqual(shallow.delta_qty, Decimal("0.001"))
+
+        # 价差更高，满足全部 → 取最高阈值 0.09 → target 0（平更多）
+        deep = state.evaluate(
             open_spread_pct=Decimal("0.00"),
             close_spread_pct=Decimal("0.10"),
             current_position_qty=Decimal("0.003"),
         )
-        signal = state.evaluate(
-            open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("0.07"),
-            current_position_qty=Decimal("0.003"),
-        )
-
-        self.assertIsNotNone(signal)
-        self.assertEqual(signal.action, "close")
-        self.assertEqual(signal.delta_qty, Decimal("0.003"))
-        self.assertEqual(signal.target_qty, Decimal("0"))
-
-    def test_close_does_not_fire_before_crossing(self):
-        state = GradientStrategyState.default()
-        state.open_rows[0].threshold_pct = Decimal("0.11")
-        state.open_rows[0].target_qty = Decimal("0.001")
-        state.close_rows[0].threshold_pct = Decimal("0.07")
-        state.close_rows[0].target_qty = Decimal("0")
-
-        signal = state.evaluate(
-            open_spread_pct=Decimal("0.12"),
-            close_spread_pct=Decimal("0.00"),
-            current_position_qty=Decimal("0.001"),
-        )
-
-        self.assertIsNone(signal)
+        self.assertIsNotNone(deep)
+        self.assertEqual(deep.target_qty, Decimal("0"))
+        self.assertEqual(deep.delta_qty, Decimal("0.003"))
     def test_open_signal_uses_signed_position(self):
         state = GradientStrategyState.default()
         state.handle_key("\r")
@@ -218,11 +240,6 @@ class GradientStrategyStateTest(unittest.TestCase):
         state.close_rows[0].threshold_pct = Decimal("0.07")
         state.close_rows[0].target_qty = Decimal("-0.1")
 
-        state.evaluate(
-            open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("0.10"),
-            current_position_qty=Decimal("0"),
-        )
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
             close_spread_pct=Decimal("0.07"),
@@ -240,11 +257,6 @@ class GradientStrategyStateTest(unittest.TestCase):
         state.close_rows[0].threshold_pct = Decimal("0.07")
         state.close_rows[0].target_qty = Decimal("-0.1")
 
-        state.evaluate(
-            open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("0.10"),
-            current_position_qty=Decimal("-0.1"),
-        )
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
             close_spread_pct=Decimal("0.07"),
