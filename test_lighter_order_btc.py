@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env-file", default=".env", help="env 文件路径（默认 .env）")
     parser.add_argument("--ticker", default="BTC", help="标的（默认 BTC）")
     parser.add_argument("--side", choices=["buy", "sell"], default="buy", help="方向（默认 buy）")
-    parser.add_argument("--size", default="", help="下单量（默认取该市场最小步长）")
+    parser.add_argument("--size", default="0.001", help="下单量（默认 0.001）")
     parser.add_argument("--offset", type=float, default=0.02, help="挂单偏离盘口比例，默认 0.02(2%%) 远离不成交")
     parser.add_argument("--submit", action="store_true", help="真正发单（不加则仅 dry-run）")
     return parser.parse_args()
@@ -112,7 +112,7 @@ async def run(args: argparse.Namespace) -> None:
             print("!! 拿不到盘口，退出")
             return
 
-        qty = Decimal(args.size) if args.size else (Decimal("1") / Decimal(base_mult))
+        qty = Decimal(args.size)
         offset = Decimal(str(args.offset))
         if args.side == "buy":
             is_ask = False
