@@ -58,7 +58,8 @@ APP_LOG_FILE = LOG_DIR / "runtime.log"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
-BROWSER_ORDER_TIMEOUT_SECONDS = 10.0
+# broker 层等待必须 >= 页面内 timeout_ms，否则会在页面返回前假超时。
+BROWSER_ORDER_BROKER_MARGIN_SECONDS = 8.0
 LIGHTER_ORDER_MAP_MAX = 500
 DOM_POSITION_TIMEOUT_SECONDS = 5.0
 STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
@@ -943,6 +944,7 @@ class VariationalToLighterRuntime:
             async with self._record_lock:
                 record.hedge_error = "Lighter order book not ready"
                 payload = record.to_payload()
+            self.logger.warning("Lighter 对冲失败(盘口未就绪): key=%s side=%s qty=%s", record.trade_key, side, decimal_to_str(record.qty))
             await self.append_order_log("lighter_error", payload)
             return
 
@@ -959,6 +961,7 @@ class VariationalToLighterRuntime:
             async with self._record_lock:
                 record.hedge_error = f"Hedge base amount rounds to zero ({record.qty})"
                 payload = record.to_payload()
+            self.logger.warning("Lighter 对冲失败(数量向下取整为0): key=%s qty=%s multiplier=%s", record.trade_key, decimal_to_str(record.qty), self.base_amount_multiplier)
             await self.append_order_log("lighter_error", payload)
             return
 
@@ -997,11 +1000,16 @@ class VariationalToLighterRuntime:
                 while len(self.lighter_client_order_to_trade_key) > LIGHTER_ORDER_MAP_MAX:
                     oldest = next(iter(self.lighter_client_order_to_trade_key))
                     self.lighter_client_order_to_trade_key.pop(oldest, None)
+            self.logger.info(
+                "Lighter 对冲已下单: key=%s side=%s base_amount=%s price=%s coid=%s",
+                record.trade_key, side, base_amount, price_i, client_order_id,
+            )
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
                 record.hedge_error = str(exc)
                 payload = record.to_payload()
+            self.logger.warning("Lighter 对冲失败(下单异常): key=%s side=%s error=%s", record.trade_key, side, exc)
             await self.append_order_log("lighter_error", payload)
 
     @staticmethod
@@ -1790,9 +1798,14 @@ class VariationalToLighterRuntime:
             return
         await self._send_browser_order(command)
 
+    @staticmethod
+    def _browser_order_timeout(command: BrowserOrderCommand) -> float:
+        # broker 等待 = 页面内回执上限 + 余量（选方向/输入/提交轮询），保证不早于页面返回。
+        return command.timeout_ms / 1000.0 + BROWSER_ORDER_BROKER_MARGIN_SECONDS
+
     async def _send_prepare_browser_order(self, command: BrowserOrderCommand) -> None:
         try:
-            result = await self.browser_order_broker.place_order(command, timeout=BROWSER_ORDER_TIMEOUT_SECONDS)
+            result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
         except Exception as exc:
             self.logger.warning(
                 "Browser order prepare failed: side=%s qty=%s error=%s",
@@ -2068,7 +2081,7 @@ class VariationalToLighterRuntime:
         is_live_strategy_order = not command.prepare_only and not command.dry_run
         try:
             try:
-                result = await self.browser_order_broker.place_order(command, timeout=BROWSER_ORDER_TIMEOUT_SECONDS)
+                result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
             except Exception as exc:
                 await self._record_var_order_error(command.trade_key, str(exc))
                 self.logger.warning(
