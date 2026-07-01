@@ -348,6 +348,20 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(rt._strategy_halted)
 
+    async def test_warm_lighter_skips_without_hedge(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = False
+        await rt.warm_lighter()
+        self.assertFalse(rt._lighter_ready)
+
+    async def test_warm_lighter_sets_ready_on_success(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+        rt.initialize_lighter_client = lambda: None
+        rt._rest_get_lighter_account = lambda: {}
+        await rt.warm_lighter()
+        self.assertTrue(rt._lighter_ready)
+
     async def test_confirm_hedge_ok_when_balanced(self):
         rt = self._runtime()
         rt.base_amount_multiplier = 1000

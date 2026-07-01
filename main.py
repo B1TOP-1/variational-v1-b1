@@ -388,6 +388,11 @@ class VariationalToLighterRuntime:
             self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
         self.lighter_client: SignerClient | None = None
         self._lighter_signer_lock = asyncio.Lock()
+        # Lighter REST 连接复用 + 预热就绪标志。
+        self._lighter_http_session = requests.Session()
+        self._lighter_http_session.headers.update({"accept": "application/json"})
+        self._lighter_ready = False
+        self._lighter_warm_task: asyncio.Task[None] | None = None
 
         self.lighter_market_index = 0
         self.base_amount_multiplier = 0
@@ -561,6 +566,19 @@ class VariationalToLighterRuntime:
             if err is not None:
                 raise RuntimeError(f"CheckClient error: {err}")
         return self.lighter_client
+
+    async def warm_lighter(self) -> None:
+        """Lighter 预热：建签名客户端 + 校验 + 暖一次 REST（复用连接）；就绪后置标志。"""
+        if not self.args.auto_hedge:
+            return
+        try:
+            await asyncio.to_thread(self.initialize_lighter_client)
+            await asyncio.to_thread(self._rest_get_lighter_account)  # 暖 TLS/连接池
+            self._lighter_ready = True
+            self.logger.info("Lighter 预热完成：签名客户端就绪 + REST 连接复用")
+        except Exception as exc:
+            self._lighter_ready = False
+            self.logger.warning("Lighter 预热失败: %s", exc)
 
     def get_lighter_market_config(self) -> tuple[int, int, int]:
         if not self.ticker:
@@ -1068,10 +1086,9 @@ class VariationalToLighterRuntime:
                 await asyncio.sleep(1.0)
 
     def _rest_get_lighter_account(self) -> dict[str, Any]:
-        response = requests.get(
+        response = self._lighter_http_session.get(
             f"{self.lighter_base_url}/api/v1/account",
             params={"by": "index", "value": self.account_index},
-            headers={"accept": "application/json"},
             timeout=10,
         )
         response.raise_for_status()
@@ -2390,10 +2407,18 @@ class VariationalToLighterRuntime:
         if self._strategy_halted:
             stop_label = "停止" if is_zh else "HALT"
             halt_text = f"[bold red]⛔{stop_label}: {self._halt_reason}[/] | "
+        lit_ready_text = ""
+        if self.args.auto_hedge:
+            if self._lighter_ready:
+                ready_label = "Lighter就绪" if is_zh else "Lighter ready"
+                lit_ready_text = f" | [bold green]✅{ready_label}[/]"
+            else:
+                warming_label = "Lighter预热中" if is_zh else "Lighter warming"
+                lit_ready_text = f" | [yellow]…{warming_label}[/]"
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{halt_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}",
+            f"{halt_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
             border_style="red" if self._strategy_halted else "cyan",
         )
 
@@ -2710,7 +2735,7 @@ class VariationalToLighterRuntime:
         await self.wait_for_variational_ready()
         self.logger.info("Variational heartbeat is live")
         if self.args.auto_hedge:
-            self.initialize_lighter_client()
+            self._lighter_warm_task = asyncio.create_task(self.warm_lighter())
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
 
@@ -2749,6 +2774,13 @@ class VariationalToLighterRuntime:
         if self._lighter_account_task and not self._lighter_account_task.done():
             self._lighter_account_task.cancel()
             await asyncio.gather(self._lighter_account_task, return_exceptions=True)
+
+        if self._lighter_warm_task and not self._lighter_warm_task.done():
+            self._lighter_warm_task.cancel()
+            await asyncio.gather(self._lighter_warm_task, return_exceptions=True)
+
+        with contextlib.suppress(Exception):
+            self._lighter_http_session.close()
 
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()
