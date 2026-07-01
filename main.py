@@ -64,6 +64,7 @@ DOM_POSITION_TIMEOUT_SECONDS = 5.0
 STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
 POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
 POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
+POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -427,6 +428,12 @@ class VariationalToLighterRuntime:
         self._strategy_wake = asyncio.Event()
         self._strategy_task: asyncio.Task[None] | None = None
         self._strategy_order_in_flight = False
+        # Lighter 真实账户仓位（account_all 频道，按 symbol）+ 双腿平衡闸状态。
+        self._lighter_positions: dict[str, Decimal] = {}
+        self._lighter_position_ready = asyncio.Event()
+        self._lighter_account_task: asyncio.Task[None] | None = None
+        self._strategy_halted = False
+        self._halt_reason = ""
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -502,8 +509,14 @@ class VariationalToLighterRuntime:
             if self.current_page == 2:
                 self._schedule_prepare_browser_order()
         elif self.current_page == 2:
+            was_enabled = self.gradient_strategy.enabled
             if self.gradient_strategy.handle_key(key):
                 self._schedule_prepare_browser_order()
+            # 由禁用切到启用 → 视为手动确认，解除硬停。
+            if self.gradient_strategy.enabled and not was_enabled and self._strategy_halted:
+                self._strategy_halted = False
+                self._halt_reason = ""
+                self.logger.info("策略硬停已由手动重新启用解除")
         elif key == "1":
             self.current_page = 1
         elif key == "2":
@@ -606,6 +619,12 @@ class VariationalToLighterRuntime:
             self._pending_trigger_spreads.clear()
         self.cross_spread_history.clear()
         self.hourly_spread_buckets.clear()
+        # 换标的：清缓存仓位与在途/停止状态，避免用旧标的仓位误判平衡。
+        self._cached_position_qty = None
+        self._strategy_order_in_flight = False
+        self._strategy_halted = False
+        self._halt_reason = ""
+        self._last_gradient_signal_sig = None
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -989,6 +1008,141 @@ class VariationalToLighterRuntime:
                 record.hedge_error = str(exc)
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
+
+    @staticmethod
+    def _parse_lighter_positions(data: dict[str, Any]) -> dict[str, Decimal]:
+        """从 account_all 消息解析 {symbol: 带符号仓位}（position * sign）。"""
+        result: dict[str, Decimal] = {}
+        positions = data.get("positions", {})
+        if isinstance(positions, dict):
+            pos_iter: Any = positions.values()
+        elif isinstance(positions, list):
+            pos_iter = positions
+        else:
+            return result
+        for pos in pos_iter:
+            if not isinstance(pos, dict):
+                continue
+            symbol = str(pos.get("symbol", "")).strip().upper()
+            if not symbol:
+                continue
+            qty = to_decimal(pos.get("position"))
+            if qty is None:
+                continue
+            try:
+                sign = int(pos.get("sign", 1))
+            except (TypeError, ValueError):
+                sign = 1
+            result[symbol] = qty * sign
+        return result
+
+    async def lighter_account_ws(self) -> None:
+        """订阅 account_all/{account_index}（公开频道）实时追踪 Lighter 真实仓位。"""
+        while not self.stop_flag:
+            try:
+                async with websockets.connect(LIGHTER_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                    first = await asyncio.wait_for(ws.recv(), timeout=10)
+                    if json.loads(first).get("type") != "connected":
+                        self.logger.warning("Lighter account WS: 未收到 connected")
+                    await ws.send(json.dumps({"type": "subscribe", "channel": f"account_all/{self.account_index}"}))
+                    self.logger.info("已订阅 Lighter account_all/%s", self.account_index)
+                    while not self.stop_flag:
+                        raw = await ws.recv()
+                        if isinstance(raw, bytes):
+                            raw = raw.decode("utf-8", errors="replace")
+                        data = json.loads(raw)
+                        msg_type = data.get("type", "")
+                        if msg_type == "ping":
+                            await ws.send(json.dumps({"type": "pong"}))
+                            continue
+                        if msg_type in ("subscribed/account_all", "update/account_all"):
+                            self._lighter_positions.update(self._parse_lighter_positions(data))
+                            self._lighter_position_ready.set()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                self.logger.warning("Lighter account WS 重连: %s", exc)
+                await asyncio.sleep(1.0)
+
+    def _rest_get_lighter_account(self) -> dict[str, Any]:
+        response = requests.get(
+            f"{self.lighter_base_url}/api/v1/account",
+            params={"by": "index", "value": self.account_index},
+            headers={"accept": "application/json"},
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json() if response.text.strip() else {}
+
+    async def _fetch_lighter_position_rest(self) -> Decimal | None:
+        """REST 兜底：WS 未就绪时查询 Lighter 真实仓位。"""
+        try:
+            data = await asyncio.to_thread(self._rest_get_lighter_account)
+        except Exception as exc:
+            self.logger.warning("Lighter REST 仓位查询失败: %s", exc)
+            return None
+        accounts = data.get("accounts") if isinstance(data, dict) else None
+        if not accounts:
+            return None
+        for position in accounts[0].get("positions", []):
+            if str(position.get("symbol", "")).strip().upper() == (self.ticker or "").strip().upper():
+                qty = to_decimal(position.get("position"))
+                if qty is None:
+                    return None
+                try:
+                    sign = int(position.get("sign", 1))
+                except (TypeError, ValueError):
+                    sign = 1
+                return qty * sign
+        return Decimal("0")
+
+    def _current_lighter_position(self) -> Decimal:
+        return self._lighter_positions.get((self.ticker or "").strip().upper(), Decimal("0"))
+
+    def _balance_tolerance(self) -> Decimal:
+        multiplier = self.base_amount_multiplier
+        if not multiplier or multiplier <= 0:
+            return Decimal("0")
+        return Decimal("1") / Decimal(multiplier)  # 1 个最小步长
+
+    def _positions_balanced(self) -> bool:
+        """对冲两腿方向相反，净仓位应约为 0。Var 仓位未知则视为不平衡。"""
+        var_pos = self._cached_position_qty
+        if var_pos is None:
+            return False
+        net = var_pos + self._current_lighter_position()
+        return abs(net) <= self._balance_tolerance()
+
+    def _strategy_order_allowed(self) -> bool:
+        if self._strategy_halted:
+            return False
+        if self.args.auto_hedge and not self._positions_balanced():
+            return False
+        return True
+
+    async def _confirm_hedge_or_halt(self, prev_var_qty: Decimal | None) -> None:
+        """下单后 10s 内确认两腿都到位并重新平衡；超时未平则硬停策略。"""
+        if not self.args.auto_hedge:
+            await self._refresh_position_cache_after_fill(prev_var_qty)
+            return
+        if not self._lighter_position_ready.is_set():
+            rest = await self._fetch_lighter_position_rest()
+            if rest is not None:
+                self._lighter_positions[(self.ticker or "").strip().upper()] = rest
+        deadline = time.monotonic() + POSITION_BALANCE_TIMEOUT_SECONDS
+        while time.monotonic() < deadline and not self.stop_flag:
+            var_pos = await self._read_listener_position()
+            if var_pos is not None:
+                self._cached_position_qty = var_pos
+            if self._positions_balanced():
+                return
+            await asyncio.sleep(POSITION_FILL_REFRESH_POLL_SECONDS)
+        self._strategy_halted = True
+        self._halt_reason = (
+            f"两腿仓位不平衡: Var={decimal_to_str(self._cached_position_qty)} "
+            f"Lighter={decimal_to_str(self._current_lighter_position())}"
+        )
+        self.logger.error("策略已停止（需手动重新启用）：%s", self._halt_reason)
 
     def _make_strategy_trade_key(self) -> str:
         return f"strategy:{time.time_ns()}"
@@ -1537,8 +1691,8 @@ class VariationalToLighterRuntime:
             self._last_gradient_signal_sig = None
             return None
         signal_sig = signal.signature()
-        # 在途单未被成交反映前不发下一笔：防止价差在阈值附近抖动造成同仓位重复下单。
-        if signal_sig != self._last_gradient_signal_sig and not self._strategy_order_in_flight:
+        # 在途单未被成交反映前不发下一笔；且已停止或两腿未平衡时不开新单。
+        if signal_sig != self._last_gradient_signal_sig and not self._strategy_order_in_flight and self._strategy_order_allowed():
             self.logger.info(
                 "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
                 signal.action,
@@ -1944,9 +2098,9 @@ class VariationalToLighterRuntime:
                 await self._record_var_submit_result(command.trade_key, result)
                 self._prepared_order_side = side
                 self._last_prepared_order_sig = (side, format(command.qty, "f"))
-                # 下单后刷新仓位缓存：等成交反映出来，再让评估循环放行下一步。
+                # 下单后确认：Var 单边仅刷新仓位；对冲模式在 10s 内确认两腿平衡，否则硬停。
                 if is_live_strategy_order:
-                    await self._refresh_position_cache_after_fill(self._cached_position_qty)
+                    await self._confirm_hedge_or_halt(self._cached_position_qty)
         finally:
             # 无论成败都释放在途单闸并唤醒评估循环，避免卡死步进。
             if is_live_strategy_order:
@@ -2215,11 +2369,19 @@ class VariationalToLighterRuntime:
         else:
             pos_color = "green" if avg_open_pct >= 0 else "red"
             pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker} [{pos_color}]{avg_open_pct:+.4f}%[/]"
+        lit_pos_text = ""
+        if self.args.auto_hedge:
+            lit_label = "Lit仓" if is_zh else "Litpos"
+            lit_pos_text = f"{lit_label}{self._current_lighter_position():+.3f} | "
+        halt_text = ""
+        if self._strategy_halted:
+            stop_label = "停止" if is_zh else "HALT"
+            halt_text = f"[bold red]⛔{stop_label}: {self._halt_reason}[/] | "
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{pnl_text} | {pos_text} | USDC/USDT={fx_text} | {now_cst_display()}",
-            border_style="cyan",
+            f"{halt_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}",
+            border_style="red" if self._strategy_halted else "cyan",
         )
 
         quote_table = Table(title=quote_title, show_header=True, expand=True)
@@ -2549,6 +2711,8 @@ class VariationalToLighterRuntime:
         self.trade_task = asyncio.create_task(self.trade_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
         self._strategy_task = asyncio.create_task(self.strategy_loop())
+        if self.args.auto_hedge:
+            self._lighter_account_task = asyncio.create_task(self.lighter_account_ws())
 
         while not self.stop_flag:
             await asyncio.sleep(0.25)
@@ -2572,6 +2736,10 @@ class VariationalToLighterRuntime:
         if self._strategy_task and not self._strategy_task.done():
             self._strategy_task.cancel()
             await asyncio.gather(self._strategy_task, return_exceptions=True)
+
+        if self._lighter_account_task and not self._lighter_account_task.done():
+            self._lighter_account_task.cancel()
+            await asyncio.gather(self._lighter_account_task, return_exceptions=True)
 
         if self.lighter_ws_task and not self.lighter_ws_task.done():
             self.lighter_ws_task.cancel()

@@ -220,6 +220,7 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_in_flight_blocks_duplicate_order_on_spread_flap(self):
         rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")  # 两腿平衡，放行平衡闸
         rt.gradient_strategy.enabled = True
         rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
         rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
@@ -292,6 +293,77 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(123, rt.lighter_client_order_to_trade_key)
         self.assertEqual(rt.records[key].lighter_fill_price, Decimal("4000"))
+
+    def test_parse_lighter_positions_applies_sign(self):
+        parsed = VariationalToLighterRuntime._parse_lighter_positions(
+            {"positions": {"1": {"symbol": "BTC", "sign": -1, "position": "0.004"}}}
+        )
+        self.assertEqual(parsed["BTC"], Decimal("-0.004"))
+
+    def test_positions_balanced_requires_opposite_legs(self):
+        rt = self._runtime()
+        rt.base_amount_multiplier = 1000  # 容差 0.001
+        rt.ticker = "BTC"
+        rt._cached_position_qty = Decimal("0.01")  # Var 多
+        rt._lighter_positions = {"BTC": Decimal("-0.01")}  # Lighter 空
+        self.assertTrue(rt._positions_balanced())
+        rt._lighter_positions = {"BTC": Decimal("0")}  # 裸腿
+        self.assertFalse(rt._positions_balanced())
+
+    def test_strategy_order_allowed_gate(self):
+        rt = self._runtime()
+        rt.base_amount_multiplier = 1000
+        rt.ticker = "BTC"
+        rt.args.auto_hedge = True
+        rt._cached_position_qty = Decimal("0.01")
+        rt._lighter_positions = {"BTC": Decimal("-0.01")}
+        self.assertTrue(rt._strategy_order_allowed())  # 平衡
+        rt._strategy_halted = True
+        self.assertFalse(rt._strategy_order_allowed())  # 已停止
+        rt._strategy_halted = False
+        rt._lighter_positions = {"BTC": Decimal("0")}
+        self.assertFalse(rt._strategy_order_allowed())  # 不平衡
+
+    async def test_confirm_hedge_halts_on_timeout(self):
+        import main as main_mod
+
+        rt = self._runtime()
+        rt.base_amount_multiplier = 1000
+        rt.ticker = "BTC"
+        rt.args.auto_hedge = True
+        rt._lighter_position_ready.set()  # 跳过 REST 兜底
+        rt._cached_position_qty = Decimal("0.01")
+        rt._lighter_positions = {"BTC": Decimal("0")}  # 裸腿，永不平衡
+
+        async def reader():
+            return Decimal("0.01")
+
+        rt._read_listener_position = reader
+        original = main_mod.POSITION_BALANCE_TIMEOUT_SECONDS
+        main_mod.POSITION_BALANCE_TIMEOUT_SECONDS = 0.2
+        try:
+            await rt._confirm_hedge_or_halt(Decimal("0"))
+        finally:
+            main_mod.POSITION_BALANCE_TIMEOUT_SECONDS = original
+
+        self.assertTrue(rt._strategy_halted)
+
+    async def test_confirm_hedge_ok_when_balanced(self):
+        rt = self._runtime()
+        rt.base_amount_multiplier = 1000
+        rt.ticker = "BTC"
+        rt.args.auto_hedge = True
+        rt._lighter_position_ready.set()
+        rt._cached_position_qty = Decimal("0.01")
+        rt._lighter_positions = {"BTC": Decimal("-0.01")}  # 已平衡
+
+        async def reader():
+            return Decimal("0.01")
+
+        rt._read_listener_position = reader
+        await rt._confirm_hedge_or_halt(Decimal("0"))
+
+        self.assertFalse(rt._strategy_halted)
 
 
 if __name__ == "__main__":
