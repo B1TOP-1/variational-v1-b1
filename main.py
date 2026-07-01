@@ -2236,10 +2236,15 @@ class VariationalToLighterRuntime:
         signal_text = "无信号"
         if signal is not None:
             action_text = "开仓" if signal.action == "open" else "清仓"
+            # 显示"这一笔实际会下的量"（单次下单量与剩余的较小值，对齐 lot），
+            # 剩余总差额单列，避免与单次下单量混淆。
+            order_qty = self._quantize_to_lighter_lot(
+                min(self.gradient_strategy.single_order_qty, signal.delta_qty)
+            )
             signal_text = (
-                f"[bold yellow]{action_text} {signal.delta_qty:f} {self.ticker}[/] "
+                f"[bold yellow]{action_text} {order_qty:f} {self.ticker}[/] "
                 f"目标 {signal.target_qty:f} | 当前 {signal.current_qty:f} | "
-                f"触发 {signal.threshold_pct:f}%"
+                f"剩余 {signal.delta_qty:f} | 触发 {signal.threshold_pct:f}%"
             )
         strategy_table.add_row(self._strategy_enabled_row_text())
         strategy_table.add_row(self._strategy_single_order_qty_row_text())
