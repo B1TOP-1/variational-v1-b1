@@ -437,6 +437,7 @@ class VariationalToLighterRuntime:
         self._lighter_account_task: asyncio.Task[None] | None = None
         self._strategy_halted = False
         self._halt_reason = ""
+        self._last_block_log_sig: tuple[str, Any] | None = None
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -585,7 +586,8 @@ class VariationalToLighterRuntime:
         while not self.stop_flag and not self._lighter_ready:
             step = "建签名客户端/check_client"
             try:
-                await asyncio.to_thread(self.initialize_lighter_client)
+                # SignerClient 内部依赖运行中的事件循环，必须在主循环里建，勿丢线程。
+                self.initialize_lighter_client()
                 step = "REST account 查询"
                 await asyncio.to_thread(self._rest_get_lighter_account)
                 self._lighter_ready = True
@@ -1733,22 +1735,38 @@ class VariationalToLighterRuntime:
             self._last_gradient_signal_sig = None
             return None
         signal_sig = signal.signature()
-        # 在途单未被成交反映前不发下一笔；且已停止或两腿未平衡时不开新单。
-        if signal_sig != self._last_gradient_signal_sig and not self._strategy_order_in_flight and self._strategy_order_allowed():
-            self.logger.info(
-                "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
-                signal.action,
-                signal.section.value,
-                decimal_to_str(signal.spread_pct),
-                decimal_to_str(signal.threshold_pct),
-                decimal_to_str(signal.current_qty),
-                decimal_to_str(signal.target_qty),
-                decimal_to_str(signal.delta_qty),
-            )
-            record = self._handle_new_gradient_signal(signal)
-            if record is not None:
-                self._strategy_order_in_flight = True
-                self._last_gradient_signal_sig = signal_sig
+        if signal_sig == self._last_gradient_signal_sig or self._strategy_order_in_flight:
+            return signal
+        # 信号已达但被闸拦（已停止 / 两腿不平衡）→ 节流打日志，免得排查半天没线索。
+        if not self._strategy_order_allowed():
+            reason = "已停止" if self._strategy_halted else "两腿不平衡"
+            block_sig = (reason, signal_sig)
+            if block_sig != self._last_block_log_sig:
+                self._last_block_log_sig = block_sig
+                self.logger.warning(
+                    "策略信号已达但未下单: 原因=%s halted=%s var仓=%s lighter仓=%s 容差=%s lighter_positions=%s",
+                    reason,
+                    self._strategy_halted,
+                    decimal_to_str(self._cached_position_qty),
+                    decimal_to_str(self._current_lighter_position()),
+                    decimal_to_str(self._balance_tolerance()),
+                    {k: decimal_to_str(v) for k, v in self._lighter_positions.items()},
+                )
+            return signal
+        self.logger.info(
+            "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
+            signal.action,
+            signal.section.value,
+            decimal_to_str(signal.spread_pct),
+            decimal_to_str(signal.threshold_pct),
+            decimal_to_str(signal.current_qty),
+            decimal_to_str(signal.target_qty),
+            decimal_to_str(signal.delta_qty),
+        )
+        record = self._handle_new_gradient_signal(signal)
+        if record is not None:
+            self._strategy_order_in_flight = True
+            self._last_gradient_signal_sig = signal_sig
         return signal
 
     async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
@@ -2432,6 +2450,18 @@ class VariationalToLighterRuntime:
         if self._strategy_halted:
             stop_label = "停止" if is_zh else "HALT"
             halt_text = f"[bold red]⛔{stop_label}: {self._halt_reason}[/] | "
+        # 两腿不平衡会静默拦住策略下单，显式标出来免得找不到原因。
+        imbalance_text = ""
+        imbalanced = False
+        if self.args.auto_hedge and not self._strategy_halted and self._cached_position_qty is not None:
+            net = self._cached_position_qty + self._current_lighter_position()
+            if abs(net) > self._balance_tolerance():
+                imbalanced = True
+                warn_label = "两腿不平衡·策略暂停下单" if is_zh else "legs unbalanced · orders paused"
+                imbalance_text = (
+                    f"[bold yellow]⚠️{warn_label} 净={net:+.3f}"
+                    f"(Var{self._cached_position_qty:+.3f}/Lit{self._current_lighter_position():+.3f})[/] | "
+                )
         lit_ready_text = ""
         if self.args.auto_hedge:
             if self._lighter_ready:
@@ -2443,8 +2473,8 @@ class VariationalToLighterRuntime:
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{halt_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
-            border_style="red" if self._strategy_halted else "cyan",
+            f"{halt_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
+            border_style="red" if self._strategy_halted else ("yellow" if imbalanced else "cyan"),
         )
 
         quote_table = Table(title=quote_title, show_header=True, expand=True)
