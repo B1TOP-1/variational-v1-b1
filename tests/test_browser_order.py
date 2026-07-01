@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from main import parse_args
+from main import OrderLifecycle
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
@@ -246,6 +247,51 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         await rt._refresh_position_cache_after_fill(Decimal("0"))
 
         self.assertEqual(rt._cached_position_qty, Decimal("0.01"))
+
+
+class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _runtime():
+        return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+
+    def test_quantize_to_lighter_lot_floors_to_step(self):
+        rt = self._runtime()
+        rt.base_amount_multiplier = 1000  # 最小步长 0.001
+        self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0015")), Decimal("0.001"))
+        self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.012")), Decimal("0.012"))
+        self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0005")), Decimal("0"))
+
+    def test_quantize_passthrough_without_multiplier(self):
+        rt = self._runtime()
+        rt.base_amount_multiplier = 0
+        self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0015")), Decimal("0.0015"))
+
+    async def test_lighter_fill_pops_mapping(self):
+        rt = self._runtime()
+        key = "strategy:test"
+        rt.records[key] = OrderLifecycle(
+            trade_key=key,
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.01"),
+            asset="XAU",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        rt.record_order.append(key)
+        rt.lighter_client_order_to_trade_key[123] = key
+
+        await rt.handle_lighter_fill_update(
+            {
+                "status": "filled",
+                "client_order_id": 123,
+                "filled_quote_amount": "40",
+                "filled_base_amount": "0.01",
+            }
+        )
+
+        self.assertNotIn(123, rt.lighter_client_order_to_trade_key)
+        self.assertEqual(rt.records[key].lighter_fill_price, Decimal("4000"))
 
 
 if __name__ == "__main__":

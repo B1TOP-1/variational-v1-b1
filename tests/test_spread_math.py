@@ -194,6 +194,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime.gradient_strategy.single_order_qty = Decimal("0.001")
         runtime.variational_ticker = "BTC"
+        runtime.base_amount_multiplier = 0
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []
@@ -244,6 +245,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime.gradient_strategy.single_order_qty = Decimal("0.005")
         runtime.variational_ticker = "BTC"
+        runtime.base_amount_multiplier = 0
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []

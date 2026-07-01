@@ -59,6 +59,7 @@ TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
 BROWSER_ORDER_TIMEOUT_SECONDS = 10.0
+LIGHTER_ORDER_MAP_MAX = 500
 DOM_POSITION_TIMEOUT_SECONDS = 5.0
 STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
 POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
@@ -736,6 +737,8 @@ class VariationalToLighterRuntime:
             record.lighter_fill_price = fill_price
             record.fill_usdc_usdt_rate = self.usdc_usdt_rate
             payload = record.to_payload()
+            # 成交已回填，映射项不再需要，弹出以释放。
+            self.lighter_client_order_to_trade_key.pop(client_order_id, None)
 
         await self.append_order_log("lighter_fill", payload)
 
@@ -976,6 +979,10 @@ class VariationalToLighterRuntime:
                 record.lighter_tx_hash = tx_hash
                 record.hedge_error = None
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
+                # 上限淘汰最旧未成交项，避免映射表无限增长。
+                while len(self.lighter_client_order_to_trade_key) > LIGHTER_ORDER_MAP_MAX:
+                    oldest = next(iter(self.lighter_client_order_to_trade_key))
+                    self.lighter_client_order_to_trade_key.pop(oldest, None)
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
@@ -1045,9 +1052,17 @@ class VariationalToLighterRuntime:
             resolve_variational_ticker(normalized),
         }
 
+    def _quantize_to_lighter_lot(self, qty: Decimal) -> Decimal:
+        """把下单量向下对齐到 Lighter 最小步长，保证两腿数量完全一致、Lighter 侧不再截断。"""
+        multiplier = self.base_amount_multiplier
+        if not multiplier or multiplier <= 0:
+            return qty  # 未解析到 lot（Var 单边），保持原样
+        units = int(qty * multiplier)  # floor 到整数 lot
+        return Decimal(units) / Decimal(multiplier)
+
     def _handle_new_gradient_signal(self, signal: GradientSignal) -> OrderLifecycle | None:
         side = "buy" if signal.action == "open" else "sell"
-        qty = min(self.gradient_strategy.single_order_qty, signal.delta_qty)
+        qty = self._quantize_to_lighter_lot(min(self.gradient_strategy.single_order_qty, signal.delta_qty))
         if qty <= 0:
             return None
 
