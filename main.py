@@ -66,6 +66,7 @@ STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
 POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
 POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
+LIGHTER_WARM_RETRY_SECONDS = 15.0
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -557,28 +558,47 @@ class VariationalToLighterRuntime:
     def initialize_lighter_client(self) -> SignerClient:
         if self.lighter_client is None:
             api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or required_env("LIGHTER_PRIVATE_KEY")
-            self.lighter_client = SignerClient(
+            client = SignerClient(
                 url=self.lighter_base_url,
                 account_index=self.account_index,
                 api_private_keys={self.api_key_index: api_key_private_key},
             )
-            err = self.lighter_client.check_client()
+            err = client.check_client()
             if err is not None:
+                # 校验不过不落地半初始化的 client，否则重试会跳过校验。
                 raise RuntimeError(f"CheckClient error: {err}")
+            self.lighter_client = client
         return self.lighter_client
 
     async def warm_lighter(self) -> None:
-        """Lighter 预热：建签名客户端 + 校验 + 暖一次 REST（复用连接）；就绪后置标志。"""
+        """Lighter 预热（分步 + 重试）：建签名客户端 + 校验 + 暖一次 REST（复用连接）。"""
         if not self.args.auto_hedge:
             return
-        try:
-            await asyncio.to_thread(self.initialize_lighter_client)
-            await asyncio.to_thread(self._rest_get_lighter_account)  # 暖 TLS/连接池
-            self._lighter_ready = True
-            self.logger.info("Lighter 预热完成：签名客户端就绪 + REST 连接复用")
-        except Exception as exc:
-            self._lighter_ready = False
-            self.logger.warning("Lighter 预热失败: %s", exc)
+        has_pk = bool(os.getenv("API_KEY_PRIVATE_KEY", "").strip() or os.getenv("LIGHTER_PRIVATE_KEY", "").strip())
+        self.logger.info(
+            "Lighter 预热开始: url=%s account_index=%s api_key_index=%s 私钥=%s",
+            self.lighter_base_url,
+            self.account_index,
+            self.api_key_index,
+            "已设置" if has_pk else "缺失(检查 LIGHTER_PRIVATE_KEY / API_KEY_PRIVATE_KEY)",
+        )
+        while not self.stop_flag and not self._lighter_ready:
+            step = "建签名客户端/check_client"
+            try:
+                await asyncio.to_thread(self.initialize_lighter_client)
+                step = "REST account 查询"
+                await asyncio.to_thread(self._rest_get_lighter_account)
+                self._lighter_ready = True
+                self.logger.info("Lighter 预热完成：签名客户端就绪 + REST 连接复用")
+                return
+            except Exception as exc:
+                self.logger.warning(
+                    "Lighter 预热失败[%s]，%.0fs 后重试: %r",
+                    step,
+                    LIGHTER_WARM_RETRY_SECONDS,
+                    exc,
+                )
+                await asyncio.sleep(LIGHTER_WARM_RETRY_SECONDS)
 
     def get_lighter_market_config(self) -> tuple[int, int, int]:
         if not self.ticker:
