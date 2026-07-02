@@ -244,6 +244,9 @@ class OrderLifecycle:
     var_submit_order_response: dict[str, Any] | None = None
 
     trigger_spread_pct: Decimal | None = None
+    # 触发信号那一刻两腿的预期价（Var 腿 / Lighter 腿），用于分腿滑点。
+    var_trigger_price: Decimal | None = None
+    lighter_trigger_price: Decimal | None = None
     strategy_action: str | None = None
     strategy_target_qty: Decimal | None = None
     strategy_current_qty: Decimal | None = None
@@ -263,6 +266,8 @@ class OrderLifecycle:
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
             "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
+            "var_slippage_pct": decimal_to_str(self.var_slippage_pct()),
+            "lighter_slippage_pct": decimal_to_str(self.lighter_slippage_pct()),
             "strategy_action": self.strategy_action,
             "strategy_target_qty": decimal_to_str(self.strategy_target_qty),
             "strategy_current_qty": decimal_to_str(self.strategy_current_qty),
@@ -292,6 +297,24 @@ class OrderLifecycle:
         if fill_pct is None:
             return None
         return fill_pct - self.trigger_spread_pct
+
+    @staticmethod
+    def _leg_slippage_pct(side: str, trigger: Decimal | None, fill: Decimal | None) -> Decimal | None:
+        """单腿滑点%：正=有利。买腿(触发−成交)/触发；卖腿(成交−触发)/触发。"""
+        if trigger is None or fill is None or trigger == 0:
+            return None
+        side_n = side.strip().lower()
+        if side_n == "buy":
+            return (trigger - fill) / trigger * Decimal("100")
+        if side_n == "sell":
+            return (fill - trigger) / trigger * Decimal("100")
+        return None
+
+    def var_slippage_pct(self) -> Decimal | None:
+        return self._leg_slippage_pct(self.side, self.var_trigger_price, self.var_fill_price)
+
+    def lighter_slippage_pct(self) -> Decimal | None:
+        return self._leg_slippage_pct(self.lighter_side or "", self.lighter_trigger_price, self.lighter_fill_price)
 
 
 @dataclass(frozen=True, slots=True)
@@ -438,6 +461,7 @@ class VariationalToLighterRuntime:
         self._strategy_halted = False
         self._halt_reason = ""
         self._last_block_log_sig: tuple[str, Any] | None = None
+        self._last_leg_prices: dict[str, Decimal | None] = {}
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -1194,6 +1218,14 @@ class VariationalToLighterRuntime:
         while trade_key in self.records:
             trade_key = f"strategy:{int(time.time() * 1000) + len(self.records)}"
         asset = self.variational_ticker or self.ticker or "UNKNOWN"
+        # 触发价：开仓(side=buy)→Var买@ask、Lighter卖@bid；清仓(side=sell)→Var卖@bid、Lighter买@ask。
+        prices = self._last_leg_prices
+        if side == "buy":
+            var_trigger = prices.get("var_ask")
+            lighter_trigger = prices.get("lighter_bid")
+        else:
+            var_trigger = prices.get("var_bid")
+            lighter_trigger = prices.get("lighter_ask")
         record = OrderLifecycle(
             trade_key=trade_key,
             trade_id="",
@@ -1204,6 +1236,8 @@ class VariationalToLighterRuntime:
             last_variational_status="strategy_submitted",
             lighter_side="SELL" if side == "buy" else "BUY",
             trigger_spread_pct=signal.spread_pct,
+            var_trigger_price=var_trigger,
+            lighter_trigger_price=lighter_trigger,
             strategy_action=signal.action,
             strategy_target_qty=signal.target_qty,
             strategy_current_qty=signal.current_qty,
@@ -1441,13 +1475,24 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
-    def _fmt_fill_pct_with_slippage(self, fill_pct: Decimal | None, slippage_pct: Decimal | None) -> str:
+    def _fmt_fill_pct_with_leg_slippage(
+        self,
+        fill_pct: Decimal | None,
+        v_slippage_pct: Decimal | None,
+        l_slippage_pct: Decimal | None,
+    ) -> str:
+        """成交价差% + 括号分腿滑点：V/L 各自正=有利(绿)/负=不利(红)。"""
         fill_text = self._fmt_pct(fill_pct)
-        if slippage_pct is None:
+        parts: list[str] = []
+        for label, slip in (("V", v_slippage_pct), ("L", l_slippage_pct)):
+            if slip is None:
+                continue
+            color = "green" if slip >= 0 else "red"
+            sign = "+" if slip >= 0 else ""
+            parts.append(f"{label}[{color}]{sign}{slip:.3f}%[/{color}]")
+        if not parts:
             return fill_text
-        color = "green" if slippage_pct >= 0 else "red"
-        sign = "+" if slippage_pct >= 0 else ""
-        return f"{fill_text} [{color}]({sign}{slippage_pct:.4f}%)[/{color}]"
+        return f"{fill_text} ({' '.join(parts)})"
 
     def _fmt_signal_pct(
         self,
@@ -1777,6 +1822,13 @@ class VariationalToLighterRuntime:
         vwap_bid, vwap_ask = await self.get_lighter_depth_quote(depth_notional)
         sig_bid = vwap_bid if vwap_bid is not None else lighter_bid
         sig_ask = vwap_ask if vwap_ask is not None else lighter_ask
+        # 暂存两腿触发价，供下单时记录、算分腿滑点。
+        self._last_leg_prices = {
+            "var_bid": var_bid,
+            "var_ask": var_ask,
+            "lighter_bid": sig_bid,
+            "lighter_ask": sig_ask,
+        }
         return cross_spread_percentages(var_bid, var_ask, sig_bid, sig_ask)
 
     async def strategy_loop(self) -> None:
@@ -2559,7 +2611,6 @@ class VariationalToLighterRuntime:
                     row.var_fill_price,
                     row.lighter_fill_price,
                 )
-                slippage_pct = row.spread_slippage_pct()
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
                 orders_table.add_row(
@@ -2569,7 +2620,9 @@ class VariationalToLighterRuntime:
                     payload["variational_filled_price"] or "-",
                     payload["lighter_filled_price"] or "-",
                     self._fmt_price(fill_diff),
-                    self._fmt_fill_pct_with_slippage(fill_diff_pct, slippage_pct),
+                    self._fmt_fill_pct_with_leg_slippage(
+                        fill_diff_pct, row.var_slippage_pct(), row.lighter_slippage_pct()
+                    ),
                 )
 
         hourly_title = (
@@ -2677,6 +2730,8 @@ class VariationalToLighterRuntime:
                         "fill_diff": decimal_to_str(fill_diff),
                         "fill_diff_pct": decimal_to_str(fill_diff_pct),
                         "spread_slippage_pct": decimal_to_str(slippage_pct),
+                        "var_slippage_pct": payload["var_slippage_pct"],
+                        "lighter_slippage_pct": payload["lighter_slippage_pct"],
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "var_order_error": payload["var_order_error"],
                         "var_submit_ok": payload["var_submit_ok"],
@@ -2718,6 +2773,8 @@ class VariationalToLighterRuntime:
             "fill_diff",
             "fill_diff_pct",
             "spread_slippage_pct",
+            "var_slippage_pct",
+            "lighter_slippage_pct",
             "auto_hedge_enabled",
             "var_order_error",
             "var_submit_ok",

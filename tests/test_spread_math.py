@@ -72,6 +72,45 @@ class SpreadMathTest(unittest.TestCase):
 
         self.assertEqual(record.spread_slippage_pct(), Decimal("0.00100"))
 
+    def test_leg_slippage_signs(self):
+        # 做多 Var：触发100 成交98 → +2%(买得便宜=有利)；做空 Lighter 成交98 → -2%(卖得便宜=不利)
+        rec = OrderLifecycle(
+            trade_key="t",
+            trade_id="",
+            side="buy",
+            qty=Decimal("1"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            lighter_side="SELL",
+            var_trigger_price=Decimal("100"),
+            var_fill_price=Decimal("98"),
+            lighter_trigger_price=Decimal("100"),
+            lighter_fill_price=Decimal("98"),
+        )
+        self.assertEqual(rec.var_slippage_pct(), Decimal("2"))
+        self.assertEqual(rec.lighter_slippage_pct(), Decimal("-2"))
+
+        # 做空 Lighter 成交101 → +1%(卖得更高=有利)
+        rec2 = OrderLifecycle(
+            trade_key="t2",
+            trade_id="",
+            side="sell",
+            qty=Decimal("1"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            lighter_side="BUY",
+            var_trigger_price=Decimal("100"),
+            var_fill_price=Decimal("101"),
+            lighter_trigger_price=Decimal("100"),
+            lighter_fill_price=Decimal("99"),
+        )
+        # 做空 Var：触发100 成交101 → +1%(卖得更高)
+        self.assertEqual(rec2.var_slippage_pct(), Decimal("1"))
+        # 做多 Lighter：触发100 成交99 → +1%(买得便宜)
+        self.assertEqual(rec2.lighter_slippage_pct(), Decimal("1"))
+
     def test_pending_trigger_spread_binds_by_side_fifo(self):
         runtime = object.__new__(VariationalToLighterRuntime)
         now = time.monotonic()
@@ -194,6 +233,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy.single_order_qty = Decimal("0.001")
         runtime.variational_ticker = "BTC"
         runtime.base_amount_multiplier = 0
+        runtime._last_leg_prices = {}
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []
@@ -245,6 +285,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy.single_order_qty = Decimal("0.005")
         runtime.variational_ticker = "BTC"
         runtime.base_amount_multiplier = 0
+        runtime._last_leg_prices = {}
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []
