@@ -7,6 +7,7 @@ from pathlib import Path
 
 from main import parse_args
 from main import OrderLifecycle
+from main import RunningStat
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
@@ -277,6 +278,38 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _runtime():
         return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+
+    def test_running_stat_avg(self):
+        s = RunningStat()
+        self.assertIsNone(s.avg())
+        s.add(2.0)
+        s.add(4.0)
+        self.assertEqual(s.avg(), 3.0)
+        self.assertEqual(s.last, 4.0)
+        self.assertEqual(s.n, 2)
+
+    def test_slippage_stats_accumulate_once(self):
+        rt = self._runtime()
+        rec = OrderLifecycle(
+            trade_key="strategy:x",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="XAU",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            lighter_side="SELL",
+            var_trigger_price=Decimal("100"),
+            var_fill_price=Decimal("98"),
+            lighter_trigger_price=Decimal("100"),
+            lighter_fill_price=Decimal("98"),
+        )
+        rt._maybe_record_slippage_stats(rec)
+        rt._maybe_record_slippage_stats(rec)  # 去重：只记一次
+        self.assertEqual(rt._stat_both_filled, 1)
+        self.assertEqual(rt._stat_var_slip.n, 1)
+        self.assertEqual(rt._stat_var_slip.last, 2.0)  # 做多 100→98 = +2%
+        self.assertEqual(rt._stat_lighter_slip.last, -2.0)  # 做空 100→98 = -2%
 
     def test_quantize_to_lighter_lot_floors_to_step(self):
         rt = self._runtime()

@@ -252,6 +252,7 @@ class OrderLifecycle:
     strategy_action: str | None = None
     strategy_target_qty: Decimal | None = None
     strategy_current_qty: Decimal | None = None
+    slippage_recorded: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -324,6 +325,22 @@ class PendingTriggerSpread:
     side: str
     spread_pct: Decimal
     created_at_monotonic: float
+
+
+@dataclass(slots=True)
+class RunningStat:
+    """累计统计：次数/总和/最近值 → 均值。用于延迟、滑点等指标面板。"""
+    n: int = 0
+    total: float = 0.0
+    last: float | None = None
+
+    def add(self, value: float) -> None:
+        self.n += 1
+        self.total += value
+        self.last = value
+
+    def avg(self) -> float | None:
+        return self.total / self.n if self.n else None
 
 
 class VariationalRuntime:
@@ -466,6 +483,15 @@ class VariationalToLighterRuntime:
         self._last_leg_prices: dict[str, Decimal | None] = {}
         self._pending_signal_sig: tuple[str, str, str, str, str] | None = None
         self._pending_signal_count = 0
+        self._pending_signal_started_at: float | None = None
+        # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
+        self._stat_fired = 0
+        self._stat_both_filled = 0
+        self._stat_var_latency = RunningStat()
+        self._stat_lighter_latency = RunningStat()
+        self._stat_signal_confirm = RunningStat()
+        self._stat_var_slip = RunningStat()
+        self._stat_lighter_slip = RunningStat()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -821,11 +847,27 @@ class VariationalToLighterRuntime:
 
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
+            self._maybe_record_slippage_stats(record)
             payload = record.to_payload()
             # 成交已回填，映射项不再需要，弹出以释放。
             self.lighter_client_order_to_trade_key.pop(client_order_id, None)
 
         await self.append_order_log("lighter_fill", payload)
+
+    def _maybe_record_slippage_stats(self, record: OrderLifecycle) -> None:
+        """两腿都成交后累计一次分腿滑点（仅策略单有触发价；调用方持 _record_lock）。"""
+        if record.slippage_recorded:
+            return
+        if record.var_fill_price is None or record.lighter_fill_price is None:
+            return
+        self._stat_both_filled += 1
+        v = record.var_slippage_pct()
+        l = record.lighter_slippage_pct()
+        if v is not None:
+            self._stat_var_slip.add(float(v))
+        if l is not None:
+            self._stat_lighter_slip.add(float(l))
+        record.slippage_recorded = True
 
     def build_lighter_ws_url(self) -> str:
         params: list[str] = []
@@ -1042,6 +1084,7 @@ class VariationalToLighterRuntime:
                 client_order_id += 1
 
         try:
+            lighter_started = time.perf_counter()
             async with self._lighter_signer_lock:
                 if not self.lighter_client:
                     self.initialize_lighter_client()
@@ -1056,6 +1099,7 @@ class VariationalToLighterRuntime:
                     reduce_only=False,
                     trigger_price=0,
                 )
+            self._stat_lighter_latency.add((time.perf_counter() - lighter_started) * 1000)
 
             if error is not None:
                 raise RuntimeError(f"Sign error: {error}")
@@ -1414,6 +1458,7 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                self._maybe_record_slippage_stats(record)
                 filled_payload = record.to_payload()
             else:
                 filled_payload = None
@@ -1812,8 +1857,11 @@ class VariationalToLighterRuntime:
         else:
             self._pending_signal_sig = signal_sig
             self._pending_signal_count = 1
+            self._pending_signal_started_at = time.monotonic()
         if self._pending_signal_count < SIGNAL_CONFIRM_COUNT:
             return signal
+        if self._pending_signal_started_at is not None:
+            self._stat_signal_confirm.add((time.monotonic() - self._pending_signal_started_at) * 1000)
         self.logger.info(
             "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
             signal.action,
@@ -1828,6 +1876,7 @@ class VariationalToLighterRuntime:
         if record is not None:
             self._strategy_order_in_flight = True
             self._last_gradient_signal_sig = signal_sig
+            self._stat_fired += 1
         return signal
 
     async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
@@ -2202,9 +2251,12 @@ class VariationalToLighterRuntime:
     async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
         side = "sell" if command.side.strip().lower() == "sell" else "buy"
         is_live_strategy_order = not command.prepare_only and not command.dry_run
+        order_started = time.perf_counter()
         try:
             try:
                 result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
+                if is_live_strategy_order:
+                    self._stat_var_latency.add((time.perf_counter() - order_started) * 1000)
             except Exception as exc:
                 await self._record_var_order_error(command.trade_key, str(exc))
                 self.logger.warning(
@@ -2308,6 +2360,40 @@ class VariationalToLighterRuntime:
             "clickResult": result.get("clickResult"),
         }
         return json.dumps(summary, ensure_ascii=False, default=str)
+
+    def _render_stats_panel(self, is_zh: bool) -> Panel:
+        """第2页统计面板：本地会话累计的延迟 / 分腿滑点 / 信号确认时长 / 下单成交数。"""
+        def fmt_ms(stat: RunningStat) -> str:
+            avg = stat.avg()
+            avg_t = f"{avg:.0f}ms" if avg is not None else "-"
+            last_t = f"{stat.last:.0f}ms" if stat.last is not None else "-"
+            return f"均 {avg_t} | 最近 {last_t} | n={stat.n}"
+
+        def fmt_pct(stat: RunningStat) -> str:
+            avg = stat.avg()
+            avg_t = f"{avg:+.3f}%" if avg is not None else "-"
+            last_t = f"{stat.last:+.3f}%" if stat.last is not None else "-"
+            return f"均 {avg_t} | 最近 {last_t} | n={stat.n}"
+
+        grid = Table.grid(expand=True)
+        grid.add_column(ratio=1)
+        if is_zh:
+            grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
+            grid.add_row(f"信号确认时长: {fmt_ms(self._stat_signal_confirm)}")
+            grid.add_row(f"Var 下单延迟: {fmt_ms(self._stat_var_latency)}")
+            grid.add_row(f"Lighter 下单延迟: {fmt_ms(self._stat_lighter_latency)}")
+            grid.add_row(f"V 滑点(有利+): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
+            title = "统计（本地会话）"
+        else:
+            grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
+            grid.add_row(f"signal confirm: {fmt_ms(self._stat_signal_confirm)}")
+            grid.add_row(f"Var latency: {fmt_ms(self._stat_var_latency)}")
+            grid.add_row(f"Lighter latency: {fmt_ms(self._stat_lighter_latency)}")
+            grid.add_row(f"V slippage(+good): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
+            title = "Stats (session)"
+        return Panel(grid, title=title, border_style="magenta")
 
     def _render_strategy_panel(
         self,
@@ -2702,7 +2788,12 @@ class VariationalToLighterRuntime:
         footer = Panel(f"{page_hint}  |  {page_label}", border_style="dim")
 
         if self.current_page == 2:
-            return Group(header, hourly_table, strategy_panel, footer)
+            stats_panel = self._render_stats_panel(is_zh)
+            body = Table.grid(expand=True)
+            body.add_column(ratio=3)
+            body.add_column(ratio=2)
+            body.add_row(strategy_panel, stats_panel)
+            return Group(header, hourly_table, body, footer)
         return Group(header, quote_table, spread_table, orders_table, footer)
 
     async def export_trade_records_csv(self) -> None:
