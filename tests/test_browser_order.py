@@ -227,12 +227,35 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
+        # 需连续 2 次确认：第 1 次不下单
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 0)
+        # 第 2 次确认 → 下单
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 1)
         self.assertTrue(rt._strategy_order_in_flight)
 
         # 价差抖动：信号消失(指纹重置)再出现，在途期间不得再下单。
         rt._evaluate_gradient_signal(None, None, Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 1)
+
+    async def test_single_tick_signal_is_treated_as_noise(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        # 信号出现1次→消失(噪音)→再出现1次：都只到确认1次，不下单
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        rt._evaluate_gradient_signal(None, None, Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 0)
+        # 再确认1次(连续第2次)→下单
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 1)
 

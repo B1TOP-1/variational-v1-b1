@@ -67,6 +67,8 @@ POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
 POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
+# 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
+SIGNAL_CONFIRM_COUNT = 2
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -462,6 +464,8 @@ class VariationalToLighterRuntime:
         self._halt_reason = ""
         self._last_block_log_sig: tuple[str, Any] | None = None
         self._last_leg_prices: dict[str, Decimal | None] = {}
+        self._pending_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._pending_signal_count = 0
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -686,6 +690,8 @@ class VariationalToLighterRuntime:
         self._strategy_halted = False
         self._halt_reason = ""
         self._last_gradient_signal_sig = None
+        self._pending_signal_sig = None
+        self._pending_signal_count = 0
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -1778,6 +1784,8 @@ class VariationalToLighterRuntime:
         signal = self.gradient_strategy.evaluate(open_spread_pct, close_spread_pct, position_qty)
         if signal is None:
             self._last_gradient_signal_sig = None
+            self._pending_signal_sig = None
+            self._pending_signal_count = 0
             return None
         signal_sig = signal.signature()
         if signal_sig == self._last_gradient_signal_sig or self._strategy_order_in_flight:
@@ -1797,6 +1805,14 @@ class VariationalToLighterRuntime:
                     decimal_to_str(self._balance_tolerance()),
                     {k: decimal_to_str(v) for k, v in self._lighter_positions.items()},
                 )
+            return signal
+        # 噪音过滤：同一信号需连续出现 SIGNAL_CONFIRM_COUNT 次才下单，单次(价差瞬时穿越)视为噪音。
+        if signal_sig == self._pending_signal_sig:
+            self._pending_signal_count += 1
+        else:
+            self._pending_signal_sig = signal_sig
+            self._pending_signal_count = 1
+        if self._pending_signal_count < SIGNAL_CONFIRM_COUNT:
             return signal
         self.logger.info(
             "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
