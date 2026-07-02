@@ -68,7 +68,7 @@ POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
-SIGNAL_CONFIRM_COUNT = 2
+SIGNAL_CONFIRM_COUNT = 3
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
 # 默认 None=关闭：30s 滚动均值滞后，会误杀只持续几秒的真实机会。
 SPIKE_BASELINE_WINDOW_SECONDS = 30.0

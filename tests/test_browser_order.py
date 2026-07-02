@@ -9,6 +9,7 @@ from pathlib import Path
 from main import parse_args
 from main import OrderLifecycle
 from main import RunningStat
+from main import SIGNAL_CONFIRM_COUNT
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
@@ -229,10 +230,11 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
-        # 需连续 2 次确认：第 1 次不下单
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        # 需连续 SIGNAL_CONFIRM_COUNT 次确认：不足时不下单
+        for _ in range(SIGNAL_CONFIRM_COUNT - 1):
+            rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 0)
-        # 第 2 次确认 → 下单
+        # 补足最后一次 → 下单
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 1)
         self.assertTrue(rt._strategy_order_in_flight)
@@ -282,9 +284,9 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         original = main_mod.MAX_SPIKE_DEVIATION_PCT
         main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
         try:
-            # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续2次确认下单
-            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
-            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+            # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续确认满次数后下单
+            for _ in range(SIGNAL_CONFIRM_COUNT):
+                rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
         finally:
             main_mod.MAX_SPIKE_DEVIATION_PCT = original
         self.assertEqual(len(placed), 1)
@@ -298,13 +300,14 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
-        # 信号出现1次→消失(噪音)→再出现1次：都只到确认1次，不下单
+        # 信号出现→消失(噪音)→再出现：中断使连续计数清零
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         rt._evaluate_gradient_signal(None, None, Decimal("0"))
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))  # 连续=1
         self.assertEqual(len(placed), 0)
-        # 再确认1次(连续第2次)→下单
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        # 连续补齐到 SIGNAL_CONFIRM_COUNT → 下单
+        for _ in range(SIGNAL_CONFIRM_COUNT - 1):
+            rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 1)
 
     async def test_refresh_after_fill_waits_for_position_change(self):
