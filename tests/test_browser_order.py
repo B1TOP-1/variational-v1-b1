@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import unittest
 from asyncio import Future
 from decimal import Decimal
@@ -240,6 +241,38 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         rt._evaluate_gradient_signal(None, None, Decimal("0"))
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
         rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 1)
+
+    async def test_spike_far_above_recent_average_is_rejected(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        now = time.monotonic()
+        rt.cross_spread_history.extend((now, 0.07, 0.0) for _ in range(30))  # 近期均值 0.07
+        # 触发 0.12 远超均值 0.07(偏离0.05>0.02) → 尖峰，多次也不下单
+        for _ in range(3):
+            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        self.assertEqual(len(placed), 0)
+
+    async def test_signal_near_recent_average_passes_spike_filter(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        now = time.monotonic()
+        rt.cross_spread_history.extend((now, 0.115, 0.0) for _ in range(30))  # 均值贴近阈值
+        # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续2次确认下单
+        rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
         self.assertEqual(len(placed), 1)
 
     async def test_single_tick_signal_is_treated_as_noise(self):
