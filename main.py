@@ -69,9 +69,10 @@ POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
 SIGNAL_CONFIRM_COUNT = 2
-# 尖峰过滤：触发价差相对近期均值(下窗口秒数)的最大允许偏离，超过视为瞬时噪音。
+# 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
+# 默认 None=关闭：30s 滚动均值滞后，会误杀只持续几秒的真实机会。
 SPIKE_BASELINE_WINDOW_SECONDS = 30.0
-MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
+MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
@@ -1854,23 +1855,24 @@ class VariationalToLighterRuntime:
                     {k: decimal_to_str(v) for k, v in self._lighter_positions.items()},
                 )
             return signal
-        # 尖峰过滤：触发价差远超近期均值 → 瞬时噪音(如均值0.07突然冒0.12)，不下单并清确认。
-        baseline = self._median_cross_spread(
-            SPIKE_BASELINE_WINDOW_SECONDS, long_side=(signal.section == StrategySection.OPEN)
-        )
-        if baseline is not None and float(signal.spread_pct) - baseline > float(MAX_SPIKE_DEVIATION_PCT):
-            self._pending_signal_sig = None
-            self._pending_signal_count = 0
-            spike_sig = ("spike", signal_sig)
-            if spike_sig != self._last_block_log_sig:
-                self._last_block_log_sig = spike_sig
-                self.logger.warning(
-                    "信号判为尖峰噪音(未下单): 触发价差=%s 近期均值=%.4f%% 允许偏离=%s",
-                    decimal_to_str(signal.spread_pct),
-                    baseline,
-                    decimal_to_str(MAX_SPIKE_DEVIATION_PCT),
-                )
-            return signal
+        # 尖峰过滤（可选，默认关）：触发价差远超近期均值 → 瞬时噪音，不下单并清确认。
+        if MAX_SPIKE_DEVIATION_PCT is not None:
+            baseline = self._median_cross_spread(
+                SPIKE_BASELINE_WINDOW_SECONDS, long_side=(signal.section == StrategySection.OPEN)
+            )
+            if baseline is not None and float(signal.spread_pct) - baseline > float(MAX_SPIKE_DEVIATION_PCT):
+                self._pending_signal_sig = None
+                self._pending_signal_count = 0
+                spike_sig = ("spike", signal_sig)
+                if spike_sig != self._last_block_log_sig:
+                    self._last_block_log_sig = spike_sig
+                    self.logger.warning(
+                        "信号判为尖峰噪音(未下单): 触发价差=%s 近期均值=%.4f%% 允许偏离=%s",
+                        decimal_to_str(signal.spread_pct),
+                        baseline,
+                        decimal_to_str(MAX_SPIKE_DEVIATION_PCT),
+                    )
+                return signal
         # 噪音过滤：同一信号需连续出现 SIGNAL_CONFIRM_COUNT 次才下单，单次(价差瞬时穿越)视为噪音。
         if signal_sig == self._pending_signal_sig:
             self._pending_signal_count += 1

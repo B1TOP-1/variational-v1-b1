@@ -244,6 +244,8 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(placed), 1)
 
     async def test_spike_far_above_recent_average_is_rejected(self):
+        import main as main_mod
+
         rt = self._runtime()
         rt._cached_position_qty = Decimal("0")
         rt.gradient_strategy.enabled = True
@@ -254,12 +256,19 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
 
         now = time.monotonic()
         rt.cross_spread_history.extend((now, 0.07, 0.0) for _ in range(30))  # 近期均值 0.07
-        # 触发 0.12 远超均值 0.07(偏离0.05>0.02) → 尖峰，多次也不下单
-        for _ in range(3):
-            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        original = main_mod.MAX_SPIKE_DEVIATION_PCT
+        main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
+        try:
+            # 触发 0.12 远超均值 0.07(偏离0.05>0.02) → 尖峰，多次也不下单
+            for _ in range(3):
+                rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        finally:
+            main_mod.MAX_SPIKE_DEVIATION_PCT = original
         self.assertEqual(len(placed), 0)
 
     async def test_signal_near_recent_average_passes_spike_filter(self):
+        import main as main_mod
+
         rt = self._runtime()
         rt._cached_position_qty = Decimal("0")
         rt.gradient_strategy.enabled = True
@@ -270,9 +279,14 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
 
         now = time.monotonic()
         rt.cross_spread_history.extend((now, 0.115, 0.0) for _ in range(30))  # 均值贴近阈值
-        # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续2次确认下单
-        rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
-        rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        original = main_mod.MAX_SPIKE_DEVIATION_PCT
+        main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
+        try:
+            # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续2次确认下单
+            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+            rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+        finally:
+            main_mod.MAX_SPIKE_DEVIATION_PCT = original
         self.assertEqual(len(placed), 1)
 
     async def test_single_tick_signal_is_treated_as_noise(self):
