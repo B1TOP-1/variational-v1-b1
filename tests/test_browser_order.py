@@ -438,6 +438,15 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["transitions"]["dom"], 1)
         self.assertEqual(snap["matched"], 1)
 
+    def test_dom_transport_delay_recorded(self):
+        rt = self._runtime()
+        ts_ms = time.time() * 1000.0 - 30.0  # 浏览器事件 30ms 前
+        rt._on_dom_quote({"bid": "100", "ask": "101", "ts": ts_ms})
+        delay = rt._last_quote_delay["dom"]
+        self.assertIsNotNone(delay)
+        self.assertGreaterEqual(delay, 25.0)
+        self.assertLess(delay, 300.0)
+
     def test_api_quote_ignored_for_other_asset(self):
         rt = self._runtime()
         rt.variational_ticker = "XAU"

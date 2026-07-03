@@ -502,6 +502,7 @@ class VariationalToLighterRuntime:
         self._last_dom_ask: Decimal | None = None
         self._last_dom_at: float | None = None
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
+        self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
         self._last_spread_record_ts = 0.0
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
@@ -1960,27 +1961,31 @@ class VariationalToLighterRuntime:
                 return None
         return None
 
-    def _feed_quote_comparator(self, source: str, bid: Any, ask: Any, source_ts: Any) -> None:
+    def _feed_quote_comparator(self, source: str, bid: Any, ask: Any, source_ts: Any, browser_wall_ms: float | None = None) -> None:
         b = to_decimal(bid)
         a = to_decimal(ask)
         if b is None or a is None:
             return
         acquire_ms = time.monotonic() * 1000.0            # 获取时间：本地单调钟(跨源可比)
+        receive_wall_ms = time.time() * 1000.0            # 本地收到墙钟
         change_ms = self._epoch_ms(source_ts)
         if change_ms is None:
-            change_ms = time.time() * 1000.0              # 兜底用本地墙钟(单位一致)
-        self._last_quote_wall[source] = time.time()       # 最近获取墙钟(用于显示)
+            change_ms = receive_wall_ms                   # 兜底用本地墙钟(单位一致)
+        self._last_quote_wall[source] = receive_wall_ms / 1000.0  # 最近获取墙钟(秒，用于显示)
+        # 传输延迟：本地收到 − 浏览器事件墙钟（同机时钟才准）。
+        if browser_wall_ms is not None:
+            self._last_quote_delay[source] = receive_wall_ms - browser_wall_ms
         self.quote_comparator.update(source, float(b), float(a), change_ms, acquire_ms)
 
-    def _on_api_quote(self, asset: str, bid: Any, ask: Any, source_ts: Any) -> None:
+    def _on_api_quote(self, asset: str, bid: Any, ask: Any, source_ts: Any, captured_at: Any = None) -> None:
         # 只喂当前活跃标的，避免与 DOM(仅当前页)错配。
         if self.variational_ticker and str(asset).strip().upper() != self.variational_ticker.strip().upper():
             return
-        self._feed_quote_comparator("api", bid, ask, source_ts)
+        self._feed_quote_comparator("api", bid, ask, source_ts, browser_wall_ms=self._epoch_ms(captured_at))
 
     def _on_dom_quote(self, payload: dict[str, Any]) -> None:
         ts = payload.get("ts") or payload.get("capturedAtMs") or payload.get("timestamp")
-        self._feed_quote_comparator("dom", payload.get("bid"), payload.get("ask"), ts)
+        self._feed_quote_comparator("dom", payload.get("bid"), payload.get("ask"), ts, browser_wall_ms=self._epoch_ms(ts))
         self._last_dom_bid = to_decimal(payload.get("bid"))
         self._last_dom_ask = to_decimal(payload.get("ask"))
         self._last_dom_at = time.monotonic()
@@ -2520,17 +2525,21 @@ class VariationalToLighterRuntime:
         aavg = s["acquire_lead_avg_ms"]
         aavg_t = f"{aavg:.0f}ms" if aavg is not None else "-"
         dv = s["divergences"]
-        api_t = self._fmt_wall_ms(self._last_quote_wall.get("api"))
-        dom_t = self._fmt_wall_ms(self._last_quote_wall.get("dom"))
+        def with_delay(source: str) -> str:
+            t = self._fmt_wall_ms(self._last_quote_wall.get(source))
+            d = self._last_quote_delay.get(source)
+            return f"{t}(+{d:.0f}ms)" if d is not None else t
+        api_t = with_delay("api")
+        dom_t = with_delay("dom")
         if is_zh:
             return (
                 f"报价对比 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
-                f"  最近获取 api={api_t} dom={dom_t}\n"
+                f"  最近获取(+传输延迟) api={api_t} dom={dom_t}\n"
                 f"  获取领先: {aleader} 均{aavg_t} | 背离 api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
             )
         return (
             f"quote-cmp transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
-            f"  last-recv api={api_t} dom={dom_t}\n"
+            f"  last-recv(+delay) api={api_t} dom={dom_t}\n"
             f"  acquire-lead: {aleader} avg {aavg_t} | divergence api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
         )
 

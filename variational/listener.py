@@ -85,7 +85,7 @@ class VariationalMonitor:
             return [f"[MONITOR] REST body is not JSON for {url}"]
 
         async with self._lock:
-            self._update_quote(parsed)
+            self._update_quote(parsed, captured_at=payload.get("capturedAt") or payload.get("captured_at"))
             self.last_update_at = utc_now()
             if self.snapshot_file is not None:
                 await asyncio.to_thread(write_json_file, self.snapshot_file, self.snapshot())
@@ -173,7 +173,7 @@ class VariationalMonitor:
 
         return lines, alerts
 
-    def _update_quote(self, payload: Any) -> None:
+    def _update_quote(self, payload: Any, captured_at: Any = None) -> None:
         if not isinstance(payload, dict):
             return
 
@@ -198,7 +198,7 @@ class VariationalMonitor:
         self.current_quote_asset = asset
         if self.on_quote_update is not None:
             try:
-                self.on_quote_update(asset, bid, ask, ts)
+                self.on_quote_update(asset, bid, ask, ts, captured_at)
             except Exception:
                 pass
 
