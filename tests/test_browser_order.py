@@ -423,6 +423,27 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt._stat_lighter_latency.n, 1)
         self.assertGreaterEqual(rt._stat_lighter_latency.last, 40.0)  # ~50ms 端到端
 
+    def test_epoch_ms_parses_seconds_and_millis(self):
+        self.assertIsNone(VariationalToLighterRuntime._epoch_ms(None))
+        self.assertEqual(VariationalToLighterRuntime._epoch_ms(1700000000000), 1700000000000.0)
+        self.assertEqual(VariationalToLighterRuntime._epoch_ms(1700000000), 1700000000000.0)
+
+    def test_runtime_feeds_quote_comparator(self):
+        rt = self._runtime()
+        rt.variational_ticker = "XAU"
+        rt._on_api_quote("XAU", "100", "101", None)          # api 先出
+        rt._on_dom_quote({"bid": "100", "ask": "101", "ts": None})  # dom 后出 → 匹配
+        snap = rt.quote_comparator.snapshot()
+        self.assertEqual(snap["transitions"]["api"], 1)
+        self.assertEqual(snap["transitions"]["dom"], 1)
+        self.assertEqual(snap["matched"], 1)
+
+    def test_api_quote_ignored_for_other_asset(self):
+        rt = self._runtime()
+        rt.variational_ticker = "XAU"
+        rt._on_api_quote("BTC", "100", "101", None)  # 非活跃标的，忽略
+        self.assertEqual(rt.quote_comparator.snapshot()["transitions"]["api"], 0)
+
     def test_parse_lighter_positions_applies_sign(self):
         parsed = VariationalToLighterRuntime._parse_lighter_positions(
             {"positions": {"1": {"symbol": "BTC", "sign": -1, "position": "0.004"}}}

@@ -42,6 +42,7 @@ from variational.listener import (
 )
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
+from variational.quote_comparator import QuoteComparator
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -69,6 +70,8 @@ POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
 SIGNAL_CONFIRM_COUNT = 3
+# Var 报价过期闸（默认关）：设为毫秒数开启——API 报价超过该时长没更新则不下单。
+VAR_QUOTE_STALE_MS: float | None = None
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
 # 默认 None=关闭：30s 滚动均值滞后，会误杀只持续几秒的真实机会。
 SPIKE_BASELINE_WINDOW_SECONDS = 30.0
@@ -492,6 +495,10 @@ class VariationalToLighterRuntime:
         self._pending_signal_sig: tuple[str, str, str, str, str] | None = None
         self._pending_signal_count = 0
         self._pending_signal_started_at: float | None = None
+        # Var 报价双源对比器（观测记录：API vs DOM）。
+        self.quote_comparator = QuoteComparator(("api", "dom"))
+        self.browser_order_broker.on_dom_quote = self._on_dom_quote
+        self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
         self._stat_fired = 0
         self._stat_both_filled = 0
@@ -1243,6 +1250,11 @@ class VariationalToLighterRuntime:
     def _strategy_order_allowed(self) -> bool:
         if self._strategy_halted:
             return False
+        # Var 报价过期闸（默认关）：API 报价太久没更新则不下单。
+        if VAR_QUOTE_STALE_MS is not None:
+            fresh = self.quote_comparator.freshness_ms("api", time.monotonic() * 1000.0)
+            if fresh is not None and fresh > VAR_QUOTE_STALE_MS:
+                return False
         if self.args.auto_hedge and not self._positions_balanced():
             return False
         return True
@@ -1913,6 +1925,48 @@ class VariationalToLighterRuntime:
             self._stat_fired += 1
         return signal
 
+    @staticmethod
+    def _epoch_ms(ts: Any) -> float | None:
+        """尽力把源时间戳转 epoch 毫秒（数字按秒/毫秒判断，或 ISO）；失败返回 None。"""
+        if ts is None:
+            return None
+        if isinstance(ts, (int, float)):
+            v = float(ts)
+            return v if v > 1e12 else v * 1000.0
+        if isinstance(ts, str):
+            s = ts.strip()
+            try:
+                v = float(s)
+                return v if v > 1e12 else v * 1000.0
+            except ValueError:
+                pass
+            try:
+                return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000.0
+            except ValueError:
+                return None
+        return None
+
+    def _feed_quote_comparator(self, source: str, bid: Any, ask: Any, source_ts: Any) -> None:
+        b = to_decimal(bid)
+        a = to_decimal(ask)
+        if b is None or a is None:
+            return
+        acquire_ms = time.monotonic() * 1000.0            # 获取时间：本地单调钟(跨源可比)
+        change_ms = self._epoch_ms(source_ts)
+        if change_ms is None:
+            change_ms = time.time() * 1000.0              # 兜底用本地墙钟(单位一致)
+        self.quote_comparator.update(source, float(b), float(a), change_ms, acquire_ms)
+
+    def _on_api_quote(self, asset: str, bid: Any, ask: Any, source_ts: Any) -> None:
+        # 只喂当前活跃标的，避免与 DOM(仅当前页)错配。
+        if self.variational_ticker and str(asset).strip().upper() != self.variational_ticker.strip().upper():
+            return
+        self._feed_quote_comparator("api", bid, ask, source_ts)
+
+    def _on_dom_quote(self, payload: dict[str, Any]) -> None:
+        ts = payload.get("ts") or payload.get("capturedAtMs") or payload.get("timestamp")
+        self._feed_quote_comparator("dom", payload.get("bid"), payload.get("ask"), ts)
+
     async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
         """实时算两侧触发价差（Var 报价 × Lighter 深度 VWAP），不读仓位。"""
         var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
@@ -2421,6 +2475,7 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Lighter 延迟(信号→WS成交): {fmt_ms(self._stat_lighter_latency)}")
             grid.add_row(f"V 滑点(有利+): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
+            grid.add_row(self._fmt_quote_compare(is_zh))
             title = "统计（本地会话）"
         else:
             grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
@@ -2430,8 +2485,26 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Lighter latency(signal->wsfill): {fmt_ms(self._stat_lighter_latency)}")
             grid.add_row(f"V slippage(+good): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
+            grid.add_row(self._fmt_quote_compare(is_zh))
             title = "Stats (session)"
         return Panel(grid, title=title, border_style="magenta")
+
+    def _fmt_quote_compare(self, is_zh: bool) -> str:
+        s = self.quote_comparator.snapshot()
+        tr = s["transitions"]
+        aleader = max(s["acquire_lead_counts"], key=s["acquire_lead_counts"].get) if s["acquire_lead_counts"] else "-"
+        aavg = s["acquire_lead_avg_ms"]
+        aavg_t = f"{aavg:.0f}ms" if aavg is not None else "-"
+        dv = s["divergences"]
+        if is_zh:
+            return (
+                f"报价对比 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
+                f"  获取领先: {aleader} 均{aavg_t} | 背离 api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
+            )
+        return (
+            f"quote-cmp transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
+            f"  acquire-lead: {aleader} avg {aavg_t} | divergence api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
+        )
 
     def _render_strategy_panel(
         self,
@@ -2580,6 +2653,7 @@ class VariationalToLighterRuntime:
         # 廉价兜底刷新缓存仓位（仅 listener，无 DOM 往返），防外部手动改仓。
         await self._refresh_position_cache(allow_dom=False)
         display_position_qty = self._cached_position_qty if self._cached_position_qty is not None else position_qty
+        self.quote_comparator.tick(time.monotonic() * 1000.0)  # 推进背离检测
 
         is_zh = self.args.lang == "zh"
         header_title = "Var↔Lit"

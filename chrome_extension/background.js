@@ -615,6 +615,72 @@ async function runInTab(tabId, func, args = []) {
   return results[0].result;
 }
 
+// 注入页面：MutationObserver 盯 bid/ask 显示，变动即通过 chrome.runtime 推给 background。
+// 用 ISOLATED world（可用 chrome.runtime），只读 DOM 不下单。
+function installDomQuoteObserverInPage() {
+  const KEY = "__varDomQuoteObserver__";
+  function parsePrice(text) {
+    const cleaned = String(text == null ? "" : text).replace(/[$,\s]/g, "");
+    const numeric = Number(cleaned);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+  function read() {
+    const askEl = document.querySelector("[data-testid='ask-price-display']");
+    const bidEl = document.querySelector("[data-testid='bid-price-display']");
+    return {
+      ask: parsePrice(askEl && (askEl.innerText || askEl.textContent)),
+      bid: parsePrice(bidEl && (bidEl.innerText || bidEl.textContent))
+    };
+  }
+  let st = window[KEY];
+  if (st && st.active) {
+    return { reused: true };
+  }
+  st = { active: true, last: null, observer: null };
+  window[KEY] = st;
+  const emit = () => {
+    const snapshot = read();
+    if (snapshot.ask == null && snapshot.bid == null) {
+      return;
+    }
+    if (st.last && st.last.ask === snapshot.ask && st.last.bid === snapshot.bid) {
+      return;
+    }
+    st.last = snapshot;
+    try {
+      chrome.runtime.sendMessage({
+        action: "dom_quote_event",
+        payload: { bid: snapshot.bid, ask: snapshot.ask, ts: Date.now() }
+      });
+    } catch (e) {
+      // 忽略瞬时投递失败
+    }
+  };
+  st.observer = new MutationObserver(emit);
+  st.observer.observe(document.body || document.documentElement, {
+    childList: true,
+    characterData: true,
+    subtree: true
+  });
+  emit();
+  return { ok: true };
+}
+
+async function installDomQuoteObserver(tabId) {
+  if (tabId == null) {
+    return;
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: installDomQuoteObserverInPage
+    });
+  } catch (e) {
+    // 页面未就绪/无权限时忽略，reload 完成或下次 attach 会重试。
+  }
+}
+
 async function getActiveTabId() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tabs.length || tabs[0].id == null) {
@@ -646,6 +712,7 @@ async function startForwarding(tabId = null) {
   wsForwarder.connect();
   restForwarder.connect();
   brokerSocket.connect();
+  void installDomQuoteObserver(targetTabId);
   autoReloadAttachedTab("forwarder started");
   notifyStatus();
   return getStatus();
@@ -1523,6 +1590,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   (async () => {
     await ensureConfigLoaded();
 
+    if (message.action === "dom_quote_event") {
+      brokerSocket.send({
+        event: "dom_quote",
+        bid: message.payload && message.payload.bid,
+        ask: message.payload && message.payload.ask,
+        ts: message.payload && message.payload.ts
+      });
+      return { ok: true };
+    }
+
     if (message.action === "getStatus") {
       return { ok: true, status: getStatus() };
     }
@@ -1555,6 +1632,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     .catch((error) => sendResponse({ ok: false, error: error.message }));
 
   return true;
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (state.active && tabId === state.attachedTabId && changeInfo.status === "complete") {
+    void installDomQuoteObserver(tabId);
+  }
 });
 
 chrome.runtime.onInstalled.addListener(() => {

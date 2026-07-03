@@ -64,6 +64,8 @@ class VariationalMonitor:
     _last_hourly_alert_hour: int = 0
     _next_trade_event_seq: int = 1
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    # 可选回调：每次 API 报价更新时调用 (asset, bid, ask, source_timestamp)，仅用于观测记录。
+    on_quote_update: Any = field(default=None, repr=False)
 
     async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
         if payload.get("kind") != "rest_response":
@@ -194,6 +196,11 @@ class VariationalMonitor:
             "raw": payload,
         }
         self.current_quote_asset = asset
+        if self.on_quote_update is not None:
+            try:
+                self.on_quote_update(asset, bid, ask, ts)
+            except Exception:
+                pass
 
     def _update_trade_event(self, payload: Any) -> str | None:
         if not isinstance(payload, dict):
