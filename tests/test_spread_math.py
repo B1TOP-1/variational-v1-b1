@@ -234,6 +234,8 @@ class SpreadMathTest(unittest.TestCase):
         runtime.variational_ticker = "BTC"
         runtime.base_amount_multiplier = 0
         runtime._last_leg_prices = {}
+        runtime._last_dom_bid = None
+        runtime._last_dom_ask = None
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []
@@ -286,6 +288,8 @@ class SpreadMathTest(unittest.TestCase):
         runtime.variational_ticker = "BTC"
         runtime.base_amount_multiplier = 0
         runtime._last_leg_prices = {}
+        runtime._last_dom_bid = None
+        runtime._last_dom_ask = None
         runtime.records = {}
         runtime.record_order = []
         runtime._pending_variational_strategy_order_keys = []

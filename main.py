@@ -256,6 +256,7 @@ class OrderLifecycle:
     # 触发信号那一刻两腿的预期价（Var 腿 / Lighter 腿），用于分腿滑点。
     var_trigger_price: Decimal | None = None
     lighter_trigger_price: Decimal | None = None
+    dom_trigger_price: Decimal | None = None  # 触发时 DOM 报价，用于对比 DOM 口径滑点
     strategy_action: str | None = None
     strategy_target_qty: Decimal | None = None
     strategy_current_qty: Decimal | None = None
@@ -281,6 +282,7 @@ class OrderLifecycle:
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
             "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
             "var_slippage_pct": decimal_to_str(self.var_slippage_pct()),
+            "dom_slippage_pct": decimal_to_str(self.dom_slippage_pct()),
             "lighter_slippage_pct": decimal_to_str(self.lighter_slippage_pct()),
             "strategy_action": self.strategy_action,
             "strategy_target_qty": decimal_to_str(self.strategy_target_qty),
@@ -326,6 +328,9 @@ class OrderLifecycle:
 
     def var_slippage_pct(self) -> Decimal | None:
         return self._leg_slippage_pct(self.side, self.var_trigger_price, self.var_fill_price)
+
+    def dom_slippage_pct(self) -> Decimal | None:
+        return self._leg_slippage_pct(self.side, self.dom_trigger_price, self.var_fill_price)
 
     def lighter_slippage_pct(self) -> Decimal | None:
         return self._leg_slippage_pct(self.lighter_side or "", self.lighter_trigger_price, self.lighter_fill_price)
@@ -512,7 +517,8 @@ class VariationalToLighterRuntime:
         self._stat_lighter_latency = RunningStat()   # 信号触发→Lighter WS成交(端到端)
         self._stat_var_side_switch = RunningStat()   # Var 方向切换耗时(不切=0)
         self._stat_signal_confirm = RunningStat()
-        self._stat_var_slip = RunningStat()
+        self._stat_var_slip = RunningStat()       # Var 滑点(对 API 触发价)
+        self._stat_var_slip_dom = RunningStat()   # Var 滑点(对 DOM 触发价)
         self._stat_lighter_slip = RunningStat()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
@@ -888,9 +894,12 @@ class VariationalToLighterRuntime:
             return
         self._stat_both_filled += 1
         v = record.var_slippage_pct()
+        vd = record.dom_slippage_pct()
         l = record.lighter_slippage_pct()
         if v is not None:
             self._stat_var_slip.add(float(v))
+        if vd is not None:
+            self._stat_var_slip_dom.add(float(vd))
         if l is not None:
             self._stat_lighter_slip.add(float(l))
         record.slippage_recorded = True
@@ -1310,9 +1319,11 @@ class VariationalToLighterRuntime:
         if side == "buy":
             var_trigger = prices.get("var_ask")
             lighter_trigger = prices.get("lighter_bid")
+            dom_trigger = self._last_dom_ask
         else:
             var_trigger = prices.get("var_bid")
             lighter_trigger = prices.get("lighter_ask")
+            dom_trigger = self._last_dom_bid
         record = OrderLifecycle(
             trade_key=trade_key,
             trade_id="",
@@ -1325,6 +1336,7 @@ class VariationalToLighterRuntime:
             trigger_spread_pct=signal.spread_pct,
             var_trigger_price=var_trigger,
             lighter_trigger_price=lighter_trigger,
+            dom_trigger_price=dom_trigger,
             strategy_action=signal.action,
             strategy_target_qty=signal.target_qty,
             strategy_current_qty=signal.current_qty,
@@ -2529,7 +2541,8 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Var 延迟(信号→成交): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  其中方向切换: {fmt_ms(self._stat_var_side_switch)}")
             grid.add_row(f"Lighter 延迟(信号→WS成交): {fmt_ms(self._stat_lighter_latency)}")
-            grid.add_row(f"V 滑点(有利+): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V 滑点·api口径(有利+): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V 滑点·dom口径(有利+): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
             grid.add_row(self._fmt_quote_compare(is_zh))
             title = "统计（本地会话）"
@@ -2539,7 +2552,8 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Var latency(signal->fill): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  side switch: {fmt_ms(self._stat_var_side_switch)}")
             grid.add_row(f"Lighter latency(signal->wsfill): {fmt_ms(self._stat_lighter_latency)}")
-            grid.add_row(f"V slippage(+good): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V slippage/api(+good): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V slippage/dom(+good): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
             grid.add_row(self._fmt_quote_compare(is_zh))
             title = "Stats (session)"
@@ -3028,6 +3042,7 @@ class VariationalToLighterRuntime:
                         "fill_diff_pct": decimal_to_str(fill_diff_pct),
                         "spread_slippage_pct": decimal_to_str(slippage_pct),
                         "var_slippage_pct": payload["var_slippage_pct"],
+                        "dom_slippage_pct": payload["dom_slippage_pct"],
                         "lighter_slippage_pct": payload["lighter_slippage_pct"],
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "var_order_error": payload["var_order_error"],
@@ -3071,6 +3086,7 @@ class VariationalToLighterRuntime:
             "fill_diff_pct",
             "spread_slippage_pct",
             "var_slippage_pct",
+            "dom_slippage_pct",
             "lighter_slippage_pct",
             "auto_hedge_enabled",
             "var_order_error",

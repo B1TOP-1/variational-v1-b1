@@ -368,6 +368,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
             lighter_side="SELL",
             var_trigger_price=Decimal("100"),
             var_fill_price=Decimal("98"),
+            dom_trigger_price=Decimal("99"),
             lighter_trigger_price=Decimal("100"),
             lighter_fill_price=Decimal("98"),
         )
@@ -375,7 +376,9 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt._maybe_record_slippage_stats(rec)  # 去重：只记一次
         self.assertEqual(rt._stat_both_filled, 1)
         self.assertEqual(rt._stat_var_slip.n, 1)
-        self.assertEqual(rt._stat_var_slip.last, 2.0)  # 做多 100→98 = +2%
+        self.assertEqual(rt._stat_var_slip.last, 2.0)  # 做多 对api100→98 = +2%
+        self.assertEqual(rt._stat_var_slip_dom.n, 1)   # dom 口径也记一次
+        self.assertEqual(rt._stat_var_slip_dom.last, float((Decimal("99") - Decimal("98")) / Decimal("99") * 100))
         self.assertEqual(rt._stat_lighter_slip.last, -2.0)  # 做空 100→98 = -2%
 
     def test_quantize_to_lighter_lot_floors_to_step(self):
