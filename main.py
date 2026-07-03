@@ -504,6 +504,7 @@ class VariationalToLighterRuntime:
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
         self._last_spread_record_ts = 0.0
+        self._spread_stats_cache: dict[str, float | None] = {}
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -1664,7 +1665,12 @@ class VariationalToLighterRuntime:
     def _percentile(values: list[float], pct: float) -> float | None:
         if not values:
             return None
-        ordered = sorted(values)
+        return VariationalToLighterRuntime._percentile_sorted(sorted(values), pct)
+
+    @staticmethod
+    def _percentile_sorted(ordered: list[float], pct: float) -> float | None:
+        if not ordered:
+            return None
         if len(ordered) == 1:
             return float(ordered[0])
         rank = (pct / 100.0) * (len(ordered) - 1)
@@ -1672,6 +1678,27 @@ class VariationalToLighterRuntime:
         high = min(low + 1, len(ordered) - 1)
         frac = rank - low
         return float(ordered[low] + (ordered[high] - ordered[low]) * frac)
+
+    def _window_stats(self, window_seconds: float, long_side: bool) -> tuple[float | None, float | None, float | None]:
+        """一次过滤+排序，同出 (median, p90, p10)，避免同窗口重复过滤三遍。"""
+        values = self._cross_spread_values(window_seconds, long_side)
+        if not values:
+            return None, None, None
+        ordered = sorted(values)
+        mid = len(ordered) // 2
+        median_v = float(ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0)
+        return median_v, self._percentile_sorted(ordered, 90), self._percentile_sorted(ordered, 10)
+
+    def _refresh_spread_stats(self) -> None:
+        """1Hz 计算并缓存 18 个窗口统计，渲染(4Hz)只读缓存，避免重复排序。"""
+        cache: dict[str, float | None] = {}
+        for secs, tag in ((5 * 60, "5m"), (30 * 60, "30m"), (60 * 60, "1h")):
+            for long_side, side_key in ((True, "long"), (False, "short")):
+                med, p90, p10 = self._window_stats(secs, long_side)
+                cache[f"{side_key}_median_{tag}"] = med
+                cache[f"{side_key}_p90_{tag}"] = p90
+                cache[f"{side_key}_p10_{tag}"] = p10
+        self._spread_stats_cache = cache
 
     def _record_hourly_spread(
         self,
@@ -2652,7 +2679,7 @@ class VariationalToLighterRuntime:
             sig_bid,
             sig_ask,
         )
-        # 历史采样节流到 ~1s（渲染提速后不跟着高频采样，省内存/CPU）。
+        # 历史采样 + 窗口统计节流到 ~1s（渲染提速后不跟着高频采样/重排序，省内存/CPU）。
         now_mono = time.monotonic()
         if now_mono - self._last_spread_record_ts >= SPREAD_RECORD_INTERVAL_SECONDS:
             self._last_spread_record_ts = now_mono
@@ -2664,26 +2691,28 @@ class VariationalToLighterRuntime:
                 long_var_short_lighter_pct,
                 short_var_long_lighter_pct,
             )
+            self._refresh_spread_stats()
 
-        long_pct_median_5m = self._median_cross_spread(5 * 60, long_side=True)
-        long_pct_median_30m = self._median_cross_spread(30 * 60, long_side=True)
-        long_pct_median_1h = self._median_cross_spread(60 * 60, long_side=True)
-        short_pct_median_5m = self._median_cross_spread(5 * 60, long_side=False)
-        short_pct_median_30m = self._median_cross_spread(30 * 60, long_side=False)
-        short_pct_median_1h = self._median_cross_spread(60 * 60, long_side=False)
+        st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
+        long_pct_median_5m = st.get("long_median_5m")
+        long_pct_median_30m = st.get("long_median_30m")
+        long_pct_median_1h = st.get("long_median_1h")
+        short_pct_median_5m = st.get("short_median_5m")
+        short_pct_median_30m = st.get("short_median_30m")
+        short_pct_median_1h = st.get("short_median_1h")
 
-        long_p90_5m = self._percentile_cross_spread(5 * 60, long_side=True, pct=90)
-        long_p10_5m = self._percentile_cross_spread(5 * 60, long_side=True, pct=10)
-        long_p90_30m = self._percentile_cross_spread(30 * 60, long_side=True, pct=90)
-        long_p10_30m = self._percentile_cross_spread(30 * 60, long_side=True, pct=10)
-        long_p90_1h = self._percentile_cross_spread(60 * 60, long_side=True, pct=90)
-        long_p10_1h = self._percentile_cross_spread(60 * 60, long_side=True, pct=10)
-        short_p90_5m = self._percentile_cross_spread(5 * 60, long_side=False, pct=90)
-        short_p10_5m = self._percentile_cross_spread(5 * 60, long_side=False, pct=10)
-        short_p90_30m = self._percentile_cross_spread(30 * 60, long_side=False, pct=90)
-        short_p10_30m = self._percentile_cross_spread(30 * 60, long_side=False, pct=10)
-        short_p90_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=90)
-        short_p10_1h = self._percentile_cross_spread(60 * 60, long_side=False, pct=10)
+        long_p90_5m = st.get("long_p90_5m")
+        long_p10_5m = st.get("long_p10_5m")
+        long_p90_30m = st.get("long_p90_30m")
+        long_p10_30m = st.get("long_p10_30m")
+        long_p90_1h = st.get("long_p90_1h")
+        long_p10_1h = st.get("long_p10_1h")
+        short_p90_5m = st.get("short_p90_5m")
+        short_p10_5m = st.get("short_p10_5m")
+        short_p90_30m = st.get("short_p90_30m")
+        short_p10_30m = st.get("short_p10_30m")
+        short_p90_1h = st.get("short_p90_1h")
+        short_p10_1h = st.get("short_p10_1h")
 
         hourly_row_limit, order_row_limit = self._adaptive_row_limits()
         async with self._record_lock:

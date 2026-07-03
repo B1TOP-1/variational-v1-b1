@@ -329,6 +329,23 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
     def _runtime():
         return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
 
+    def test_window_stats_single_pass(self):
+        rt = self._runtime()
+        now = time.monotonic()
+        for v in (0.05, 0.06, 0.07, 0.08, 0.09):
+            rt.cross_spread_history.append((now, v, None))
+        med, p90, p10 = rt._window_stats(3600, long_side=True)
+        self.assertEqual(med, 0.07)
+        self.assertEqual(p90, rt._percentile([0.05, 0.06, 0.07, 0.08, 0.09], 90))
+        self.assertEqual(p10, rt._percentile([0.05, 0.06, 0.07, 0.08, 0.09], 10))
+
+    def test_refresh_spread_stats_populates_cache(self):
+        rt = self._runtime()
+        rt.cross_spread_history.append((time.monotonic(), 0.07, 0.03))
+        rt._refresh_spread_stats()
+        self.assertEqual(rt._spread_stats_cache["long_median_5m"], 0.07)
+        self.assertEqual(rt._spread_stats_cache["short_median_1h"], 0.03)
+
     def test_running_stat_avg(self):
         s = RunningStat()
         self.assertIsNone(s.avg())
