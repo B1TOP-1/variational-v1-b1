@@ -257,6 +257,10 @@ class OrderLifecycle:
     strategy_target_qty: Decimal | None = None
     strategy_current_qty: Decimal | None = None
     slippage_recorded: bool = False
+    # 信号触发时刻(monotonic秒)，用于端到端延迟；两腿延迟只记一次。
+    signal_trigger_monotonic: float | None = None
+    var_latency_recorded: bool = False
+    lighter_latency_recorded: bool = False
 
     def to_payload(self) -> dict[str, Any]:
         return {
@@ -491,8 +495,9 @@ class VariationalToLighterRuntime:
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
         self._stat_fired = 0
         self._stat_both_filled = 0
-        self._stat_var_latency = RunningStat()
-        self._stat_lighter_latency = RunningStat()
+        self._stat_var_latency = RunningStat()       # 信号触发→Var成交(端到端)
+        self._stat_lighter_latency = RunningStat()   # 信号触发→Lighter WS成交(端到端)
+        self._stat_var_side_switch = RunningStat()   # Var 方向切换耗时(不切=0)
         self._stat_signal_confirm = RunningStat()
         self._stat_var_slip = RunningStat()
         self._stat_lighter_slip = RunningStat()
@@ -852,6 +857,10 @@ class VariationalToLighterRuntime:
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
             self._maybe_record_slippage_stats(record)
+            # Lighter 端到端延迟：信号触发 → 收到 Lighter WS 成交（仅策略单）。
+            if record.signal_trigger_monotonic is not None and not record.lighter_latency_recorded:
+                self._stat_lighter_latency.add((time.monotonic() - record.signal_trigger_monotonic) * 1000)
+                record.lighter_latency_recorded = True
             payload = record.to_payload()
             # 成交已回填，映射项不再需要，弹出以释放。
             self.lighter_client_order_to_trade_key.pop(client_order_id, None)
@@ -1088,7 +1097,6 @@ class VariationalToLighterRuntime:
                 client_order_id += 1
 
         try:
-            lighter_started = time.perf_counter()
             async with self._lighter_signer_lock:
                 if not self.lighter_client:
                     self.initialize_lighter_client()
@@ -1103,7 +1111,6 @@ class VariationalToLighterRuntime:
                     reduce_only=False,
                     trigger_price=0,
                 )
-            self._stat_lighter_latency.add((time.perf_counter() - lighter_started) * 1000)
 
             if error is not None:
                 raise RuntimeError(f"Sign error: {error}")
@@ -1295,6 +1302,7 @@ class VariationalToLighterRuntime:
             strategy_action=signal.action,
             strategy_target_qty=signal.target_qty,
             strategy_current_qty=signal.current_qty,
+            signal_trigger_monotonic=time.monotonic(),
         )
         self.records[trade_key] = record
         self.record_order.append(trade_key)
@@ -1463,6 +1471,10 @@ class VariationalToLighterRuntime:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
                 self._maybe_record_slippage_stats(record)
+                # Var 端到端延迟：信号触发 → 收到 Var 成交（仅策略单有触发时刻）。
+                if record.signal_trigger_monotonic is not None and not record.var_latency_recorded:
+                    self._stat_var_latency.add((time.monotonic() - record.signal_trigger_monotonic) * 1000)
+                    record.var_latency_recorded = True
                 filled_payload = record.to_payload()
             else:
                 filled_payload = None
@@ -2273,12 +2285,14 @@ class VariationalToLighterRuntime:
     async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
         side = "sell" if command.side.strip().lower() == "sell" else "buy"
         is_live_strategy_order = not command.prepare_only and not command.dry_run
-        order_started = time.perf_counter()
         try:
             try:
                 result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
                 if is_live_strategy_order:
-                    self._stat_var_latency.add((time.perf_counter() - order_started) * 1000)
+                    # 方向切换耗时（页面已在目标方向则为0）。
+                    timing = result.get("timing") if isinstance(result.get("timing"), dict) else {}
+                    switch_ms = timing.get("sideClickDuration")
+                    self._stat_var_side_switch.add(float(switch_ms) if switch_ms is not None else 0.0)
             except Exception as exc:
                 await self._record_var_order_error(command.trade_key, str(exc))
                 self.logger.warning(
@@ -2402,16 +2416,18 @@ class VariationalToLighterRuntime:
         if is_zh:
             grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
             grid.add_row(f"信号确认时长: {fmt_ms(self._stat_signal_confirm)}")
-            grid.add_row(f"Var 下单延迟: {fmt_ms(self._stat_var_latency)}")
-            grid.add_row(f"Lighter 下单延迟: {fmt_ms(self._stat_lighter_latency)}")
+            grid.add_row(f"Var 延迟(信号→成交): {fmt_ms(self._stat_var_latency)}")
+            grid.add_row(f"  其中方向切换: {fmt_ms(self._stat_var_side_switch)}")
+            grid.add_row(f"Lighter 延迟(信号→WS成交): {fmt_ms(self._stat_lighter_latency)}")
             grid.add_row(f"V 滑点(有利+): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
             title = "统计（本地会话）"
         else:
             grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
             grid.add_row(f"signal confirm: {fmt_ms(self._stat_signal_confirm)}")
-            grid.add_row(f"Var latency: {fmt_ms(self._stat_var_latency)}")
-            grid.add_row(f"Lighter latency: {fmt_ms(self._stat_lighter_latency)}")
+            grid.add_row(f"Var latency(signal->fill): {fmt_ms(self._stat_var_latency)}")
+            grid.add_row(f"  side switch: {fmt_ms(self._stat_var_side_switch)}")
+            grid.add_row(f"Lighter latency(signal->wsfill): {fmt_ms(self._stat_lighter_latency)}")
             grid.add_row(f"V slippage(+good): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
             title = "Stats (session)"

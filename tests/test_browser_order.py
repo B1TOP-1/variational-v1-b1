@@ -400,6 +400,29 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(123, rt.lighter_client_order_to_trade_key)
         self.assertEqual(rt.records[key].lighter_fill_price, Decimal("4000"))
 
+    async def test_lighter_latency_recorded_from_signal_trigger(self):
+        rt = self._runtime()
+        key = "strategy:lat"
+        rt.records[key] = OrderLifecycle(
+            trade_key=key,
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.01"),
+            asset="XAU",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+            signal_trigger_monotonic=time.monotonic() - 0.05,  # 50ms 前触发
+        )
+        rt.record_order.append(key)
+        rt.lighter_client_order_to_trade_key[7] = key
+
+        await rt.handle_lighter_fill_update(
+            {"status": "filled", "client_order_id": 7, "filled_quote_amount": "40", "filled_base_amount": "0.01"}
+        )
+
+        self.assertEqual(rt._stat_lighter_latency.n, 1)
+        self.assertGreaterEqual(rt._stat_lighter_latency.last, 40.0)  # ~50ms 端到端
+
     def test_parse_lighter_positions_applies_sign(self):
         parsed = VariationalToLighterRuntime._parse_lighter_positions(
             {"positions": {"1": {"symbol": "BTC", "sign": -1, "position": "0.004"}}}
