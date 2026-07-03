@@ -78,7 +78,8 @@ SPIKE_BASELINE_WINDOW_SECONDS = 30.0
 MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
-DASHBOARD_REFRESH_SECONDS = 1.0
+DASHBOARD_REFRESH_SECONDS = 0.25
+SPREAD_RECORD_INTERVAL_SECONDS = 1.0
 DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
@@ -501,6 +502,7 @@ class VariationalToLighterRuntime:
         self._last_dom_ask: Decimal | None = None
         self._last_dom_at: float | None = None
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
+        self._last_spread_record_ts = 0.0
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -2641,14 +2643,18 @@ class VariationalToLighterRuntime:
             sig_bid,
             sig_ask,
         )
-        self._record_cross_spreads(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
-        self._record_hourly_spread(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
+        # 历史采样节流到 ~1s（渲染提速后不跟着高频采样，省内存/CPU）。
+        now_mono = time.monotonic()
+        if now_mono - self._last_spread_record_ts >= SPREAD_RECORD_INTERVAL_SECONDS:
+            self._last_spread_record_ts = now_mono
+            self._record_cross_spreads(
+                long_var_short_lighter_pct,
+                short_var_long_lighter_pct,
+            )
+            self._record_hourly_spread(
+                long_var_short_lighter_pct,
+                short_var_long_lighter_pct,
+            )
 
         long_pct_median_5m = self._median_cross_spread(5 * 60, long_side=True)
         long_pct_median_30m = self._median_cross_spread(30 * 60, long_side=True)
