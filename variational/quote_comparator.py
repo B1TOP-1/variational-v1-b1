@@ -112,7 +112,7 @@ class QuoteComparator:
         self._history[source].append(current)
 
         other = self._other(source)
-        matched = self._pop_pending(other, bid, ask)
+        matched = self._pop_pending(other, bid, ask, acquire_ms)
         if matched is not None:
             # 对方之前出过这个价、在等确认 → 对方领先。
             return self._record_match(leader_t=matched, leader=other, follow_t=current)
@@ -120,9 +120,12 @@ class QuoteComparator:
         self._pending[source].append(current)
         return None
 
-    def _pop_pending(self, source: str, bid: float, ask: float) -> _Transition | None:
+    def _pop_pending(self, source: str, bid: float, ask: float, now_ms: float) -> _Transition | None:
         lst = self._pending[source]
         for index, item in enumerate(lst):
+            # 只与近窗内的待定项配对，避免价格重复出现时跨大时间差错配（虚高领先）。
+            if now_ms - item.acquire_ms > self.divergence_window_ms:
+                continue
             if self._prices_match((item.bid, item.ask), (bid, ask)):
                 return lst.pop(index)
         return None

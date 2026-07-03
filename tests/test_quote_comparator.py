@@ -63,6 +63,14 @@ class QuoteComparatorTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(c.divergences["api"], 0)
 
+    def test_stale_pending_does_not_match_recurring_price(self):
+        # 同价 17s 后再出现，不应与旧待定项配对(否则虚高领先)。
+        c = self._cmp(divergence_window_ms=500)
+        c.update("api", 100, 101, 0, 0)          # api 待定 100/101
+        result = c.update("dom", 100, 101, 17000, 17000)  # 17s 后 dom 出同价
+        self.assertIsNone(result)                # 不匹配旧待定
+        self.assertEqual(c.snapshot()["matched"], 0)
+
     def test_snapshot_aggregates(self):
         c = self._cmp()
         c.update("api", 100, 101, 0, 0)

@@ -500,6 +500,7 @@ class VariationalToLighterRuntime:
         self._last_dom_bid: Decimal | None = None
         self._last_dom_ask: Decimal | None = None
         self._last_dom_at: float | None = None
+        self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -1966,6 +1967,7 @@ class VariationalToLighterRuntime:
         change_ms = self._epoch_ms(source_ts)
         if change_ms is None:
             change_ms = time.time() * 1000.0              # 兜底用本地墙钟(单位一致)
+        self._last_quote_wall[source] = time.time()       # 最近获取墙钟(用于显示)
         self.quote_comparator.update(source, float(b), float(a), change_ms, acquire_ms)
 
     def _on_api_quote(self, asset: str, bid: Any, ask: Any, source_ts: Any) -> None:
@@ -2503,6 +2505,12 @@ class VariationalToLighterRuntime:
             title = "Stats (session)"
         return Panel(grid, title=title, border_style="magenta")
 
+    @staticmethod
+    def _fmt_wall_ms(wall: float | None) -> str:
+        if wall is None:
+            return "-"
+        return datetime.fromtimestamp(wall, tz=CST_TZ).strftime("%H:%M:%S.%f")[:-3]  # 精确到ms
+
     def _fmt_quote_compare(self, is_zh: bool) -> str:
         s = self.quote_comparator.snapshot()
         tr = s["transitions"]
@@ -2510,13 +2518,17 @@ class VariationalToLighterRuntime:
         aavg = s["acquire_lead_avg_ms"]
         aavg_t = f"{aavg:.0f}ms" if aavg is not None else "-"
         dv = s["divergences"]
+        api_t = self._fmt_wall_ms(self._last_quote_wall.get("api"))
+        dom_t = self._fmt_wall_ms(self._last_quote_wall.get("dom"))
         if is_zh:
             return (
                 f"报价对比 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
+                f"  最近获取 api={api_t} dom={dom_t}\n"
                 f"  获取领先: {aleader} 均{aavg_t} | 背离 api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
             )
         return (
             f"quote-cmp transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
+            f"  last-recv api={api_t} dom={dom_t}\n"
             f"  acquire-lead: {aleader} avg {aavg_t} | divergence api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
         )
 
