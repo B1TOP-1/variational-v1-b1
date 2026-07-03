@@ -78,8 +78,7 @@ SPIKE_BASELINE_WINDOW_SECONDS = 30.0
 MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
-DASHBOARD_REFRESH_SECONDS = 0.25
-SPREAD_RECORD_INTERVAL_SECONDS = 1.0
+DASHBOARD_REFRESH_SECONDS = 1.0
 DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
@@ -503,7 +502,6 @@ class VariationalToLighterRuntime:
         self._last_dom_at: float | None = None
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
-        self._last_spread_record_ts = 0.0
         self._spread_stats_cache: dict[str, float | None] = {}
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
@@ -2679,19 +2677,16 @@ class VariationalToLighterRuntime:
             sig_bid,
             sig_ask,
         )
-        # 历史采样 + 窗口统计节流到 ~1s（渲染提速后不跟着高频采样/重排序，省内存/CPU）。
-        now_mono = time.monotonic()
-        if now_mono - self._last_spread_record_ts >= SPREAD_RECORD_INTERVAL_SECONDS:
-            self._last_spread_record_ts = now_mono
-            self._record_cross_spreads(
-                long_var_short_lighter_pct,
-                short_var_long_lighter_pct,
-            )
-            self._record_hourly_spread(
-                long_var_short_lighter_pct,
-                short_var_long_lighter_pct,
-            )
-            self._refresh_spread_stats()
+        # 渲染回到 1s，每帧采样一次历史并刷新窗口统计缓存（单次过滤算 median/p90/p10）。
+        self._record_cross_spreads(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+        )
+        self._record_hourly_spread(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+        )
+        self._refresh_spread_stats()
 
         st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
         long_pct_median_5m = st.get("long_median_5m")
