@@ -497,6 +497,9 @@ class VariationalToLighterRuntime:
         self._pending_signal_started_at: float | None = None
         # Var 报价双源对比器（观测记录：API vs DOM）。
         self.quote_comparator = QuoteComparator(("api", "dom"))
+        self._last_dom_bid: Decimal | None = None
+        self._last_dom_ask: Decimal | None = None
+        self._last_dom_at: float | None = None
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -1539,6 +1542,14 @@ class VariationalToLighterRuntime:
             return "-"
         return format(value, "f")
 
+    def _fmt_var_cell_with_dom(self, api_value: Decimal | None, dom_value: Decimal | None) -> str:
+        """行情表 Var 单元格：API 价 + 括号内 DOM 价（相等绿、不同黄，无则灰 -）。"""
+        api_text = self._fmt_price(api_value)
+        if dom_value is None:
+            return f"{api_text} [dim](-)[/]"
+        color = "green" if api_value is not None and dom_value == api_value else "yellow"
+        return f"{api_text} [{color}]({self._fmt_price(dom_value)})[/]"
+
     @staticmethod
     def _direction_labels(side: str) -> tuple[str, str]:
         side_n = side.strip().lower()
@@ -1966,6 +1977,9 @@ class VariationalToLighterRuntime:
     def _on_dom_quote(self, payload: dict[str, Any]) -> None:
         ts = payload.get("ts") or payload.get("capturedAtMs") or payload.get("timestamp")
         self._feed_quote_comparator("dom", payload.get("bid"), payload.get("ask"), ts)
+        self._last_dom_bid = to_decimal(payload.get("bid"))
+        self._last_dom_ask = to_decimal(payload.get("ask"))
+        self._last_dom_at = time.monotonic()
 
     async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
         """实时算两侧触发价差（Var 报价 × Lighter 深度 VWAP），不读仓位。"""
@@ -2751,8 +2765,8 @@ class VariationalToLighterRuntime:
         quote_table.add_column(col_book_spread_pct, justify="right")
         quote_table.add_row(
             f"{variational_label} ({quote_asset or self.variational_ticker})",
-            self._fmt_price(var_bid),
-            self._fmt_price(var_ask),
+            self._fmt_var_cell_with_dom(var_bid, self._last_dom_bid),
+            self._fmt_var_cell_with_dom(var_ask, self._last_dom_ask),
             self._fmt_price(var_book_spread),
             self._fmt_pct(var_book_spread_pct),
         )
