@@ -70,8 +70,8 @@ POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
 SIGNAL_CONFIRM_COUNT = 3
-# Var 报价过期闸（默认关）：设为毫秒数开启——API 报价超过该时长没更新则不下单。
-VAR_QUOTE_STALE_MS: float | None = None
+# Var 报价断线闸（默认开）：API 或 DOM 报价超过该时长(ms)没刷新 = 断线，不下单。设 None 关闭。
+VAR_QUOTE_DISCONNECT_MS: float | None = 3000.0
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
 # 默认 None=关闭：30s 滚动均值滞后，会误杀只持续几秒的真实机会。
 SPIKE_BASELINE_WINDOW_SECONDS = 30.0
@@ -1253,14 +1253,22 @@ class VariationalToLighterRuntime:
         net = var_pos + self._current_lighter_position()
         return abs(net) <= self._balance_tolerance()
 
+    def _var_quote_disconnected(self) -> bool:
+        """API 或 DOM 报价超过阈值没刷新 = 断线（曾收到过才算，从未收到不算）。"""
+        if VAR_QUOTE_DISCONNECT_MS is None:
+            return False
+        now_ms = time.monotonic() * 1000.0
+        for source in ("api", "dom"):
+            fresh = self.quote_comparator.freshness_ms(source, now_ms)
+            if fresh is not None and fresh > VAR_QUOTE_DISCONNECT_MS:
+                return True
+        return False
+
     def _strategy_order_allowed(self) -> bool:
         if self._strategy_halted:
             return False
-        # Var 报价过期闸（默认关）：API 报价太久没更新则不下单。
-        if VAR_QUOTE_STALE_MS is not None:
-            fresh = self.quote_comparator.freshness_ms("api", time.monotonic() * 1000.0)
-            if fresh is not None and fresh > VAR_QUOTE_STALE_MS:
-                return False
+        if self._var_quote_disconnected():
+            return False
         if self.args.auto_hedge and not self._positions_balanced():
             return False
         return True
@@ -2793,6 +2801,11 @@ class VariationalToLighterRuntime:
                     f"[bold yellow]⚠️{warn_label} 净={net:+.3f}"
                     f"(Var{self._cached_position_qty:+.3f}/Lit{self._current_lighter_position():+.3f})[/] | "
                 )
+        disconnect_text = ""
+        disconnected = self._var_quote_disconnected()
+        if disconnected:
+            dc_label = "报价断线·暂停下单" if is_zh else "quote disconnected · orders paused"
+            disconnect_text = f"[bold red]⛔{dc_label}[/] | "
         lit_ready_text = ""
         if self.args.auto_hedge:
             if self._lighter_ready:
@@ -2804,8 +2817,8 @@ class VariationalToLighterRuntime:
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{halt_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
-            border_style="red" if self._strategy_halted else ("yellow" if imbalanced else "cyan"),
+            f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
+            border_style="red" if (self._strategy_halted or disconnected) else ("yellow" if imbalanced else "cyan"),
         )
 
         quote_table = Table(title=quote_title, show_header=True, expand=True)

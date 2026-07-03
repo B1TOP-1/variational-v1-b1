@@ -455,6 +455,20 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["transitions"]["dom"], 1)
         self.assertEqual(snap["matched"], 1)
 
+    def test_var_quote_disconnect_gate(self):
+        rt = self._runtime()
+        self.assertFalse(rt._var_quote_disconnected())  # 从未收到 → 不算断线
+        rt.quote_comparator._last_acquire_ms["api"] = time.monotonic() * 1000.0 - 5000.0
+        self.assertTrue(rt._var_quote_disconnected())   # api 5s 未刷新 → 断线
+        rt.quote_comparator._last_acquire_ms["api"] = time.monotonic() * 1000.0
+        self.assertFalse(rt._var_quote_disconnected())  # 刚收到 → 恢复
+
+    def test_disconnect_blocks_strategy_orders(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = False  # 隔离平衡闸
+        rt.quote_comparator._last_acquire_ms["dom"] = time.monotonic() * 1000.0 - 4000.0
+        self.assertFalse(rt._strategy_order_allowed())
+
     def test_dom_transport_delay_recorded(self):
         rt = self._runtime()
         ts_ms = time.time() * 1000.0 - 30.0  # 浏览器事件 30ms 前
