@@ -4,6 +4,7 @@ import contextlib
 import csv
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -1747,23 +1748,39 @@ class VariationalToLighterRuntime:
         return avgs, min(present), max(present)
 
     @staticmethod
+    def _nice_step(data_range: float, target_lines: int) -> float:
+        """把粗略步长对齐到 1/2/5×10^n 的整齐刻度。"""
+        if data_range <= 0:
+            data_range = abs(data_range) or 1.0
+        rough = data_range / max(1, target_lines)
+        mag = 10 ** math.floor(math.log10(rough))
+        norm = rough / mag
+        nice = 1 if norm < 1.5 else (2 if norm < 3 else (5 if norm < 7 else 10))
+        return nice * mag
+
+    @staticmethod
     def _ascii_line_chart(
         values: list[float | None],
-        height: int,
+        target_lines: int,
         x_labels: tuple[str, str] | None = None,
     ) -> list[str]:
-        """asciichart 式连续折线：用 ╭╮╰╯─│ 把 values 连成折线；空值断开。左侧带轴标签，
-        可选底部时间轴 x_labels=(左, 右)。"""
+        """asciichart 式连续折线：用 ╭╮╰╯─│ 把 values 连成折线；空值断开。
+        Y 轴按整齐步长(1/2/5)对齐，每一行都标出对应差价(4位小数)。可选底部时间轴。"""
         present = [v for v in values if v is not None]
         if not present:
             return []
-        mn, mx = min(present), max(present)
-        rng = (mx - mn) or 1.0
-        rows = max(2, height)
+        dmn, dmx = min(present), max(present)
+        step = VariationalToLighterRuntime._nice_step(dmx - dmn, max(2, target_lines))
+        mn = math.floor(dmn / step) * step
+        mx = math.ceil(dmx / step) * step
+        if mx <= mn:
+            mx = mn + step
+        rows = int(round((mx - mn) / step)) + 1  # 网格线(行)数
+        rng = mx - mn
         grid = [[" "] * len(values) for _ in range(rows)]
 
         def level(v: float) -> int:
-            return int(round((v - mn) / rng * (rows - 1)))
+            return min(rows - 1, max(0, int(round((v - mn) / rng * (rows - 1)))))
 
         prev_l: int | None = None
         for x, v in enumerate(values):
@@ -1788,22 +1805,14 @@ class VariationalToLighterRuntime:
                         grid[rr][x] = "│"
             prev_l = cur
 
-        # 小数位随范围自适应：范围越小显示越多位，看清微小波动。
-        span = mx - mn
-        decimals = 2
-        s = span if span > 0 else 1.0
-        while s < 1 and decimals < 8:
-            s *= 10
-            decimals += 1
-        width = max(9, decimals + 4)
         lines: list[str] = []
         for i, row in enumerate(grid):
-            axis = f"{mx:+.{decimals}f}" if i == 0 else (f"{mn:+.{decimals}f}" if i == rows - 1 else "")
-            lines.append(f"{axis:>{width}} ┤{''.join(row)}")
+            val = round(mn + (rows - 1 - i) * step, 6)  # 每行对应的整齐刻度值
+            lines.append(f"{val:+.4f} ┤{''.join(row)}")  # 每一小格都标
         if x_labels is not None:
             left, right = x_labels
             span_pad = max(1, len(values) - len(left) - len(right))
-            lines.append(" " * width + " └" + left + " " * span_pad + right)
+            lines.append(" " * 7 + " └" + left + " " * span_pad + right)
         return lines
 
     def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
