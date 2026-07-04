@@ -360,8 +360,8 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vals[0], 0.05)
         self.assertEqual(vals[-1], 0.09)
         self.assertIsNone(vals[1])       # 空桶
-        chart = rt._braille_line_chart(vals, 8)
-        self.assertEqual(len(chart), 8)  # 8 行盲文曲线
+        chart = rt._ascii_line_chart(vals, 7)
+        self.assertEqual(len(chart), 7)  # 7 行折线
 
     def test_spread_trend_sampling_throttled_and_pruned(self):
         rt = self._runtime()
