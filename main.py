@@ -79,6 +79,10 @@ MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
+# 价差走势 sparkline：滚动窗口 3 天，按此间隔取样（3天/120s ≈ 2160 点）。
+SPREAD_TREND_WINDOW_SECONDS = 3 * 86400.0
+SPREAD_TREND_SAMPLE_SECONDS = 120.0
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
 DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
@@ -508,6 +512,9 @@ class VariationalToLighterRuntime:
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
         self._spread_stats_cache: dict[str, float | None] = {}
+        # 近3天价差走势取样：(mono_ts, long_float, short_float)
+        self._spread_trend: deque[tuple[float, float | None, float | None]] = deque()
+        self._last_trend_sample_ts = 0.0
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -1707,6 +1714,65 @@ class VariationalToLighterRuntime:
         median_v = float(ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0)
         return median_v, self._percentile_sorted(ordered, 90), self._percentile_sorted(ordered, 10)
 
+    def _sample_spread_trend(self, long_pct: Decimal | None, short_pct: Decimal | None) -> None:
+        """按取样间隔把当前价差写入近3天走势缓冲，并裁掉超窗样本。"""
+        now = time.monotonic()
+        if now - self._last_trend_sample_ts < SPREAD_TREND_SAMPLE_SECONDS:
+            return
+        self._last_trend_sample_ts = now
+        self._spread_trend.append(
+            (now, self._decimal_as_float(long_pct), self._decimal_as_float(short_pct))
+        )
+        cutoff = now - SPREAD_TREND_WINDOW_SECONDS
+        while self._spread_trend and self._spread_trend[0][0] < cutoff:
+            self._spread_trend.popleft()
+
+    def _spread_sparkline(self, series_index: int, width: int, now: float) -> tuple[str, float | None, float | None]:
+        """把近3天该序列按时间分桶(width格)取均值，映射成 sparkline 字符；空桶留空格。"""
+        start = now - SPREAD_TREND_WINDOW_SECONDS
+        buckets: list[list[float]] = [[] for _ in range(width)]
+        for ts, longv, shortv in self._spread_trend:
+            if ts < start:
+                continue
+            value = longv if series_index == 0 else shortv
+            if value is None:
+                continue
+            pos = int((ts - start) / SPREAD_TREND_WINDOW_SECONDS * width)
+            buckets[min(width - 1, max(0, pos))].append(value)
+        avgs = [sum(b) / len(b) if b else None for b in buckets]
+        present = [a for a in avgs if a is not None]
+        if not present:
+            return " " * width, None, None
+        lo, hi = min(present), max(present)
+        span = (hi - lo) or 1.0
+        chars = []
+        for a in avgs:
+            if a is None:
+                chars.append(" ")
+            else:
+                chars.append(SPARK_CHARS[min(7, max(0, int((a - lo) / span * 7)))])
+        return "".join(chars), lo, hi
+
+    def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
+        width = max(20, min(200, self.dashboard_console.size.width - 8))
+        now = time.monotonic()
+        long_line, long_lo, long_hi = self._spread_sparkline(0, width, now)
+        short_line, short_lo, short_hi = self._spread_sparkline(1, width, now)
+
+        def rng(lo: float | None, hi: float | None) -> str:
+            return f"[{lo:.4f}% ~ {hi:.4f}%]" if lo is not None else ("[无数据]" if is_zh else "[no data]")
+
+        long_label = "做多差价" if is_zh else "Long spread"
+        short_label = "做空差价" if is_zh else "Short spread"
+        grid = Table.grid()
+        grid.add_column()
+        grid.add_row(f"{long_label} {rng(long_lo, long_hi)}")
+        grid.add_row(f"[green]{long_line}[/]")
+        grid.add_row(f"{short_label} {rng(short_lo, short_hi)}")
+        grid.add_row(f"[cyan]{short_line}[/]")
+        title = "价差走势·近3天(整宽=3天)" if is_zh else "Spread trend · 3d (full width = 3d)"
+        return Panel(grid, title=title, border_style="blue")
+
     def _refresh_spread_stats(self) -> None:
         """1Hz 计算并缓存 18 个窗口统计，渲染(4Hz)只读缓存，避免重复排序。"""
         cache: dict[str, float | None] = {}
@@ -2709,6 +2775,10 @@ class VariationalToLighterRuntime:
             short_var_long_lighter_pct,
         )
         self._refresh_spread_stats()
+        self._sample_spread_trend(
+            long_var_short_lighter_pct,
+            short_var_long_lighter_pct,
+        )
 
         st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
         long_pct_median_5m = st.get("long_median_5m")
@@ -2997,7 +3067,8 @@ class VariationalToLighterRuntime:
             body.add_column(ratio=3)
             body.add_column(ratio=2)
             body.add_row(strategy_panel, stats_panel)
-            return Group(header, hourly_table, body, footer)
+            trend_panel = self._render_spread_trend_panel(is_zh)
+            return Group(header, hourly_table, body, trend_panel, footer)
         return Group(header, quote_table, spread_table, orders_table, footer)
 
     async def export_trade_records_csv(self) -> None:

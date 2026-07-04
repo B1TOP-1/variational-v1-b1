@@ -10,6 +10,7 @@ from main import parse_args
 from main import OrderLifecycle
 from main import RunningStat
 from main import SIGNAL_CONFIRM_COUNT
+from main import SPREAD_TREND_WINDOW_SECONDS
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 
@@ -345,6 +346,28 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt._refresh_spread_stats()
         self.assertEqual(rt._spread_stats_cache["long_median_5m"], 0.07)
         self.assertEqual(rt._spread_stats_cache["short_median_1h"], 0.03)
+
+    def test_spread_sparkline_maps_values_and_gaps(self):
+        rt = self._runtime()
+        w = SPREAD_TREND_WINDOW_SECONDS
+        now = 1_000_000.0
+        rt._spread_trend.append((now - w + 10, 0.05, -0.05))  # 最左(最低)
+        rt._spread_trend.append((now - w / 2, 0.07, -0.07))   # 中间
+        rt._spread_trend.append((now - 10, 0.09, -0.09))      # 最右(最高)
+        line, lo, hi = rt._spread_sparkline(0, 10, now)
+        self.assertEqual(len(line), 10)
+        self.assertEqual((lo, hi), (0.05, 0.09))
+        self.assertEqual(line[0], "▁")   # 最低
+        self.assertEqual(line[-1], "█")  # 最高
+        self.assertEqual(line[1], " ")   # 空桶留空格
+
+    def test_spread_trend_sampling_throttled_and_pruned(self):
+        rt = self._runtime()
+        rt._last_trend_sample_ts = 0.0
+        rt._sample_spread_trend(Decimal("0.05"), Decimal("-0.05"))
+        self.assertEqual(len(rt._spread_trend), 1)
+        rt._sample_spread_trend(Decimal("0.06"), Decimal("-0.06"))  # 立即再取样被节流
+        self.assertEqual(len(rt._spread_trend), 1)
 
     def test_running_stat_avg(self):
         s = RunningStat()
