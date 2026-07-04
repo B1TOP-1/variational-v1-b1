@@ -1760,26 +1760,26 @@ class VariationalToLighterRuntime:
 
     @staticmethod
     def _time_ticks(cols: int, start_wall: float, end_wall: float) -> list[tuple[int, str]]:
-        """沿 X 轴按整点小时打刻度，步长(1/2/3/6/12/24h)自动选到放得下。返回 [(列, 标签)]。"""
+        """每小时一个小刻度(标签为空)，整 3/6/12h 大刻度带标签(步长自动选到放得下)。返回 [(列, 标签)]。"""
         window = end_wall - start_wall
         if window <= 0 or cols <= 0:
             return []
         label_w = 11  # "MM-DD HH:MM"
-        max_ticks = max(2, cols // (label_w + 2))
+        max_labels = max(2, cols // (label_w + 2))
         total_hours = window / 3600.0
-        stride_h = 24
-        for s in (1, 2, 3, 6, 12, 24, 48, 72):
-            if total_hours / s <= max_ticks:
-                stride_h = s
+        major_h = 24
+        for s in (3, 6, 12, 24):
+            if total_hours / s <= max_labels:
+                major_h = s
                 break
-        stride_sec = stride_h * 3600
-        first = math.ceil(start_wall / stride_sec) * stride_sec
         ticks: list[tuple[int, str]] = []
-        t = first
+        t = math.ceil(start_wall / 3600) * 3600  # 对齐到整点，每小时一个
         while t <= end_wall:
             pos = int((t - start_wall) / window * cols)
-            ticks.append((pos, datetime.fromtimestamp(t, CST_TZ).strftime("%m-%d %H:%M")))
-            t += stride_sec
+            is_major = int(round(t / 3600)) % major_h == 0
+            label = datetime.fromtimestamp(t, CST_TZ).strftime("%m-%d %H:%M") if is_major else ""
+            ticks.append((pos, label))
+            t += 3600
         return ticks
 
     @staticmethod
@@ -1840,10 +1840,12 @@ class VariationalToLighterRuntime:
             last_end = -1
             for pos, lab in x_ticks:
                 if 0 <= pos < cols:
-                    markers[pos] = "┴"
+                    markers[pos] = "┼" if lab else "┬"  # 大刻度(带标签) / 每小时小刻度
+                if not lab:
+                    continue
                 start = min(pos, cols - len(lab))
                 if start <= last_end or start < 0:
-                    continue  # 重叠则跳过该标签(刻度线仍在)
+                    continue  # 标签重叠则跳过(刻度线仍在)
                 for k, ch in enumerate(lab):
                     labelrow[start + k] = ch
                 last_end = start + len(lab)
