@@ -1759,13 +1759,37 @@ class VariationalToLighterRuntime:
         return nice * mag
 
     @staticmethod
+    def _time_ticks(cols: int, start_wall: float, end_wall: float) -> list[tuple[int, str]]:
+        """沿 X 轴按整点小时打刻度，步长(1/2/3/6/12/24h)自动选到放得下。返回 [(列, 标签)]。"""
+        window = end_wall - start_wall
+        if window <= 0 or cols <= 0:
+            return []
+        label_w = 11  # "MM-DD HH:MM"
+        max_ticks = max(2, cols // (label_w + 2))
+        total_hours = window / 3600.0
+        stride_h = 24
+        for s in (1, 2, 3, 6, 12, 24, 48, 72):
+            if total_hours / s <= max_ticks:
+                stride_h = s
+                break
+        stride_sec = stride_h * 3600
+        first = math.ceil(start_wall / stride_sec) * stride_sec
+        ticks: list[tuple[int, str]] = []
+        t = first
+        while t <= end_wall:
+            pos = int((t - start_wall) / window * cols)
+            ticks.append((pos, datetime.fromtimestamp(t, CST_TZ).strftime("%m-%d %H:%M")))
+            t += stride_sec
+        return ticks
+
+    @staticmethod
     def _ascii_line_chart(
         values: list[float | None],
         target_lines: int,
-        x_labels: tuple[str, str] | None = None,
+        x_ticks: list[tuple[int, str]] | None = None,
     ) -> list[str]:
         """asciichart 式连续折线：用 ╭╮╰╯─│ 把 values 连成折线；空值断开。
-        Y 轴按整齐步长(1/2/5)对齐，每一行都标出对应差价(4位小数)。可选底部时间轴。"""
+        Y 轴按整齐步长(1/2/5)对齐，每一行都标出对应差价(4位小数)。可选底部按小时时间轴。"""
         present = [v for v in values if v is not None]
         if not present:
             return []
@@ -1809,10 +1833,22 @@ class VariationalToLighterRuntime:
         for i, row in enumerate(grid):
             val = round(mn + (rows - 1 - i) * step, 6)  # 每行对应的整齐刻度值
             lines.append(f"{val:+.4f} ┤{''.join(row)}")  # 每一小格都标
-        if x_labels is not None:
-            left, right = x_labels
-            span_pad = max(1, len(values) - len(left) - len(right))
-            lines.append(" " * 7 + " └" + left + " " * span_pad + right)
+        if x_ticks:
+            cols = len(values)
+            markers = ["─"] * cols
+            labelrow = [" "] * cols
+            last_end = -1
+            for pos, lab in x_ticks:
+                if 0 <= pos < cols:
+                    markers[pos] = "┴"
+                start = min(pos, cols - len(lab))
+                if start <= last_end or start < 0:
+                    continue  # 重叠则跳过该标签(刻度线仍在)
+                for k, ch in enumerate(lab):
+                    labelrow[start + k] = ch
+                last_end = start + len(lab)
+            lines.append(" " * 7 + " └" + "".join(markers))
+            lines.append(" " * 9 + "".join(labelrow))
         return lines
 
     def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
@@ -1822,12 +1858,11 @@ class VariationalToLighterRuntime:
         long_label = "做多差价·近3天(整宽=3天)" if is_zh else "Long spread · 3d (full width = 3d)"
 
         now_wall = time.time()
-        fmt = lambda t: datetime.fromtimestamp(t, CST_TZ).strftime("%m-%d %H:%M")
-        x_labels = (fmt(now_wall - SPREAD_TREND_WINDOW_SECONDS), fmt(now_wall))
+        x_ticks = self._time_ticks(cols, now_wall - SPREAD_TREND_WINDOW_SECONDS, now_wall)
 
         grid = Table.grid()
         grid.add_column()
-        chart = self._ascii_line_chart(long_vals, 7, x_labels=x_labels)
+        chart = self._ascii_line_chart(long_vals, 7, x_ticks=x_ticks)
         for line in (chart or [f"  ({no_data})"]):
             grid.add_row(f"[green]{line}[/]")
         return Panel(grid, title=long_label, border_style="blue")
