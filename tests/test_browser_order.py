@@ -347,19 +347,21 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt._spread_stats_cache["long_median_5m"], 0.07)
         self.assertEqual(rt._spread_stats_cache["short_median_1h"], 0.03)
 
-    def test_spread_sparkline_maps_values_and_gaps(self):
+    def test_spread_trend_series_and_line_chart(self):
         rt = self._runtime()
         w = SPREAD_TREND_WINDOW_SECONDS
         now = 1_000_000.0
-        rt._spread_trend.append((now - w + 10, 0.05, -0.05))  # 最左(最低)
+        rt._spread_trend.append((now - w + 10, 0.05, -0.05))  # 最左
         rt._spread_trend.append((now - w / 2, 0.07, -0.07))   # 中间
-        rt._spread_trend.append((now - 10, 0.09, -0.09))      # 最右(最高)
-        line, lo, hi = rt._spread_sparkline(0, 10, now)
-        self.assertEqual(len(line), 10)
+        rt._spread_trend.append((now - 10, 0.09, -0.09))      # 最右
+        vals, lo, hi = rt._spread_trend_series(0, 10, now)
+        self.assertEqual(len(vals), 10)
         self.assertEqual((lo, hi), (0.05, 0.09))
-        self.assertEqual(line[0], "▁")   # 最低
-        self.assertEqual(line[-1], "█")  # 最高
-        self.assertEqual(line[1], " ")   # 空桶留空格
+        self.assertEqual(vals[0], 0.05)
+        self.assertEqual(vals[-1], 0.09)
+        self.assertIsNone(vals[1])       # 空桶
+        chart = rt._braille_line_chart(vals, 8)
+        self.assertEqual(len(chart), 8)  # 8 行盲文曲线
 
     def test_spread_trend_sampling_throttled_and_pruned(self):
         rt = self._runtime()

@@ -81,8 +81,9 @@ HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
 # 价差走势 sparkline：滚动窗口 3 天，按此间隔取样（3天/120s ≈ 2160 点）。
 SPREAD_TREND_WINDOW_SECONDS = 3 * 86400.0
-SPREAD_TREND_SAMPLE_SECONDS = 120.0
-SPARK_CHARS = "▁▂▃▄▅▆▇█"
+SPREAD_TREND_SAMPLE_SECONDS = 30.0
+# 盲文点阵每格 2×4 点的位掩码 [行][列]
+BRAILLE_DOT_BITS = ((0x01, 0x08), (0x02, 0x10), (0x04, 0x20), (0x40, 0x80))
 DASHBOARD_ORDERS = 20
 SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
@@ -1719,16 +1720,18 @@ class VariationalToLighterRuntime:
         now = time.monotonic()
         if now - self._last_trend_sample_ts < SPREAD_TREND_SAMPLE_SECONDS:
             return
+        long_f = self._decimal_as_float(long_pct)
+        short_f = self._decimal_as_float(short_pct)
+        if long_f is None and short_f is None:
+            return  # 价差还没算出来(盘口未就绪)，不存空值污染走势
         self._last_trend_sample_ts = now
-        self._spread_trend.append(
-            (now, self._decimal_as_float(long_pct), self._decimal_as_float(short_pct))
-        )
+        self._spread_trend.append((now, long_f, short_f))
         cutoff = now - SPREAD_TREND_WINDOW_SECONDS
         while self._spread_trend and self._spread_trend[0][0] < cutoff:
             self._spread_trend.popleft()
 
-    def _spread_sparkline(self, series_index: int, width: int, now: float) -> tuple[str, float | None, float | None]:
-        """把近3天该序列按时间分桶(width格)取均值，映射成 sparkline 字符；空桶留空格。"""
+    def _spread_trend_series(self, series_index: int, width: int, now: float) -> tuple[list[float | None], float | None, float | None]:
+        """近3天该序列按时间分桶(width格)取均值；返回 (每桶值, 最小, 最大)，空桶为 None。"""
         start = now - SPREAD_TREND_WINDOW_SECONDS
         buckets: list[list[float]] = [[] for _ in range(width)]
         for ts, longv, shortv in self._spread_trend:
@@ -1739,39 +1742,67 @@ class VariationalToLighterRuntime:
                 continue
             pos = int((ts - start) / SPREAD_TREND_WINDOW_SECONDS * width)
             buckets[min(width - 1, max(0, pos))].append(value)
-        avgs = [sum(b) / len(b) if b else None for b in buckets]
+        avgs: list[float | None] = [sum(b) / len(b) if b else None for b in buckets]
         present = [a for a in avgs if a is not None]
         if not present:
-            return " " * width, None, None
-        lo, hi = min(present), max(present)
-        span = (hi - lo) or 1.0
-        chars = []
-        for a in avgs:
-            if a is None:
-                chars.append(" ")
+            return avgs, None, None
+        return avgs, min(present), max(present)
+
+    @staticmethod
+    def _braille_line_chart(values: list[float | None], height_cells: int) -> list[str]:
+        """盲文点阵平滑曲线：每格 2×4 点，竖向连线成连续圆润曲线；空值断开。左侧带轴标签。"""
+        present = [v for v in values if v is not None]
+        if not present:
+            return []
+        mn, mx = min(present), max(present)
+        rng = (mx - mn) or 1.0
+        rows = max(1, height_cells)
+        dot_h = 4 * rows
+        cols = (len(values) + 1) // 2
+        cells = [[0] * cols for _ in range(rows)]
+
+        def y_of(v: float) -> int:  # 点行(0=顶)，值越大越靠上
+            level = int(round((v - mn) / rng * (dot_h - 1)))
+            return (dot_h - 1) - level
+
+        def set_dot(x: int, y: int) -> None:
+            if 0 <= y < dot_h and 0 <= x < 2 * cols:
+                cr, dy = divmod(y, 4)
+                cc, dx = divmod(x, 2)
+                cells[cr][cc] |= BRAILLE_DOT_BITS[dy][dx]
+
+        prev_y: int | None = None
+        for x, v in enumerate(values):
+            if v is None:
+                prev_y = None
+                continue
+            y = y_of(v)
+            if prev_y is None:
+                set_dot(x, y)
             else:
-                chars.append(SPARK_CHARS[min(7, max(0, int((a - lo) / span * 7)))])
-        return "".join(chars), lo, hi
+                lo, hi = (prev_y, y) if prev_y <= y else (y, prev_y)
+                for yy in range(lo, hi + 1):  # 竖向连线，无断点
+                    set_dot(x, yy)
+            prev_y = y
+
+        lines: list[str] = []
+        for i, row in enumerate(cells):
+            axis = f"{mx:+.4f}" if i == 0 else (f"{mn:+.4f}" if i == rows - 1 else "")
+            lines.append(f"{axis:>9} ┤" + "".join(chr(0x2800 + b) for b in row))
+        return lines
 
     def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
-        width = max(20, min(200, self.dashboard_console.size.width - 8))
-        now = time.monotonic()
-        long_line, long_lo, long_hi = self._spread_sparkline(0, width, now)
-        short_line, short_lo, short_hi = self._spread_sparkline(1, width, now)
+        cols = max(20, min(200, self.dashboard_console.size.width - 14))
+        long_vals, long_lo, long_hi = self._spread_trend_series(0, cols * 2, time.monotonic())
+        no_data = "无数据" if is_zh else "no data"
+        long_label = "做多差价·近3天(整宽=3天)" if is_zh else "Long spread · 3d (full width = 3d)"
 
-        def rng(lo: float | None, hi: float | None) -> str:
-            return f"[{lo:.4f}% ~ {hi:.4f}%]" if lo is not None else ("[无数据]" if is_zh else "[no data]")
-
-        long_label = "做多差价" if is_zh else "Long spread"
-        short_label = "做空差价" if is_zh else "Short spread"
         grid = Table.grid()
         grid.add_column()
-        grid.add_row(f"{long_label} {rng(long_lo, long_hi)}")
-        grid.add_row(f"[green]{long_line}[/]")
-        grid.add_row(f"{short_label} {rng(short_lo, short_hi)}")
-        grid.add_row(f"[cyan]{short_line}[/]")
-        title = "价差走势·近3天(整宽=3天)" if is_zh else "Spread trend · 3d (full width = 3d)"
-        return Panel(grid, title=title, border_style="blue")
+        chart = self._braille_line_chart(long_vals, 8)
+        for line in (chart or [f"  ({no_data})"]):
+            grid.add_row(f"[green]{line}[/]")
+        return Panel(grid, title=long_label, border_style="blue")
 
     def _refresh_spread_stats(self) -> None:
         """1Hz 计算并缓存 18 个窗口统计，渲染(4Hz)只读缓存，避免重复排序。"""
