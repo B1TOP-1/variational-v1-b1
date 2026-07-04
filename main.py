@@ -1747,8 +1747,13 @@ class VariationalToLighterRuntime:
         return avgs, min(present), max(present)
 
     @staticmethod
-    def _ascii_line_chart(values: list[float | None], height: int) -> list[str]:
-        """asciichart 式连续折线：用 ╭╮╰╯─│ 把 values 连成折线；空值断开。左侧带轴标签。"""
+    def _ascii_line_chart(
+        values: list[float | None],
+        height: int,
+        x_labels: tuple[str, str] | None = None,
+    ) -> list[str]:
+        """asciichart 式连续折线：用 ╭╮╰╯─│ 把 values 连成折线；空值断开。左侧带轴标签，
+        可选底部时间轴 x_labels=(左, 右)。"""
         present = [v for v in values if v is not None]
         if not present:
             return []
@@ -1783,10 +1788,22 @@ class VariationalToLighterRuntime:
                         grid[rr][x] = "│"
             prev_l = cur
 
+        # 小数位随范围自适应：范围越小显示越多位，看清微小波动。
+        span = mx - mn
+        decimals = 2
+        s = span if span > 0 else 1.0
+        while s < 1 and decimals < 8:
+            s *= 10
+            decimals += 1
+        width = max(9, decimals + 4)
         lines: list[str] = []
         for i, row in enumerate(grid):
-            axis = f"{mx:+.4f}" if i == 0 else (f"{mn:+.4f}" if i == rows - 1 else "")
-            lines.append(f"{axis:>9} ┤{''.join(row)}")
+            axis = f"{mx:+.{decimals}f}" if i == 0 else (f"{mn:+.{decimals}f}" if i == rows - 1 else "")
+            lines.append(f"{axis:>{width}} ┤{''.join(row)}")
+        if x_labels is not None:
+            left, right = x_labels
+            span_pad = max(1, len(values) - len(left) - len(right))
+            lines.append(" " * width + " └" + left + " " * span_pad + right)
         return lines
 
     def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
@@ -1795,9 +1812,13 @@ class VariationalToLighterRuntime:
         no_data = "无数据" if is_zh else "no data"
         long_label = "做多差价·近3天(整宽=3天)" if is_zh else "Long spread · 3d (full width = 3d)"
 
+        now_wall = time.time()
+        fmt = lambda t: datetime.fromtimestamp(t, CST_TZ).strftime("%m-%d %H:%M")
+        x_labels = (fmt(now_wall - SPREAD_TREND_WINDOW_SECONDS), fmt(now_wall))
+
         grid = Table.grid()
         grid.add_column()
-        chart = self._ascii_line_chart(long_vals, 7)
+        chart = self._ascii_line_chart(long_vals, 7, x_labels=x_labels)
         for line in (chart or [f"  ({no_data})"]):
             grid.add_row(f"[green]{line}[/]")
         return Panel(grid, title=long_label, border_style="blue")
