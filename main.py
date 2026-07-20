@@ -49,6 +49,7 @@ from variational.spread_dashboard import SpreadDashboardServer
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
+    "WTI": "CL",
 }
 VARIATIONAL_ASSET_TO_LIGHTER_TICKER = {v: k for k, v in VARIATIONAL_TICKER_OVERRIDES.items()}
 

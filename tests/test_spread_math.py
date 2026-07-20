@@ -15,12 +15,18 @@ from main import (
     edge_pnl_percent,
     fill_diff_by_direction,
     PRICE_MAPPING_RATIO,
+    resolve_lighter_ticker,
+    resolve_variational_ticker,
 )
 from variational.gradient_strategy import GradientSignal, GradientStrategyState
 from variational.gradient_strategy import StrategySection
 
 
 class SpreadMathTest(unittest.TestCase):
+    def test_cl_uses_lighter_wti_market(self):
+        self.assertEqual(resolve_lighter_ticker("CL"), "WTI")
+        self.assertEqual(resolve_variational_ticker("WTI"), "CL")
+
     def test_production_price_mapping_ratio_defaults_to_one(self):
         self.assertEqual(PRICE_MAPPING_RATIO, Decimal("1"))
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
@@ -452,6 +458,34 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
                 "wait_for_lighter_order_book_ready",
             ],
         )
+
+    async def test_activate_variational_cl_uses_lighter_wti(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.args = argparse.Namespace(auto_hedge=False)
+        runtime.variational_ticker = None
+        runtime.ticker = None
+        runtime._asset_switch_lock = asyncio.Lock()
+        runtime.lighter_ws_task = None
+
+        def get_lighter_market_config():
+            self.assertEqual(runtime.ticker, "WTI")
+            return 93, 100, 1000
+
+        async def noop():
+            return None
+
+        runtime.get_lighter_market_config = get_lighter_market_config
+        runtime.handle_lighter_ws = noop
+        runtime.wait_for_lighter_order_book_ready = noop
+        runtime.reset_lighter_order_book = noop
+        runtime._reset_state_for_asset_switch = noop
+        runtime.logger = type("Logger", (), {"info": lambda *args, **kwargs: None})()
+
+        await runtime.activate_asset("CL", reason="test")
+
+        self.assertEqual(runtime.variational_ticker, "CL")
+        self.assertEqual(runtime.ticker, "WTI")
+        self.assertEqual(runtime.accepted_assets, {"CL", "WTI"})
 
     async def test_variational_fill_binds_to_pending_strategy_record(self):
         runtime = object.__new__(VariationalToLighterRuntime)
