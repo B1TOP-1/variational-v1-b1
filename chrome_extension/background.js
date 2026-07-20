@@ -3,12 +3,22 @@ const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
 const QUOTE_URL_PATH = "/api/quotes/indicative";
 const ORDER_URL_PATH = "/orders/new/market";
+const ACTIVE_QUOTE_MARKER = "__var_active_quote";
+const RUNTIME_STATE_KEY = "forwarderRuntimeState";
+const CONFIG_VERSION = 2;
 
 const DEFAULT_CONFIG = {
+  configVersion: CONFIG_VERSION,
   wsEndpoint: "ws://127.0.0.1:8766",
   restEndpoint: "ws://127.0.0.1:8767",
   brokerEndpoint: "ws://127.0.0.1:8768",
   domainFilter: "variational",
+  activeQuoteEnabled: true,
+  activeQuoteIntervalMs: 200,
+  activeQuoteNotionalUsd: 500,
+  activeQuoteMaxInFlight: 4,
+  activeQuoteTimeoutMs: 1500,
+  activeQuoteMaxBackoffMs: 30000,
   restAllowlist: [
     "https://omni.variational.io/api/quotes/indicative",
     "https://omni.variational.io/orders/new/market"
@@ -29,6 +39,15 @@ const state = {
   lastQuote: null,
   lastOrderResponse: null,
   pendingOrderWaiters: [],
+  activeQuoteTemplate: null,
+  activeQuoteStatus: "waiting_template",
+  activeQuoteAsset: null,
+  activeQuoteSessionId: null,
+  latestAcceptedQuoteSeq: new Map(),
+  activeQuoteRequests: new Map(),
+  activeQuoteMetrics: null,
+  activeQuoteSupervisorTimer: null,
+  activeQuoteSupervisorBusy: false,
   lastError: null,
   lastAutoReloadAt: 0
 };
@@ -41,6 +60,7 @@ class ForwardSocket {
     this.status = "disconnected";
     this.queue = [];
     this.retryTimer = null;
+    this.keepaliveTimer = null;
   }
 
   get endpoint() {
@@ -75,6 +95,7 @@ class ForwardSocket {
           return;
         }
         this.status = "connected";
+        this.startKeepalive();
         this.flush();
         if (this.configKey === "wsEndpoint") {
           autoReloadAttachedTab("forward receiver connected");
@@ -87,6 +108,7 @@ class ForwardSocket {
           return;
         }
         this.ws = null;
+        this.stopKeepalive();
         this.status = "disconnected";
         notifyStatus();
         this.scheduleReconnect();
@@ -99,6 +121,7 @@ class ForwardSocket {
         this.status = "error";
         notifyStatus();
       };
+
     } catch (error) {
       this.status = "error";
       state.lastError = `${this.label} socket connect failed: ${error.message}`;
@@ -140,6 +163,22 @@ class ForwardSocket {
     }, 1000);
   }
 
+  startKeepalive() {
+    this.stopKeepalive();
+    this.keepaliveTimer = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ kind: "extension_keepalive", timestamp: nowIso() }));
+      }
+    }, 20000);
+  }
+
+  stopKeepalive() {
+    if (this.keepaliveTimer) {
+      clearInterval(this.keepaliveTimer);
+      this.keepaliveTimer = null;
+    }
+  }
+
   restart() {
     this.close();
     this.connect();
@@ -150,6 +189,7 @@ class ForwardSocket {
       clearTimeout(this.retryTimer);
       this.retryTimer = null;
     }
+    this.stopKeepalive();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -300,18 +340,111 @@ async function ensureConfigLoaded() {
   }
   const stored = await chrome.storage.local.get("forwarderConfig");
   state.config = sanitizeConfig(stored.forwarderConfig);
+  await chrome.storage.local.set({ forwarderConfig: state.config });
   state.configLoaded = true;
 }
 
+async function persistRuntimeState() {
+  try {
+    await chrome.storage.session.set({
+      [RUNTIME_STATE_KEY]: {
+        active: state.active,
+        attachedTabId: state.attachedTabId,
+        activeQuoteTemplate: state.activeQuoteTemplate
+      }
+    });
+  } catch {
+    // storage.session may be unavailable on older Chromium; runtime still works until worker restart.
+  }
+}
+
+async function debuggerTargets() {
+  return await new Promise((resolve) => {
+    chrome.debugger.getTargets((targets) => resolve(targets || []));
+  });
+}
+
+async function restoreRuntimeState() {
+  await ensureConfigLoaded();
+  let saved = null;
+  try {
+    const stored = await chrome.storage.session.get(RUNTIME_STATE_KEY);
+    saved = stored[RUNTIME_STATE_KEY] || null;
+  } catch {
+    return;
+  }
+  if (!saved?.active || saved.attachedTabId == null) {
+    return;
+  }
+
+  const tabId = saved.attachedTabId;
+  try {
+    await chrome.tabs.get(tabId);
+    const targets = await debuggerTargets();
+    const alreadyAttached = targets.some((target) => target.tabId === tabId && target.attached);
+    if (!alreadyAttached) {
+      await debuggerAttach(tabId);
+    }
+    await sendDebuggerCommand(tabId, "Network.enable");
+    state.active = true;
+    state.attachedTabId = tabId;
+    state.activeQuoteTemplate = saved.activeQuoteTemplate || null;
+    state.activeQuoteAsset = state.activeQuoteTemplate?.asset || null;
+    state.activeQuoteStatus = state.config.activeQuoteEnabled
+      ? (state.activeQuoteTemplate ? "restoring" : "waiting_template")
+      : "disabled";
+    wsForwarder.connect();
+    restForwarder.connect();
+    brokerSocket.connect();
+    void installDomQuoteObserver(tabId);
+    if (state.activeQuoteTemplate) {
+      void installActiveQuotePoller(tabId, state.activeQuoteTemplate);
+    }
+    notifyStatus();
+  } catch (error) {
+    cleanupForwardingState();
+    state.lastError = `Runtime restore failed: ${error.message}`;
+    await persistRuntimeState();
+    notifyStatus();
+  }
+}
+
 function sanitizeConfig(incoming = {}) {
+  const incomingVersion = asBoundedInteger(incoming.configVersion, 1, 1, CONFIG_VERSION);
+  const storedInterval = asBoundedInteger(
+    incoming.activeQuoteIntervalMs,
+    DEFAULT_CONFIG.activeQuoteIntervalMs,
+    50,
+    60000
+  );
   return {
+    configVersion: CONFIG_VERSION,
     wsEndpoint: asStringOrDefault(incoming.wsEndpoint, DEFAULT_CONFIG.wsEndpoint),
     restEndpoint: asStringOrDefault(incoming.restEndpoint, DEFAULT_CONFIG.restEndpoint),
     brokerEndpoint: asStringOrDefault(incoming.brokerEndpoint, DEFAULT_CONFIG.brokerEndpoint),
     domainFilter: asStringOrDefault(incoming.domainFilter, DEFAULT_CONFIG.domainFilter),
+    activeQuoteEnabled: incoming.activeQuoteEnabled !== false,
+    activeQuoteIntervalMs: incomingVersion < 2 && storedInterval === 100 ? 200 : storedInterval,
+    activeQuoteNotionalUsd: asBoundedInteger(incoming.activeQuoteNotionalUsd, DEFAULT_CONFIG.activeQuoteNotionalUsd, 10, 1000000),
+    activeQuoteMaxInFlight: asBoundedInteger(incoming.activeQuoteMaxInFlight, DEFAULT_CONFIG.activeQuoteMaxInFlight, 1, 20),
+    activeQuoteTimeoutMs: asBoundedInteger(incoming.activeQuoteTimeoutMs, DEFAULT_CONFIG.activeQuoteTimeoutMs, 250, 30000),
+    activeQuoteMaxBackoffMs: asBoundedInteger(
+      incoming.activeQuoteMaxBackoffMs,
+      DEFAULT_CONFIG.activeQuoteMaxBackoffMs,
+      1000,
+      300000
+    ),
     restAllowlist: sanitizeRestAllowlist(incoming.restAllowlist),
     wsAllowlist: sanitizeAllowlist(incoming.wsAllowlist, DEFAULT_CONFIG.wsAllowlist)
   };
+}
+
+function asBoundedInteger(value, fallback, minimum, maximum) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+  return Math.min(maximum, Math.max(minimum, Math.round(numeric)));
 }
 
 function asStringOrDefault(value, fallback) {
@@ -373,6 +506,23 @@ function isQuoteUrl(url) {
   return typeof url === "string" && url.includes(QUOTE_URL_PATH);
 }
 
+function parseActiveQuoteMeta(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    if (url.searchParams.get(ACTIVE_QUOTE_MARKER) !== "1") {
+      return null;
+    }
+    const sequence = Number(url.searchParams.get("seq"));
+    return {
+      sessionId: url.searchParams.get("session") || "",
+      sequence: Number.isSafeInteger(sequence) && sequence > 0 ? sequence : null,
+      asset: (url.searchParams.get("asset") || "UNKNOWN").toUpperCase()
+    };
+  } catch {
+    return null;
+  }
+}
+
 function isOrderUrl(url) {
   return typeof url === "string" && url.includes(ORDER_URL_PATH);
 }
@@ -425,9 +575,35 @@ function getMatchedPattern(url, patterns) {
   return null;
 }
 
-function updateLastQuote(meta, bodyText) {
-  const payload = tryParseJson(bodyText);
+function quoteResponseAccepted(meta, payload) {
+  if (meta.status !== 200 || !payload || typeof payload !== "object" || payload.bid == null || payload.ask == null) {
+    return false;
+  }
+  const activeMeta = meta.activeQuote;
+  const asset = String(payload?.instrument?.underlying || activeMeta?.asset || "UNKNOWN").toUpperCase();
+  if (!activeMeta) {
+    return !(state.config.activeQuoteEnabled && state.activeQuoteStatus === "running" && state.activeQuoteAsset === asset);
+  }
+  if (!activeMeta.sessionId || activeMeta.sequence == null) {
+    return false;
+  }
+  if (activeMeta.sessionId !== state.activeQuoteSessionId || asset !== state.activeQuoteAsset) {
+    return false;
+  }
+  const key = `${activeMeta.sessionId}:${asset}`;
+  const latest = state.latestAcceptedQuoteSeq.get(key) || 0;
+  if (activeMeta.sequence <= latest) {
+    return false;
+  }
+  state.latestAcceptedQuoteSeq.set(key, activeMeta.sequence);
+  return true;
+}
+
+function updateLastQuote(meta, bodyText, payload, accepted) {
   if (!payload || typeof payload !== "object") {
+    return;
+  }
+  if (!accepted) {
     return;
   }
   state.lastQuote = {
@@ -440,8 +616,11 @@ function updateLastQuote(meta, bodyText) {
     quoteId: payload.quote_id || "",
     bid: payload.bid != null ? Number(payload.bid) : null,
     ask: payload.ask != null ? Number(payload.ask) : null,
+    markPrice: payload.mark_price != null ? Number(payload.mark_price) : null,
     bodyTimestamp: payload.timestamp || null,
-    instrument: payload.instrument || null
+    instrument: payload.instrument || null,
+    activeQuote: meta.activeQuote || null,
+    latencyMs: meta.sentAtMs ? Math.max(0, Date.now() - meta.sentAtMs) : null
   };
 }
 
@@ -615,6 +794,349 @@ async function runInTab(tabId, func, args = []) {
   return results[0].result;
 }
 
+// MAIN world：复用网页真实同源会话主动获取 indicative quote，不读取/导出 Cookie。
+function installActiveQuotePollerInPage(config) {
+  const KEY = "__variationalActiveQuotePollerV1__";
+  const endpoint = "/api/quotes/indicative";
+  const metricsWindowSize = 10000;
+
+  function signatureOf(body) {
+    return JSON.stringify({ instrument: body.instrument, qty: String(body.qty) });
+  }
+
+  function currentRouteAsset() {
+    try {
+      const raw = decodeURIComponent(location.pathname.split("/").filter(Boolean).at(-1) || "");
+      return /^[A-Za-z0-9_]+$/.test(raw) ? raw.toUpperCase() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  const sourceBody = config && config.body;
+  const body = sourceBody && {
+    ...sourceBody,
+    instrument: sourceBody.instrument ? { ...sourceBody.instrument } : sourceBody.instrument
+  };
+  if (!body || typeof body !== "object" || !body.instrument || body.qty == null) {
+    return { ok: false, error: "invalid_quote_template" };
+  }
+
+  const signature = signatureOf(body);
+  const existing = window[KEY];
+  if (existing && existing.active && existing.signature === signature) {
+    existing.intervalMs = config.intervalMs;
+    existing.maxInFlight = config.maxInFlight;
+    existing.timeoutMs = config.timeoutMs;
+    existing.maxBackoffMs = config.maxBackoffMs;
+    existing.quoteNotionalUsd = config.quoteNotionalUsd;
+    return existing.snapshot();
+  }
+  if (existing && typeof existing.stop === "function") {
+    existing.stop("template_changed");
+  }
+
+  const asset = String(body.instrument.underlying || "UNKNOWN").toUpperCase();
+  const sessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const state = {
+    active: true,
+    pausedReason: "",
+    signature,
+    asset,
+    sessionId,
+    sequence: 0,
+    inFlight: 0,
+    completed: 0,
+    failed: 0,
+    skipped: 0,
+    consecutiveErrors: 0,
+    nextAllowedAt: 0,
+    lastStartedAt: 0,
+    timer: null,
+    controllers: new Set(),
+    intervalMs: config.intervalMs,
+    maxInFlight: config.maxInFlight,
+    timeoutMs: config.timeoutMs,
+    maxBackoffMs: config.maxBackoffMs,
+    quoteNotionalUsd: config.quoteNotionalUsd,
+    quoteQty: String(body.qty),
+    nextTickAt: performance.now(),
+    snapshot() {
+      return {
+        ok: true,
+        active: this.active,
+        pausedReason: this.pausedReason,
+        asset: this.asset,
+        sessionId: this.sessionId,
+        sequence: this.sequence,
+        displaySequence: this.sequence === 0 ? 0 : ((this.sequence - 1) % metricsWindowSize) + 1,
+        metricsWindow: Math.floor(this.sequence / metricsWindowSize) + 1,
+        quoteNotionalUsd: this.quoteNotionalUsd,
+        quoteQty: this.quoteQty,
+        inFlight: this.inFlight,
+        completed: this.completed,
+        failed: this.failed,
+        skipped: this.skipped
+      };
+    },
+    stop(reason = "stopped") {
+      this.active = false;
+      this.pausedReason = reason;
+      if (this.timer != null) {
+        clearTimeout(this.timer);
+        this.timer = null;
+      }
+      for (const controller of this.controllers) {
+        controller.abort();
+      }
+      this.controllers.clear();
+    }
+  };
+  window[KEY] = state;
+
+  function schedule() {
+    if (!state.active) {
+      return;
+    }
+    state.nextTickAt += state.intervalMs;
+    if (state.nextTickAt < performance.now() - state.intervalMs) {
+      state.nextTickAt = performance.now() + state.intervalMs;
+    }
+    state.timer = setTimeout(tick, Math.max(0, state.nextTickAt - performance.now()));
+  }
+
+  function backoff(retryAfterSeconds = null) {
+    state.consecutiveErrors += 1;
+    const exponential = Math.min(state.maxBackoffMs, 1000 * (2 ** Math.min(8, state.consecutiveErrors - 1)));
+    const retryMs = retryAfterSeconds == null ? exponential : Math.max(exponential, retryAfterSeconds * 1000);
+    state.nextAllowedAt = Date.now() + retryMs;
+  }
+
+  function updateQuoteQuantity(payload) {
+    const bid = Number(payload && payload.bid);
+    const ask = Number(payload && payload.ask);
+    const mark = Number(payload && payload.mark_price);
+    const referencePrice = Number.isFinite(mark) && mark > 0
+      ? mark
+      : (Number.isFinite(bid) && Number.isFinite(ask) && bid > 0 && ask > 0 ? (bid + ask) / 2 : NaN);
+    if (!Number.isFinite(referencePrice) || referencePrice <= 0) {
+      return;
+    }
+    const approximateQty = state.quoteNotionalUsd / referencePrice;
+    if (!Number.isFinite(approximateQty) || approximateQty <= 0) {
+      return;
+    }
+    // 两位有效数字足以保持约 $500 名义深度，同时避免无意义的小数尾数。
+    state.quoteQty = Number(approximateQty.toPrecision(2)).toString();
+    body.qty = state.quoteQty;
+  }
+
+  async function requestQuote(sequence) {
+    const controller = new AbortController();
+    state.controllers.add(controller);
+    state.inFlight += 1;
+    const timeout = setTimeout(() => controller.abort(), state.timeoutMs);
+    const url = `${endpoint}?__var_active_quote=1&session=${encodeURIComponent(state.sessionId)}` +
+      `&seq=${sequence}&asset=${encodeURIComponent(state.asset)}`;
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        credentials: "include",
+        cache: "no-store",
+        signal: controller.signal,
+        headers: {
+          "content-type": "application/json",
+          "cache-control": "no-cache"
+        },
+        body: JSON.stringify(body)
+      });
+      if (response.status === 403) {
+        state.failed += 1;
+        state.stop("http_403_reverify_required");
+        return;
+      }
+      if (response.status === 429) {
+        state.failed += 1;
+        const retryAfter = Number(response.headers.get("retry-after"));
+        backoff(Number.isFinite(retryAfter) ? retryAfter : null);
+        return;
+      }
+      if (response.status >= 500) {
+        state.failed += 1;
+        backoff();
+        return;
+      }
+      if (!response.ok) {
+        // 400/401/404/422 等同样不是有效报价，不能记入 completed。
+        await response.text();
+        state.failed += 1;
+        backoff();
+        return;
+      }
+      // CDP 负责读取响应正文；这里必须消费 body，保证连接可复用。
+      const responseText = await response.text();
+      try {
+        updateQuoteQuantity(JSON.parse(responseText));
+      } catch {
+        // CDP 仍会处理响应；无法解析时沿用上一次有效数量。
+      }
+      state.completed += 1;
+      state.consecutiveErrors = 0;
+      state.nextAllowedAt = 0;
+    } catch (error) {
+      if (state.active && error && error.name !== "AbortError") {
+        state.failed += 1;
+        backoff();
+      }
+    } finally {
+      clearTimeout(timeout);
+      state.controllers.delete(controller);
+      state.inFlight -= 1;
+    }
+  }
+
+  function tick() {
+    if (!state.active) {
+      return;
+    }
+    state.kick();
+    schedule();
+  }
+
+  state.kick = function kick() {
+    if (!state.active) {
+      return false;
+    }
+    const routeAsset = currentRouteAsset();
+    if (routeAsset && /^[A-Z0-9_]+$/.test(state.asset) && routeAsset !== state.asset) {
+      state.stop("route_asset_changed");
+      return false;
+    }
+    const now = Date.now();
+    if (now < state.nextAllowedAt || now - state.lastStartedAt < state.intervalMs) {
+      return false;
+    }
+    if (state.inFlight >= state.maxInFlight) {
+      state.skipped += 1;
+      return false;
+    }
+    state.lastStartedAt = now;
+    state.sequence += 1;
+    if (state.sequence > 1 && (state.sequence - 1) % metricsWindowSize === 0) {
+      state.completed = 0;
+      state.failed = 0;
+      state.skipped = 0;
+    }
+    void requestQuote(state.sequence);
+    return true;
+  };
+
+  state.kick();
+  schedule();
+  return state.snapshot();
+}
+
+function kickActiveQuotePollerInPage() {
+  const state = window.__variationalActiveQuotePollerV1__;
+  if (!state || typeof state.kick !== "function") {
+    return { ok: false, active: false };
+  }
+  const started = state.kick();
+  return { ...state.snapshot(), started };
+}
+
+function stopActiveQuotePollerInPage() {
+  const state = window.__variationalActiveQuotePollerV1__;
+  if (!state || typeof state.stop !== "function") {
+    return { ok: true, active: false };
+  }
+  state.stop("extension_stopped");
+  return state.snapshot();
+}
+
+function activeQuoteTemplateInfo(body) {
+  if (!body || typeof body !== "object" || !body.instrument || body.qty == null) {
+    return null;
+  }
+  const asset = String(body.instrument.underlying || "UNKNOWN").toUpperCase();
+  return { body, asset, signature: JSON.stringify({ instrument: body.instrument, qty: String(body.qty) }) };
+}
+
+async function installActiveQuotePoller(tabId, template = state.activeQuoteTemplate) {
+  if (!state.active || !state.config.activeQuoteEnabled || tabId == null || !template) {
+    return null;
+  }
+  const result = await runInTab(tabId, installActiveQuotePollerInPage, [{
+    body: template.body,
+    intervalMs: state.config.activeQuoteIntervalMs,
+    maxInFlight: state.config.activeQuoteMaxInFlight,
+    timeoutMs: state.config.activeQuoteTimeoutMs,
+    maxBackoffMs: state.config.activeQuoteMaxBackoffMs,
+    quoteNotionalUsd: state.config.activeQuoteNotionalUsd
+  }]);
+  if (result && result.ok) {
+    state.activeQuoteStatus = result.active ? "running" : (result.pausedReason || "stopped");
+    state.activeQuoteAsset = result.asset || template.asset;
+    state.activeQuoteSessionId = result.sessionId || null;
+    state.activeQuoteMetrics = result;
+    startActiveQuoteSupervisor();
+  } else {
+    state.activeQuoteStatus = (result && result.error) || "install_failed";
+  }
+  notifyStatus();
+  return result;
+}
+
+function startActiveQuoteSupervisor() {
+  stopActiveQuoteSupervisor();
+  if (!state.active || !state.config.activeQuoteEnabled) {
+    return;
+  }
+  state.activeQuoteSupervisorTimer = setInterval(async () => {
+    if (state.activeQuoteSupervisorBusy || state.attachedTabId == null || !state.activeQuoteTemplate) {
+      return;
+    }
+    state.activeQuoteSupervisorBusy = true;
+    try {
+      const result = await runInTab(state.attachedTabId, kickActiveQuotePollerInPage);
+      if (result && result.ok) {
+        state.activeQuoteMetrics = result;
+      }
+      if (result && !result.active && result.pausedReason) {
+        state.activeQuoteStatus = result.pausedReason;
+        notifyStatus();
+      }
+    } catch {
+      // Navigation races are recovered by tabs.onUpdated and the next native quote template.
+    } finally {
+      state.activeQuoteSupervisorBusy = false;
+    }
+  }, state.config.activeQuoteIntervalMs);
+}
+
+function stopActiveQuoteSupervisor() {
+  if (state.activeQuoteSupervisorTimer) {
+    clearInterval(state.activeQuoteSupervisorTimer);
+    state.activeQuoteSupervisorTimer = null;
+  }
+  state.activeQuoteSupervisorBusy = false;
+}
+
+async function stopActiveQuotePoller(tabId) {
+  stopActiveQuoteSupervisor();
+  if (tabId == null) {
+    return;
+  }
+  try {
+    await runInTab(tabId, stopActiveQuotePollerInPage);
+  } catch {
+    // Tab may already be navigating or closed.
+  }
+  state.activeQuoteStatus = "stopped";
+  state.activeQuoteSessionId = null;
+  state.activeQuoteMetrics = null;
+}
+
 // 注入页面：MutationObserver 盯 bid/ask 显示，变动即通过 chrome.runtime 推给 background。
 // 用 ISOLATED world（可用 chrome.runtime），只读 DOM 不下单。
 function installDomQuoteObserverInPage() {
@@ -708,7 +1230,9 @@ async function startForwarding(tabId = null) {
 
   state.active = true;
   state.attachedTabId = targetTabId;
+  state.activeQuoteStatus = state.config.activeQuoteEnabled ? "waiting_template" : "disabled";
   state.lastError = null;
+  await persistRuntimeState();
   wsForwarder.connect();
   restForwarder.connect();
   brokerSocket.connect();
@@ -1365,7 +1889,9 @@ async function handleReadPosition(payload) {
 
 async function stopForwarding() {
   const attachedTabId = state.attachedTabId;
+  await stopActiveQuotePoller(attachedTabId);
   cleanupForwardingState();
+  await persistRuntimeState();
   if (attachedTabId != null) {
     try {
       await debuggerDetach(attachedTabId);
@@ -1378,9 +1904,17 @@ async function stopForwarding() {
 }
 
 function cleanupForwardingState() {
+  stopActiveQuoteSupervisor();
   state.active = false;
   state.pendingResponses.clear();
   state.websocketMeta.clear();
+  state.activeQuoteTemplate = null;
+  state.activeQuoteStatus = "stopped";
+  state.activeQuoteAsset = null;
+  state.activeQuoteSessionId = null;
+  state.latestAcceptedQuoteSeq.clear();
+  state.activeQuoteRequests.clear();
+  state.activeQuoteMetrics = null;
   state.attachedTabId = null;
   state.lastAutoReloadAt = 0;
   wsForwarder.close();
@@ -1401,6 +1935,13 @@ function getStatus() {
     lastQuote: state.lastQuote,
     lastOrderResponse: state.lastOrderResponse,
     pendingOrderWaiters: state.pendingOrderWaiters.length,
+    activeQuote: {
+      status: state.activeQuoteStatus,
+      asset: state.activeQuoteAsset,
+      sessionId: state.activeQuoteSessionId,
+      hasTemplate: Boolean(state.activeQuoteTemplate),
+      metrics: state.activeQuoteMetrics
+    },
     lastError: state.lastError
   };
 }
@@ -1433,6 +1974,8 @@ function trackResponse(params) {
     headers: params.response.headers,
     type: params.type,
     matchedPattern,
+    activeQuote: parseActiveQuoteMeta(params.response.url),
+    sentAtMs: state.activeQuoteRequests.get(params.requestId)?.sentAtMs || null,
     capturedAt: nowIso()
   });
 }
@@ -1443,12 +1986,16 @@ async function forwardResponseBody(requestId, encodedDataLength) {
     return;
   }
   state.pendingResponses.delete(requestId);
+  state.activeQuoteRequests.delete(requestId);
 
   try {
     const result = await sendDebuggerCommand(state.attachedTabId, "Network.getResponseBody", { requestId });
     const bodyText = decodeDebuggerBody(result.body ?? "", Boolean(result.base64Encoded));
+    let quoteAccepted = null;
     if (isQuoteUrl(meta.url)) {
-      updateLastQuote(meta, bodyText);
+      const payload = tryParseJson(bodyText);
+      quoteAccepted = quoteResponseAccepted(meta, payload);
+      updateLastQuote(meta, bodyText, payload, quoteAccepted);
     }
     if (isOrderUrl(meta.url)) {
       state.lastOrderResponse = {
@@ -1463,6 +2010,7 @@ async function forwardResponseBody(requestId, encodedDataLength) {
       timestamp: nowIso(),
       encodedDataLength,
       ...meta,
+      quoteAccepted,
       body: bodyText,
       base64Encoded: false
     });
@@ -1501,6 +2049,32 @@ async function handleDebuggerEvent(source, method, params) {
     return;
   }
 
+  if (method === "Network.requestWillBeSent") {
+    const request = params && params.request;
+    if (!request || !isQuoteUrl(request.url)) {
+      return;
+    }
+    const activeMeta = parseActiveQuoteMeta(request.url);
+    if (activeMeta) {
+      state.activeQuoteRequests.set(params.requestId, { ...activeMeta, sentAtMs: Date.now() });
+      return;
+    }
+    const parsedBody = tryParseJson(request.postData || "");
+    const template = activeQuoteTemplateInfo(parsedBody);
+    if (!template) {
+      return;
+    }
+    const changed = !state.activeQuoteTemplate || state.activeQuoteTemplate.signature !== template.signature;
+    state.activeQuoteTemplate = template;
+    state.activeQuoteAsset = template.asset;
+    await persistRuntimeState();
+    if (changed || state.activeQuoteStatus !== "running") {
+      state.activeQuoteStatus = "installing";
+      await installActiveQuotePoller(source.tabId, template);
+    }
+    return;
+  }
+
   if (method === "Network.responseReceived") {
     trackResponse(params);
     return;
@@ -1513,6 +2087,7 @@ async function handleDebuggerEvent(source, method, params) {
 
   if (method === "Network.loadingFailed") {
     state.pendingResponses.delete(params.requestId);
+    state.activeQuoteRequests.delete(params.requestId);
     return;
   }
 
@@ -1583,6 +2158,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   }
   state.lastError = `Debugger detached: ${reason}`;
   cleanupForwardingState();
+  void persistRuntimeState();
   notifyStatus();
 });
 
@@ -1605,12 +2181,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
 
     if (message.action === "updateConfig") {
-      state.config = sanitizeConfig(message.config);
+      const wasActiveQuoteEnabled = state.config.activeQuoteEnabled;
+      state.config = sanitizeConfig({ ...state.config, ...message.config });
       await chrome.storage.local.set({ forwarderConfig: state.config });
       if (state.active) {
         wsForwarder.restart();
         restForwarder.restart();
         brokerSocket.restart();
+        if (!state.config.activeQuoteEnabled) {
+          await stopActiveQuotePoller(state.attachedTabId);
+          state.activeQuoteStatus = "disabled";
+        } else if (state.activeQuoteTemplate) {
+          await installActiveQuotePoller(state.attachedTabId, state.activeQuoteTemplate);
+        } else if (!wasActiveQuoteEnabled) {
+          state.activeQuoteStatus = "waiting_template";
+        }
       }
       notifyStatus();
       return { ok: true, status: getStatus() };
@@ -1637,6 +2222,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (state.active && tabId === state.attachedTabId && changeInfo.status === "complete") {
     void installDomQuoteObserver(tabId);
+    if (state.activeQuoteTemplate) {
+      void installActiveQuotePoller(tabId, state.activeQuoteTemplate);
+    }
+  }
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (state.active && tabId === state.attachedTabId) {
+    cleanupForwardingState();
+    state.lastError = "Attached Variational tab was closed";
+    void persistRuntimeState();
+    notifyStatus();
   }
 });
 
@@ -1645,3 +2242,5 @@ chrome.runtime.onInstalled.addListener(() => {
     // Ignore config load errors during install.
   });
 });
+
+void restoreRuntimeState();

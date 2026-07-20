@@ -1,0 +1,109 @@
+import tempfile
+import time
+import unittest
+import json
+import urllib.request
+import threading
+from pathlib import Path
+
+from variational.spread_store import SpreadStore
+from variational.spread_dashboard import SpreadDashboardServer
+
+
+class SpreadStoreTest(unittest.TestCase):
+    def test_history_read_lock_does_not_block_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpreadStore(Path(directory) / "spreads.sqlite3")
+            finished = threading.Event()
+
+            def write_sample():
+                store.record(asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4, long_edge_pct=5, short_edge_pct=6)
+                finished.set()
+
+            with store._read_lock:
+                thread = threading.Thread(target=write_sample)
+                thread.start()
+                self.assertTrue(finished.wait(1), "writer was blocked by a history read lock")
+            thread.join()
+            self.assertEqual(store.sample_count("BTC"), 1)
+            store.close()
+
+    def test_history_and_stats_survive_reopen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spreads.sqlite3"
+            now_ms = int(time.time() * 1000)
+            store = SpreadStore(path)
+            for index, value in enumerate((0.10, 0.20, 0.30)):
+                store.record(
+                    asset="BTC",
+                    var_bid=65000 + index,
+                    var_ask=65001 + index,
+                    lighter_bid=65002 + index,
+                    lighter_ask=65003 + index,
+                    long_edge_pct=value,
+                    short_edge_pct=-value,
+                    timestamp_ms=now_ms - (2 - index) * 1000,
+                )
+            store.record(
+                asset="XAU",
+                var_bid=3000,
+                var_ask=3001,
+                lighter_bid=3002,
+                lighter_ask=3003,
+                long_edge_pct=9.9,
+                short_edge_pct=-9.9,
+                timestamp_ms=now_ms,
+            )
+            store.close()
+
+            reopened = SpreadStore(path)
+            history = reopened.history("BTC", 60)
+            median_value, p90, p10 = reopened.window_stats("BTC", 60, "long")
+            self.assertEqual(len(history), 3)
+            self.assertAlmostEqual(median_value, 0.20)
+            self.assertGreater(p90, median_value)
+            self.assertLess(p10, median_value)
+            self.assertTrue(all(point["longEdge"] != 9.9 for point in history))
+            reopened.close()
+
+
+class SpreadDashboardTest(unittest.TestCase):
+    def test_production_dashboard_has_chart_controls(self):
+        html = (Path(__file__).resolve().parents[1] / "web" / "spread_dashboard.html").read_text(encoding="utf-8")
+        self.assertIn('id="chart"', html)
+        self.assertIn('id="assetSelect"', html)
+        self.assertIn('data-range="604800"', html)
+        self.assertIn("/api/history", html)
+        self.assertIn("做空价差（Short Edge）", html)
+        self.assertIn("quadraticCurveTo", html)
+        self.assertIn('id="zoomIn"', html)
+        self.assertIn('id="resetZoom"', html)
+        self.assertIn('data-series="both"', html)
+        self.assertIn('data-series="long"', html)
+        self.assertIn('data-series="short"', html)
+        self.assertIn('addEventListener("wheel"', html)
+        self.assertIn('addEventListener("dblclick"', html)
+        self.assertIn("setTimeout(refreshLoop", html)
+
+    def test_dashboard_serves_html_assets_and_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            html = root / "index.html"
+            html.write_text("<html>dashboard</html>", encoding="utf-8")
+            store = SpreadStore(root / "spreads.sqlite3")
+            store.record(asset="BTC", var_bid=100, var_ask=101, lighter_bid=102, lighter_ask=103, long_edge_pct=1, short_edge_pct=-1)
+            server = SpreadDashboardServer(store, "127.0.0.1", 0, html)
+            server.start()
+            try:
+                port = server._server.server_port
+                page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=2).read().decode()
+                assets = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/assets", timeout=2))
+                history = json.load(urllib.request.urlopen(f"http://127.0.0.1:{port}/api/history?asset=BTC&range=3600", timeout=2))
+                self.assertIn("dashboard", page)
+                self.assertEqual(assets["assets"], ["BTC"])
+                self.assertEqual(history["asset"], "BTC")
+                self.assertEqual(history["sampleCount"], 1)
+                self.assertEqual(history["latest"]["varAsk"], 101.0)
+            finally:
+                server.stop()
+                store.close()

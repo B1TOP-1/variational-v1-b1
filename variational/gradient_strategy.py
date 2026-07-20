@@ -159,11 +159,38 @@ class GradientStrategyState:
     ) -> GradientSignal | None:
         if not self.enabled:
             return None
-        # 单向持仓单轴语义：仓位带符号（正=多 / 负=空），不做多空钳制。
-        close_signal = self._evaluate_close(close_spread_pct, current_position_qty)
-        if close_signal is not None:
-            return close_signal
-        return self._evaluate_open(open_spread_pct, current_position_qty)
+        # Long Edge 只查 Long 梯度，Short Edge 只查 Short 梯度；梯度给出带符号目标仓位。
+        candidates: list[tuple[Decimal, StrategySection, GradientRow]] = []
+        long_row = self._select_long_row(self.open_rows, open_spread_pct)
+        short_row = self._select_short_row(self.close_rows, close_spread_pct)
+        if long_row is not None and open_spread_pct is not None:
+            candidates.append((open_spread_pct, StrategySection.OPEN, long_row))
+        if short_row is not None and close_spread_pct is not None:
+            candidates.append((close_spread_pct, StrategySection.CLOSE, short_row))
+        if not candidates:
+            return None
+
+        # 同时命中时选择数值更高的 Edge；相同则选择距离当前仓位更近的目标。
+        spread_pct, section, selected = max(
+            candidates,
+            key=lambda item: (item[0], -abs(item[2].target_qty - current_position_qty)),
+        )
+        target_qty = selected.target_qty
+        threshold_pct = selected.threshold_pct
+        if target_qty is None or threshold_pct is None:
+            return None
+        signed_delta = target_qty - current_position_qty
+        if signed_delta == 0:
+            return None
+        return GradientSignal(
+            action="open" if signed_delta > 0 else "close",
+            section=section,
+            spread_pct=spread_pct,
+            threshold_pct=threshold_pct,
+            target_qty=target_qty,
+            current_qty=current_position_qty,
+            delta_qty=abs(signed_delta),
+        )
 
     def display_value(self, section: StrategySection, index: int, field_name: EditableField) -> str:
         if (
@@ -192,54 +219,29 @@ class GradientStrategyState:
     def order_size_selected(self) -> bool:
         return self.cursor_target == CursorTarget.ORDER_SIZE
 
-    def _evaluate_open(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
+    @staticmethod
+    def _select_long_row(rows: list[GradientRow], spread_pct: Decimal | None) -> GradientRow | None:
         if spread_pct is None:
             return None
-        rows = sorted((row for row in self.open_rows if row.is_complete()), key=lambda row: row.threshold_pct)
         selected: GradientRow | None = None
-        for row in rows:
+        for row in sorted((row for row in rows if row.is_complete()), key=lambda row: row.threshold_pct):
             if row.threshold_pct is not None and spread_pct >= row.threshold_pct:
                 selected = row
-        if selected is None or selected.target_qty is None or selected.threshold_pct is None:
-            return None
-        delta_qty = selected.target_qty - current_qty
-        if delta_qty <= 0:
-            return None
-        return GradientSignal(
-            action="open",
-            section=StrategySection.OPEN,
-            spread_pct=spread_pct,
-            threshold_pct=selected.threshold_pct,
-            target_qty=selected.target_qty,
-            current_qty=current_qty,
-            delta_qty=delta_qty,
-        )
+        return selected
 
-    def _evaluate_close(self, spread_pct: Decimal | None, current_qty: Decimal) -> GradientSignal | None:
-        # 电平触发：平仓价差 >= 阈值即刻平仓（价差越高越有利；阈值 -0.1 时 -0.09/-0.08 平、-0.12 不平），
-        # 与开仓同方向，不需要穿越。current_qty 带符号；target 可为 0 或负数（继续做空到 -N），
-        # 靠 delta=current-target>0 触发卖出。
+    @staticmethod
+    def _select_short_row(rows: list[GradientRow], spread_pct: Decimal | None) -> GradientRow | None:
         if spread_pct is None:
             return None
-        rows = sorted((row for row in self.close_rows if row.is_complete()), key=lambda row: row.threshold_pct)
         selected: GradientRow | None = None
-        for row in rows:
-            if row.threshold_pct is not None and spread_pct >= row.threshold_pct:
+        for row in sorted(
+            (row for row in rows if row.is_complete()),
+            key=lambda row: row.threshold_pct,
+            reverse=True,
+        ):
+            if row.threshold_pct is not None and spread_pct <= row.threshold_pct:
                 selected = row
-        if selected is None or selected.target_qty is None or selected.threshold_pct is None:
-            return None
-        delta_qty = current_qty - selected.target_qty
-        if delta_qty <= 0:
-            return None
-        return GradientSignal(
-            action="close",
-            section=StrategySection.CLOSE,
-            spread_pct=spread_pct,
-            threshold_pct=selected.threshold_pct,
-            target_qty=selected.target_qty,
-            current_qty=current_qty,
-            delta_qty=delta_qty,
-        )
+        return selected
 
     def _handle_escape_sequence(self, key: str) -> bool:
         if key in ("\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"):

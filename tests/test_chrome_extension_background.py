@@ -9,6 +9,153 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class ChromeExtensionBackgroundTest(unittest.TestCase):
+    def _run_active_quote_poller(self) -> dict:
+        script = textwrap.dedent(
+            r"""
+            const fs = require("fs");
+            const vm = require("vm");
+            const source = fs.readFileSync("chrome_extension/background.js", "utf8");
+            const start = source.indexOf("function installActiveQuotePollerInPage(config) {");
+            if (start < 0) throw new Error("active quote poller not found");
+            let depth = 0;
+            let end = -1;
+            for (let index = start; index < source.length; index += 1) {
+              if (source[index] === "{") depth += 1;
+              if (source[index] === "}") {
+                depth -= 1;
+                if (depth === 0) { end = index + 1; break; }
+              }
+            }
+            const pollerSource = source.slice(start, end);
+            const fetchCalls = [];
+            let timerId = 0;
+            const sandbox = {
+              window: {},
+              location: { pathname: "/perpetual/BTC" },
+              performance: { now: () => 1 },
+              fetch: async (url, options) => {
+                fetchCalls.push({ url, options });
+                return { status: 200, headers: { get: () => null }, text: async () => "{}" };
+              },
+              setTimeout: () => ++timerId,
+              clearTimeout: () => {},
+              AbortController,
+              Date,
+              Math,
+              JSON,
+              String,
+              Number,
+              encodeURIComponent,
+              decodeURIComponent
+            };
+            vm.createContext(sandbox);
+            vm.runInContext(pollerSource, sandbox);
+            const config = {
+              body: {
+                instrument: {
+                  underlying: "BTC",
+                  instrument_type: "perpetual_future",
+                  settlement_asset: "USDC",
+                  funding_interval_s: 3600
+                },
+                qty: "0.001"
+              },
+              intervalMs: 100,
+              maxInFlight: 4,
+              timeoutMs: 1500,
+              maxBackoffMs: 30000
+            };
+            const result = sandbox.installActiveQuotePollerInPage(config);
+            setImmediate(() => process.stdout.write(JSON.stringify({ result, fetchCalls })));
+            """
+        )
+        completed = subprocess.run(
+            ["node", "-e", script],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
+    def test_active_quote_poller_starts_same_origin_fetch_with_sequence(self):
+        result = self._run_active_quote_poller()
+
+        self.assertTrue(result["result"]["active"])
+        self.assertEqual(result["result"]["asset"], "BTC")
+        self.assertEqual(result["result"]["sequence"], 1)
+        self.assertEqual(len(result["fetchCalls"]), 1)
+        request = result["fetchCalls"][0]
+        self.assertIn("/api/quotes/indicative?__var_active_quote=1", request["url"])
+        self.assertIn("seq=1", request["url"])
+        self.assertEqual(request["options"]["credentials"], "include")
+        self.assertEqual(json.loads(request["options"]["body"])["instrument"]["underlying"], "BTC")
+
+    def test_active_quote_collector_defaults_to_200ms_and_main_world(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("activeQuoteIntervalMs: 200", background)
+        self.assertIn("incomingVersion < 2 && storedInterval === 100 ? 200", background)
+        self.assertIn("displaySequence", background)
+        self.assertIn("metricsWindowSize = 10000", background)
+        self.assertIn("activeQuoteNotionalUsd: 500", background)
+        self.assertIn("approximateQty.toPrecision(2)", background)
+        self.assertIn("if (!response.ok)", background)
+        self.assertIn("state.failed += 1", background)
+        self.assertIn("activeQuoteMaxInFlight: 4", background)
+        self.assertIn('world: "MAIN"', background)
+        self.assertIn("installActiveQuotePollerInPage", background)
+
+    def test_active_quote_collector_learns_native_request_template(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn('method === "Network.requestWillBeSent"', background)
+        self.assertIn('tryParseJson(request.postData || "")', background)
+        self.assertIn("activeQuoteTemplateInfo(parsedBody)", background)
+        self.assertIn("state.activeQuoteTemplate = template", background)
+
+    def test_active_quote_requests_are_sequenced_and_old_responses_are_rejected(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("__var_active_quote=1", background)
+        self.assertIn("latestAcceptedQuoteSeq", background)
+        self.assertIn("activeMeta.sequence <= latest", background)
+        self.assertIn("activeMeta.sessionId !== state.activeQuoteSessionId", background)
+        self.assertIn("meta.status !== 200", background)
+        self.assertIn("quoteAccepted", background)
+
+    def test_active_quote_runtime_state_is_restored(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("chrome.storage.session", background)
+        self.assertIn("restoreRuntimeState", background)
+        self.assertIn("chrome.tabs.onRemoved", background)
+        self.assertIn("extension_keepalive", background)
+
+    def test_popup_exposes_active_quote_controls(self):
+        popup = (ROOT / "chrome_extension" / "popup.html").read_text()
+        popup_script = (ROOT / "chrome_extension" / "popup.js").read_text()
+
+        self.assertIn('id="activeQuoteEnabled"', popup)
+        self.assertIn('id="activeQuoteIntervalMs"', popup)
+        self.assertIn('id="activeQuoteMaxInFlight"', popup)
+        self.assertIn("activeQuoteIntervalMs", popup_script)
+
+    def test_popup_renders_live_quote_and_collector_metrics(self):
+        popup = (ROOT / "chrome_extension" / "popup.html").read_text()
+        popup_script = (ROOT / "chrome_extension" / "popup.js").read_text()
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("报价监控", popup)
+        self.assertIn("卖出价 Bid", popup)
+        self.assertIn("启用主动报价采集", popup)
+        for element_id in ("bid", "ask", "mark", "spread", "latency", "sequence", "completed", "failed", "skipped"):
+            self.assertIn(f'id="{element_id}"', popup)
+        self.assertIn("setInterval(refreshStatus, 250)", popup_script)
+        self.assertIn("quote.latencyMs", popup_script)
+        self.assertIn("activeQuoteMetrics", background)
+        self.assertIn("sentAtMs", background)
+
     def _run_locate_order_elements(self, buttons_js: str, inputs_js: str = "[]", side: str = "buy") -> dict:
         script = textwrap.dedent(
             r"""

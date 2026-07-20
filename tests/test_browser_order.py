@@ -71,6 +71,11 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertIn("https://omni.variational.io/api/quotes/indicative", background)
         self.assertIn("https://omni.variational.io/orders/new/market", background)
 
+    def test_listener_ignores_quote_responses_rejected_by_extension_ordering(self):
+        listener = (Path(__file__).resolve().parents[1] / "variational" / "listener.py").read_text()
+
+        self.assertIn('payload.get("quoteAccepted") is False', listener)
+
     def test_extension_uses_submit_button_testid_selector(self):
         background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
 
@@ -207,6 +212,23 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(rt._latest_gradient_signal)
         self.assertEqual(rt._latest_gradient_signal.action, "open")
 
+    async def test_short_gradient_uses_short_edge_directly(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0.01")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.close_rows[0].threshold_pct = Decimal("0.20")
+        rt.gradient_strategy.close_rows[0].target_qty = Decimal("0")
+
+        async def spreads():
+            return (Decimal("0.10"), Decimal("0.18"))
+
+        rt._compute_signal_spreads = spreads
+        await rt._run_strategy_evaluation()
+
+        self.assertIsNotNone(rt._latest_gradient_signal)
+        self.assertEqual(rt._latest_gradient_signal.action, "close")
+        self.assertEqual(rt._latest_gradient_signal.spread_pct, Decimal("0.18"))
+
     async def test_refresh_cache_uses_listener_without_dom(self):
         rt = self._runtime()
 
@@ -257,8 +279,9 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
-        now = time.monotonic()
-        rt.cross_spread_history.extend((now, 0.07, 0.0) for _ in range(30))  # 近期均值 0.07
+        rt.variational_ticker = "XAU"
+        for _ in range(30):
+            rt.spread_store.record(asset="XAU", var_bid=None, var_ask=None, lighter_bid=None, lighter_ask=None, long_edge_pct=0.07, short_edge_pct=0.0)
         original = main_mod.MAX_SPIKE_DEVIATION_PCT
         main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
         try:
@@ -280,8 +303,9 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
-        now = time.monotonic()
-        rt.cross_spread_history.extend((now, 0.115, 0.0) for _ in range(30))  # 均值贴近阈值
+        rt.variational_ticker = "XAU"
+        for _ in range(30):
+            rt.spread_store.record(asset="XAU", var_bid=None, var_ask=None, lighter_bid=None, lighter_ask=None, long_edge_pct=0.115, short_edge_pct=0.0)
         original = main_mod.MAX_SPIKE_DEVIATION_PCT
         main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
         try:
@@ -332,9 +356,9 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
     def test_window_stats_single_pass(self):
         rt = self._runtime()
-        now = time.monotonic()
+        rt.variational_ticker = "BTC"
         for v in (0.05, 0.06, 0.07, 0.08, 0.09):
-            rt.cross_spread_history.append((now, v, None))
+            rt.spread_store.record(asset="BTC", var_bid=None, var_ask=None, lighter_bid=None, lighter_ask=None, long_edge_pct=v, short_edge_pct=None)
         med, p90, p10 = rt._window_stats(3600, long_side=True)
         self.assertEqual(med, 0.07)
         self.assertEqual(p90, rt._percentile([0.05, 0.06, 0.07, 0.08, 0.09], 90))
@@ -342,19 +366,20 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
     def test_refresh_spread_stats_populates_cache(self):
         rt = self._runtime()
-        rt.cross_spread_history.append((time.monotonic(), 0.07, 0.03))
+        rt.variational_ticker = "BTC"
+        rt.spread_store.record(asset="BTC", var_bid=None, var_ask=None, lighter_bid=None, lighter_ask=None, long_edge_pct=0.07, short_edge_pct=0.03)
         rt._refresh_spread_stats()
         self.assertEqual(rt._spread_stats_cache["long_median_5m"], 0.07)
         self.assertEqual(rt._spread_stats_cache["short_median_1h"], 0.03)
 
     def test_spread_trend_series_and_line_chart(self):
         rt = self._runtime()
+        rt.variational_ticker = "BTC"
         w = SPREAD_TREND_WINDOW_SECONDS
-        now = 1_000_000.0
-        rt._spread_trend.append((now - w + 10, 0.05, -0.05))  # 最左
-        rt._spread_trend.append((now - w / 2, 0.07, -0.07))   # 中间
-        rt._spread_trend.append((now - 10, 0.09, -0.09))      # 最右
-        vals, lo, hi = rt._spread_trend_series(0, 10, now)
+        now_ms = int(time.time() * 1000)
+        for age, long_edge, short_edge in ((w - 10, 0.05, -0.05), (w / 2, 0.07, -0.07), (10, 0.09, -0.09)):
+            rt.spread_store.record(asset="BTC", var_bid=None, var_ask=None, lighter_bid=None, lighter_ask=None, long_edge_pct=long_edge, short_edge_pct=short_edge, timestamp_ms=now_ms - int(age * 1000))
+        vals, lo, hi = rt._spread_trend_series(0, 10, time.monotonic())
         self.assertEqual(len(vals), 10)
         self.assertEqual((lo, hi), (0.05, 0.09))
         self.assertEqual(vals[0], 0.05)
@@ -364,13 +389,12 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len(chart), 2)              # 行数随整齐刻度而定
         self.assertTrue(all("┤" in line for line in chart))  # 每行都带刻度标签
 
-    def test_spread_trend_sampling_throttled_and_pruned(self):
+    def test_spread_samples_are_all_persisted_without_memory_throttle(self):
         rt = self._runtime()
-        rt._last_trend_sample_ts = 0.0
-        rt._sample_spread_trend(Decimal("0.05"), Decimal("-0.05"))
-        self.assertEqual(len(rt._spread_trend), 1)
-        rt._sample_spread_trend(Decimal("0.06"), Decimal("-0.06"))  # 立即再取样被节流
-        self.assertEqual(len(rt._spread_trend), 1)
+        rt.variational_ticker = "BTC"
+        rt._record_cross_spreads("BTC", None, None, None, None, Decimal("0.05"), Decimal("-0.05"))
+        rt._record_cross_spreads("BTC", None, None, None, None, Decimal("0.06"), Decimal("-0.06"))
+        self.assertEqual(rt.spread_store.sample_count("BTC", 60), 2)
 
     def test_running_stat_avg(self):
         s = RunningStat()
@@ -483,6 +507,14 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snap["transitions"]["api"], 1)
         self.assertEqual(snap["transitions"]["dom"], 1)
         self.assertEqual(snap["matched"], 1)
+
+    def test_active_api_quote_wakes_strategy_immediately(self):
+        rt = self._runtime()
+        rt._strategy_wake.clear()
+
+        rt._on_api_quote("XAU", "100", "101", None)
+
+        self.assertTrue(rt._strategy_wake.is_set())
 
     def test_var_quote_disconnect_gate(self):
         rt = self._runtime()

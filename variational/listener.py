@@ -75,6 +75,8 @@ class VariationalMonitor:
         endpoint = classify_rest_endpoint(url)
         if endpoint != QUOTES_INDICATIVE_PATH:
             return []
+        if payload.get("quoteAccepted") is False:
+            return []
 
         body = decode_response_body(payload)
         if body is None:

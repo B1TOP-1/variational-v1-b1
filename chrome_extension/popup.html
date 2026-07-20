@@ -1,120 +1,262 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
-    <title>Variational Forwarder</title>
+    <title>Variational 报价监控</title>
     <style>
       :root {
         color-scheme: light;
-        font-family: "Segoe UI", sans-serif;
+        font-family: Inter, "Segoe UI", system-ui, sans-serif;
+        color: #17202a;
+        background: #eef1f4;
       }
+
+      * { box-sizing: border-box; }
 
       body {
         margin: 0;
-        width: 340px;
-        padding: 14px;
-        background: #f6f8fa;
+        width: 404px;
+        max-height: 600px;
+        overflow-y: auto;
+        background: #eef1f4;
+        letter-spacing: 0;
       }
 
-      h1 {
-        font-size: 16px;
-        margin: 0 0 10px;
+      header {
+        height: 54px;
+        padding: 0 16px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        background: #17202a;
+        color: #ffffff;
       }
 
-      .field {
-        margin-bottom: 10px;
-      }
-
-      label {
-        display: block;
+      .brand { display: flex; align-items: center; gap: 9px; min-width: 0; }
+      .brand-mark {
+        width: 25px;
+        height: 25px;
+        display: grid;
+        place-items: center;
+        border: 1px solid #4c9af8;
+        border-radius: 5px;
+        color: #4c9af8;
         font-size: 12px;
-        margin-bottom: 4px;
-        color: #1f2328;
+        font-weight: 700;
+      }
+      h1 { margin: 0; font-size: 14px; font-weight: 650; }
+
+      .run-state { display: flex; align-items: center; gap: 7px; font-size: 11px; color: #aeb8c2; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; background: #75808b; }
+      .dot.running { background: #38b76a; box-shadow: 0 0 0 3px rgba(56, 183, 106, 0.18); }
+      .dot.error { background: #e1534f; }
+
+      main { padding: 12px 14px 14px; }
+
+
+      .quote-panel {
+        background: #ffffff;
+        border: 1px solid #d7dde3;
+        border-radius: 6px;
+        overflow: hidden;
       }
 
-      input {
-        width: 100%;
-        box-sizing: border-box;
-        padding: 7px 8px;
-        border: 1px solid #d0d7de;
-        border-radius: 6px;
-        background: white;
+      .quote-header {
+        min-height: 42px;
+        padding: 8px 12px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid #e4e8ec;
       }
+      .asset { font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; }
+      .age { font-size: 11px; color: #66717d; font-variant-numeric: tabular-nums; }
+      .age.stale { color: #b96b00; font-weight: 650; }
 
-      textarea {
-        width: 100%;
-        box-sizing: border-box;
-        min-height: 70px;
-        padding: 7px 8px;
-        border: 1px solid #d0d7de;
-        border-radius: 6px;
-        background: white;
-        resize: vertical;
+      .primary-prices { display: grid; grid-template-columns: 1fr 1fr; }
+      .price-cell { min-width: 0; padding: 12px; }
+      .price-cell + .price-cell { border-left: 1px solid #e4e8ec; }
+      .label { font-size: 10px; font-weight: 700; color: #75808b; text-transform: uppercase; }
+      .price {
+        min-height: 27px;
+        margin-top: 3px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 20px;
+        line-height: 27px;
+        font-weight: 700;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
+      }
+      .bid { color: #137a46; }
+      .ask { color: #bd3f3a; }
+      .mark { color: #246db5; }
+
+      .secondary-prices {
+        display: grid;
+        grid-template-columns: 1.15fr 1.35fr 0.9fr;
+        border-top: 1px solid #e4e8ec;
+        background: #f8fafb;
+      }
+      .metric { padding: 8px 10px; min-width: 0; }
+      .metric + .metric { border-left: 1px solid #e4e8ec; }
+      .metric-value {
+        margin-top: 2px;
+        overflow: hidden;
+        color: #26313c;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
         font-size: 11px;
+        font-weight: 650;
+        font-variant-numeric: tabular-nums;
+        white-space: nowrap;
       }
 
-      .row {
-        display: flex;
-        gap: 8px;
-        margin-top: 12px;
+      .connection-strip {
+        margin: 10px 0;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        border-top: 1px solid #d7dde3;
+        border-bottom: 1px solid #d7dde3;
       }
+      .connection { padding: 8px 4px; text-align: center; min-width: 0; }
+      .connection + .connection { border-left: 1px solid #d7dde3; }
+      .connection strong { display: block; margin-top: 2px; font-size: 10px; overflow: hidden; text-overflow: ellipsis; }
+      .connection[data-state="connected"] strong,
+      .connection[data-state="running"] strong { color: #137a46; }
+      .connection[data-state="error"] strong,
+      .connection[data-state="disconnected"] strong { color: #bd3f3a; }
+      .connection[data-state="connecting"] strong,
+      .connection[data-state="waiting_template"] strong,
+      .connection[data-state="installing"] strong,
+      .connection[data-state="restoring"] strong { color: #b96b00; }
 
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        margin-bottom: 10px;
+      }
+      .stat { min-width: 0; padding: 3px 6px; text-align: center; }
+      .stat-value { display: block; font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+
+      details { border-top: 1px solid #d7dde3; background: #ffffff; }
+      details:last-of-type { border-bottom: 1px solid #d7dde3; }
+      summary { padding: 10px 4px; cursor: pointer; font-size: 12px; font-weight: 650; list-style-position: inside; }
+      .settings { padding: 0 4px 10px; }
+      .setting-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+      .field { min-width: 0; }
+      .field.full { grid-column: 1 / -1; }
+      label { display: block; margin-bottom: 4px; color: #55616d; font-size: 10px; font-weight: 650; }
+      .toggle-label { display: flex; align-items: center; gap: 7px; min-height: 31px; margin: 0; font-size: 11px; color: #26313c; }
+
+      input, textarea {
+        width: 100%;
+        border: 1px solid #cbd2d9;
+        border-radius: 4px;
+        background: #ffffff;
+        color: #17202a;
+        font: inherit;
+      }
+      input { height: 31px; padding: 5px 7px; font-size: 11px; }
+      input[type="checkbox"] { width: 15px; height: 15px; margin: 0; accent-color: #246db5; }
+      textarea { min-height: 62px; padding: 6px 7px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
+
+      .actions { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 12px; }
       button {
-        flex: 1;
-        border: 1px solid #1f6feb;
-        border-radius: 6px;
-        background: #1f6feb;
-        color: white;
-        padding: 7px 8px;
+        height: 34px;
+        border: 1px solid #246db5;
+        border-radius: 5px;
+        background: #246db5;
+        color: #ffffff;
+        font-size: 11px;
+        font-weight: 700;
         cursor: pointer;
       }
+      button.secondary { background: #ffffff; color: #246db5; }
+      button.danger { border-color: #bd3f3a; background: #ffffff; color: #bd3f3a; }
+      button:disabled { cursor: default; opacity: 0.45; }
 
-      button.secondary {
-        background: white;
-        color: #1f6feb;
-      }
-
-      #status {
-        margin-top: 12px;
-        padding: 8px;
-        border-radius: 6px;
-        background: white;
-        border: 1px solid #d0d7de;
-        font-size: 12px;
-        line-height: 1.4;
-        white-space: pre-wrap;
+      .error-line {
+        min-height: 17px;
+        margin-top: 8px;
+        color: #bd3f3a;
+        font-size: 10px;
+        line-height: 1.35;
+        overflow-wrap: anywhere;
       }
     </style>
   </head>
   <body>
-    <h1>Variational CDP Forwarder</h1>
-    <div class="field">
-      <label for="domainFilter">Domain filter contains</label>
-      <input id="domainFilter" placeholder="variational" />
-    </div>
-    <div class="field">
-      <label for="wsEndpoint">WebSocket frames endpoint</label>
-      <input id="wsEndpoint" placeholder="ws://127.0.0.1:8766" />
-    </div>
-    <div class="field">
-      <label for="restEndpoint">REST responses endpoint</label>
-      <input id="restEndpoint" placeholder="ws://127.0.0.1:8767" />
-    </div>
-    <div class="field">
-      <label for="brokerEndpoint">Browser order broker endpoint</label>
-      <input id="brokerEndpoint" placeholder="ws://127.0.0.1:8768" />
-    </div>
-    <div class="field">
-      <label for="restAllowlist">REST URL allowlist (one URL per line)</label>
-      <textarea id="restAllowlist"></textarea>
-    </div>
-    <div class="row">
-      <button id="saveConfig" class="secondary">Save</button>
-      <button id="start">Start</button>
-      <button id="stop" class="secondary">Stop</button>
-    </div>
-    <div id="status">Loading...</div>
+    <header>
+      <div class="brand">
+        <div class="brand-mark">V</div>
+        <h1>报价监控</h1>
+      </div>
+      <div class="run-state"><span id="runDot" class="dot"></span><span id="runText">已停止</span></div>
+    </header>
+
+    <main>
+      <section class="quote-panel" aria-label="最新报价">
+        <div class="quote-header">
+          <span id="asset" class="asset">--</span>
+          <span id="quoteAge" class="age">暂无报价</span>
+        </div>
+        <div class="primary-prices">
+          <div class="price-cell"><span class="label">卖出价 Bid</span><div id="bid" class="price bid">--</div></div>
+          <div class="price-cell"><span class="label">买入价 Ask</span><div id="ask" class="price ask">--</div></div>
+        </div>
+        <div class="secondary-prices">
+          <div class="metric"><span class="label">标记价</span><div id="mark" class="metric-value mark">--</div></div>
+          <div class="metric"><span class="label">买卖价差</span><div id="spread" class="metric-value">--</div></div>
+          <div class="metric"><span class="label">延迟</span><div id="latency" class="metric-value">--</div></div>
+        </div>
+      </section>
+
+      <section class="connection-strip" aria-label="连接状态">
+        <div id="collectorConnection" class="connection"><span class="label">报价采集</span><strong>--</strong></div>
+        <div id="restConnection" class="connection"><span class="label">报价转发</span><strong>--</strong></div>
+        <div id="wsConnection" class="connection"><span class="label">事件流</span><strong>--</strong></div>
+        <div id="brokerConnection" class="connection"><span class="label">下单通道</span><strong>--</strong></div>
+      </section>
+
+      <section class="stats" aria-label="采集统计">
+        <div class="stat"><span class="label">窗口编号</span><span id="sequence" class="stat-value">0</span></div>
+        <div class="stat"><span class="label">成功完成</span><span id="completed" class="stat-value">0</span></div>
+        <div class="stat"><span class="label">失败</span><span id="failed" class="stat-value">0</span></div>
+        <div class="stat"><span class="label">跳过</span><span id="skipped" class="stat-value">0</span></div>
+      </section>
+
+      <details open>
+        <summary>采集设置</summary>
+        <div class="settings setting-grid">
+          <div class="field full">
+            <label class="toggle-label" for="activeQuoteEnabled"><input id="activeQuoteEnabled" type="checkbox" />启用主动报价采集</label>
+          </div>
+          <div class="field"><label for="activeQuoteIntervalMs">请求间隔（毫秒）</label><input id="activeQuoteIntervalMs" type="number" min="50" max="60000" step="10" /></div>
+          <div class="field"><label for="activeQuoteNotionalUsd">Var 报价深度（美元）</label><input id="activeQuoteNotionalUsd" type="number" min="10" max="1000000" step="10" /></div>
+          <div class="field"><label for="activeQuoteMaxInFlight">最大并发请求</label><input id="activeQuoteMaxInFlight" type="number" min="1" max="20" step="1" /></div>
+          <div class="field"><label for="activeQuoteTimeoutMs">请求超时（毫秒）</label><input id="activeQuoteTimeoutMs" type="number" min="250" max="30000" step="50" /></div>
+          <div class="field"><label for="domainFilter">域名过滤</label><input id="domainFilter" placeholder="variational" /></div>
+        </div>
+      </details>
+
+      <details>
+        <summary>连接地址</summary>
+        <div class="settings setting-grid">
+          <div class="field full"><label for="wsEndpoint">事件帧地址</label><input id="wsEndpoint" /></div>
+          <div class="field full"><label for="restEndpoint">报价响应地址</label><input id="restEndpoint" /></div>
+          <div class="field full"><label for="brokerEndpoint">浏览器下单地址</label><input id="brokerEndpoint" /></div>
+          <div class="field full"><label for="restAllowlist">REST 白名单</label><textarea id="restAllowlist"></textarea></div>
+        </div>
+      </details>
+
+      <div class="actions">
+        <button id="saveConfig" class="secondary">保存设置</button>
+        <button id="start">启动</button>
+        <button id="stop" class="danger">停止</button>
+      </div>
+      <div id="lastError" class="error-line" role="status"></div>
+    </main>
     <script src="popup.js"></script>
   </body>
 </html>

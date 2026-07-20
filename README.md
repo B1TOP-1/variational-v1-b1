@@ -61,6 +61,47 @@ LIGHTER_WS_SERVER_PINGS=true
 3. 在左上角点击 `Load unpacked`，选择：
 `variational-v1/chrome_extension`
 
+### 主动报价采集
+插件 `1.2.0` 默认启用主动 indicative quote 采集，间隔为 `200ms`，不需要打开 DevTools Console。
+
+插件不会读取或复制 Cookie。启动后先通过 CDP 捕获 Omni 网页原生的
+`POST /api/quotes/indicative` 请求体，再把该请求体作为模板注入网页 MAIN world，
+使用网页已经通过 Cloudflare 验证的同源会话主动获取报价。响应仍通过原有 CDP 和
+`ws://127.0.0.1:8767` 转发给 Python。
+
+在 Omni 网页切换 BTC、CL 或其他标的后，网页原生请求体会随标的变化；插件检测到新模板后会自动停止旧采集器并启动新采集器，不需要手动修改 instrument。
+
+插件弹窗可配置：
+- 是否启用主动报价；
+- 请求间隔，默认 `200ms`；
+- Var 报价深度，默认 `$500` 等值数量并取两位有效数字；
+- 最大并发，默认 `4`；
+- 单请求超时，默认 `1500ms`。
+
+长期运行保护：
+- 每个页面采集会话使用独立 session id 和递增 sequence；晚到的旧响应不会进入策略；
+- 达到最大并发时跳过本轮，不无限堆积请求；
+- `403` 停止采集并等待重新验证；`429`、`5xx` 和网络错误指数退避；
+- 页面刷新、插件 Service Worker 重启后恢复采集；关闭目标标签时清理运行状态；
+- 页面定时器与扩展 Service Worker 监督器共同触发同一个去重 `kick`，降低后台标签定时器被 Chrome 降频的影响；
+- 本地转发 WebSocket 每 20 秒发送扩展保活消息。
+
+跨平台 Edge 使用对称百分比差：Long Edge 为 `200 × (Lighter VWAP bid × 映射比例 - Var ask) / (Lighter VWAP bid × 映射比例 + Var ask)`，Short Edge 为 `200 × (Lighter VWAP ask × 映射比例 - Var bid) / (Lighter VWAP ask × 映射比例 + Var bid)`。Long 越高越有利，Short 越低越有利。Lighter 默认使用 `$2000` 深度 VWAP；Var 的 indicative bid/ask 使用插件请求的约 `$500` 等值数量。持仓 Edge 收益统一为 `Entry Edge - Current Edge`，并使用持仓方向对应的同一条 Edge。
+
+持仓 Edge 收益只用于收益展示，不作为梯度输入。Long 仓使用 `入场 Long Edge - 当前 Short Edge`，Short 仓使用 `当前 Long Edge - 入场 Short Edge`，即始终采用反方向可执行平仓 Edge。Long 梯度直接读取实时 Long Edge，Short 梯度直接读取实时 Short Edge，二者共同解析出唯一的带符号目标仓位。
+
+成交 Edge 使用两边实际成交价格按同一对称公式计算。Long 滑点为 `Fill Long - Trigger Long`；Short 滑点为 `Trigger Short - Fill Short`，正数统一表示成交更有利。Var 实际成交价由插件转发的成交事件回填，Lighter 实际成交价由成交数量和成交金额计算。
+
+### 长期价差记录与本地浏览器看板
+
+`main.py` 每秒把当前资产的 Var bid/ask、Lighter 深度 VWAP bid/ask、Long Edge 和 Short Edge 追加到 `log/spread_history.sqlite3`。数据库使用 SQLite WAL 模式，程序重启和切换币种不会删除历史；不同资产按 symbol 隔离。
+
+5分钟、30分钟、1小时窗口、12小时分时统计和三天终端走势图都以 SQLite 为数据源，不再依赖重启即丢失的原始内存队列。可通过 `--spread-db /path/to/file.sqlite3` 修改数据库位置。
+
+`main` 启动时同时提供本地看板 [http://127.0.0.1:8780](http://127.0.0.1:8780)。页面支持资产切换、Long/Short Edge 双线、1小时/6小时/24小时/7天范围、悬停读数、最新两边价格和5分钟中位数，每5秒自动刷新。可使用 `--dashboard-port` 修改端口。数据库保留原始每秒记录，API 下采样只影响图表显示点数，不会删除原始数据。Chrome 插件继续只负责报价采集与运行状态。
+
+运行数天时，请在 Chrome 性能设置中将 `omni.variational.io` 加入“始终保持这些网站处于活动状态”，并确保系统不会自动睡眠。网页切换标的后，应在插件状态中确认 `Active quote` 显示新的 asset。
+
 ### 运行
 ```bash
 python main.py
@@ -82,7 +123,7 @@ python main.py --lang en
 ```
 
 ### 第二页触发策略
-第二页提供运行中的梯度触发策略配置，默认开仓区和清仓区各一行空参数，不会在未填完整前触发。
+第二页提供运行中的梯度目标仓位配置，默认 Long 梯度和 Short 梯度各一行空参数，不会在未填完整前触发。
 策略默认未启动；录入参数只会保存配置，必须把光标移动到启动行并按 `Enter` 后才会产生触发信号。
 
 - `Tab`：切换第一页/第二页。
@@ -94,7 +135,7 @@ python main.py --lang en
 - `+`：在当前区新增一条梯度。
 - `-`：删除当前梯度；每个区至少保留一行，删除最后一行会清空参数。
 
-开仓区默认信号源为“做多 Variational / 做空 Lighter”，清仓区默认信号源为“做空 Variational / 做多 Lighter”。每个梯度的仓位表示目标总仓位；触发信号会按 `min(单次下单数量, 距离目标仓位差额)` 执行。
+Long Edge 只查询 Long 梯度，并在 `Long Edge >= 阈值` 时命中；Short Edge 只查询 Short 梯度，并在 `Short Edge <= 阈值` 时命中。每行仓位都是带符号的目标净仓位：正数代表做多 Var / 做空 Lighter，`0` 代表清仓，负数代表做空 Var / 做多 Lighter。若两侧同时命中，选择数值更高的 Edge；Edge 相同则选择离当前仓位更近的目标。最终按 `min(单次下单数量, 目标仓位与当前仓位的差额)` 分批执行。
 
 Chrome 插件启动后会同时连接浏览器下单 broker，默认地址为 `ws://127.0.0.1:8768`。策略信号触发后会创建一条本地策略订单记录，并同时提交 Variational 浏览器订单和 Lighter 对冲单；Lighter 不等待 Variational 成交确认。后续两边成交事件会分别回填到同一条策略记录，用于成交价差和滑点统计。`--no-hedge` 只关闭 Lighter 自动对冲，不会关闭 Variational 浏览器下单。
 

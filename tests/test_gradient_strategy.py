@@ -5,6 +5,51 @@ from variational.gradient_strategy import CursorTarget, EditableField, GradientS
 
 
 class GradientStrategyStateTest(unittest.TestCase):
+    def test_long_and_short_edges_resolve_one_signed_target_position(self):
+        state = GradientStrategyState.default()
+        state.enabled = True
+        state.open_rows[0].threshold_pct = Decimal("0.6")
+        state.open_rows[0].target_qty = Decimal("0.1")
+        state.add_row(StrategySection.OPEN)
+        state.open_rows[1].threshold_pct = Decimal("0.7")
+        state.open_rows[1].target_qty = Decimal("0.2")
+        state.close_rows[0].threshold_pct = Decimal("0.4")
+        state.close_rows[0].target_qty = Decimal("0")
+        state.add_row(StrategySection.CLOSE)
+        state.close_rows[1].threshold_pct = Decimal("0.3")
+        state.close_rows[1].target_qty = Decimal("-0.1")
+
+        long_signal = state.evaluate(Decimal("0.65"), Decimal("0.2"), Decimal("0"))
+        self.assertIsNotNone(long_signal)
+        self.assertEqual(long_signal.section, StrategySection.OPEN)
+        self.assertEqual(long_signal.target_qty, Decimal("0.1"))
+        self.assertEqual(long_signal.action, "open")
+
+        flat_signal = state.evaluate(Decimal("0.5"), Decimal("0.35"), Decimal("0.1"))
+        self.assertIsNotNone(flat_signal)
+        self.assertEqual(flat_signal.section, StrategySection.CLOSE)
+        self.assertEqual(flat_signal.target_qty, Decimal("0"))
+        self.assertEqual(flat_signal.action, "close")
+
+        short_signal = state.evaluate(Decimal("0.2"), Decimal("0.25"), Decimal("0"))
+        self.assertIsNotNone(short_signal)
+        self.assertEqual(short_signal.section, StrategySection.CLOSE)
+        self.assertEqual(short_signal.target_qty, Decimal("-0.1"))
+        self.assertEqual(short_signal.action, "close")
+
+    def test_short_target_zero_buys_to_close_existing_short(self):
+        state = GradientStrategyState.default()
+        state.enabled = True
+        state.close_rows[0].threshold_pct = Decimal("0.4")
+        state.close_rows[0].target_qty = Decimal("0")
+
+        signal = state.evaluate(Decimal("0.1"), Decimal("0.35"), Decimal("-0.1"))
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "open")
+        self.assertEqual(signal.target_qty, Decimal("0"))
+        self.assertEqual(signal.delta_qty, Decimal("0.1"))
+
     def test_default_rows_and_cursor_editing(self):
         state = GradientStrategyState.default()
 
@@ -154,26 +199,8 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         self.assertIsNone(signal)
 
-    def test_close_fires_when_spread_at_or_above_threshold(self):
-        # 阈值 -0.1：价差 -0.08（≥ -0.1）→ 平；无需穿越。
-        state = GradientStrategyState.default()
-        state.handle_key("\r")
-        state.close_rows[0].threshold_pct = Decimal("-0.1")
-        state.close_rows[0].target_qty = Decimal("0")
-
-        signal = state.evaluate(
-            open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("-0.08"),
-            current_position_qty=Decimal("0.05"),
-        )
-
-        self.assertIsNotNone(signal)
-        self.assertEqual(signal.action, "close")
-        self.assertEqual(signal.delta_qty, Decimal("0.05"))
-        self.assertEqual(signal.target_qty, Decimal("0"))
-
-    def test_close_holds_when_spread_below_threshold(self):
-        # 阈值 -0.1：价差 -0.12（< -0.1）→ 不平。
+    def test_short_fires_when_edge_at_or_below_threshold(self):
+        # Short 阈值 -0.1：Edge -0.12（≤ -0.1）→ 命中。
         state = GradientStrategyState.default()
         state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("-0.1")
@@ -185,39 +212,52 @@ class GradientStrategyStateTest(unittest.TestCase):
             current_position_qty=Decimal("0.05"),
         )
 
-        self.assertIsNone(signal)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.action, "close")
+        self.assertEqual(signal.delta_qty, Decimal("0.05"))
+        self.assertEqual(signal.target_qty, Decimal("0"))
 
-    def test_close_gradient_picks_highest_satisfied_threshold(self):
+    def test_short_holds_when_edge_above_threshold(self):
+        # Short 阈值 -0.1：Edge -0.08（> -0.1）→ 不命中。
         state = GradientStrategyState.default()
         state.handle_key("\r")
-        state.close_rows[0].threshold_pct = Decimal("0.07")
-        state.close_rows[0].target_qty = Decimal("0.002")
-        state.add_row(StrategySection.CLOSE)
-        state.close_rows[1].threshold_pct = Decimal("0.08")
-        state.close_rows[1].target_qty = Decimal("0.001")
-        state.add_row(StrategySection.CLOSE)
-        state.close_rows[2].threshold_pct = Decimal("0.09")
-        state.close_rows[2].target_qty = Decimal("0")
+        state.close_rows[0].threshold_pct = Decimal("-0.1")
+        state.close_rows[0].target_qty = Decimal("0")
 
-        # 只满足最低阈值 0.07 → target 0.002（平一点）
-        shallow = state.evaluate(
+        signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("0.075"),
-            current_position_qty=Decimal("0.003"),
+            close_spread_pct=Decimal("-0.08"),
+            current_position_qty=Decimal("0.05"),
         )
-        self.assertIsNotNone(shallow)
-        self.assertEqual(shallow.target_qty, Decimal("0.002"))
-        self.assertEqual(shallow.delta_qty, Decimal("0.001"))
 
-        # 价差更高，满足全部 → 取最高阈值 0.09 → target 0（平更多）
-        deep = state.evaluate(
+        self.assertIsNone(signal)
+
+    def test_short_gradient_picks_lower_level_as_edge_falls(self):
+        state = GradientStrategyState.default()
+        state.handle_key("\r")
+        state.close_rows[0].threshold_pct = Decimal("0.4")
+        state.close_rows[0].target_qty = Decimal("0")
+        state.add_row(StrategySection.CLOSE)
+        state.close_rows[1].threshold_pct = Decimal("0.3")
+        state.close_rows[1].target_qty = Decimal("-0.1")
+
+        flat = state.evaluate(
             open_spread_pct=Decimal("0.00"),
-            close_spread_pct=Decimal("0.10"),
-            current_position_qty=Decimal("0.003"),
+            close_spread_pct=Decimal("0.35"),
+            current_position_qty=Decimal("0.1"),
         )
-        self.assertIsNotNone(deep)
-        self.assertEqual(deep.target_qty, Decimal("0"))
-        self.assertEqual(deep.delta_qty, Decimal("0.003"))
+        self.assertIsNotNone(flat)
+        self.assertEqual(flat.target_qty, Decimal("0"))
+        self.assertEqual(flat.delta_qty, Decimal("0.1"))
+
+        short = state.evaluate(
+            open_spread_pct=Decimal("0.00"),
+            close_spread_pct=Decimal("0.25"),
+            current_position_qty=Decimal("0"),
+        )
+        self.assertIsNotNone(short)
+        self.assertEqual(short.target_qty, Decimal("-0.1"))
+        self.assertEqual(short.delta_qty, Decimal("0.1"))
     def test_open_signal_uses_signed_position(self):
         state = GradientStrategyState.default()
         state.handle_key("\r")

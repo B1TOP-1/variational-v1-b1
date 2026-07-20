@@ -3,6 +3,7 @@ import time
 import asyncio
 import argparse
 from decimal import Decimal
+from pathlib import Path
 
 from main import (
     BrowserOrderCommand,
@@ -11,13 +12,30 @@ from main import (
     PendingTriggerSpread,
     VariationalToLighterRuntime,
     cross_spread_percentages,
+    edge_pnl_percent,
     fill_diff_by_direction,
+    PRICE_MAPPING_RATIO,
 )
 from variational.gradient_strategy import GradientSignal, GradientStrategyState
 from variational.gradient_strategy import StrategySection
 
 
 class SpreadMathTest(unittest.TestCase):
+    def test_production_price_mapping_ratio_defaults_to_one(self):
+        self.assertEqual(PRICE_MAPPING_RATIO, Decimal("1"))
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertGreaterEqual(source.count("PRICE_MAPPING_RATIO"), 3)
+
+    def test_edge_pnl_uses_executable_opposite_close_edge(self):
+        self.assertEqual(
+            edge_pnl_percent(Decimal("0.30"), Decimal("0.10"), Decimal("0.1")),
+            Decimal("0.20"),
+        )
+        self.assertEqual(
+            edge_pnl_percent(Decimal("0.10"), Decimal("0.30"), Decimal("-0.1")),
+            Decimal("0.20"),
+        )
+
     def test_cross_spread_uses_raw_lighter_price_without_stablecoin_normalization(self):
         var_ask = Decimal("100")
         var_bid = Decimal("99")
@@ -26,8 +44,8 @@ class SpreadMathTest(unittest.TestCase):
 
         long_pct, short_pct = cross_spread_percentages(var_bid, var_ask, lighter_bid, lighter_ask)
 
-        self.assertEqual(long_pct, Decimal("1.00"))
-        self.assertEqual(short_pct, Decimal("-2.941176470588235294117647059"))
+        self.assertEqual(long_pct, Decimal("200") / Decimal("201"))
+        self.assertEqual(short_pct, Decimal("600") / Decimal("201"))
 
     def test_fill_diff_uses_raw_lighter_price_without_stablecoin_normalization(self):
         diff, pct = fill_diff_by_direction(
@@ -37,11 +55,10 @@ class SpreadMathTest(unittest.TestCase):
         )
 
         self.assertEqual(diff, Decimal("1"))
-        self.assertEqual(pct, Decimal("1.00"))
+        self.assertEqual(pct, Decimal("200") / Decimal("201"))
 
     def test_unit_spread_uses_raw_lighter_price_without_stablecoin_normalization(self):
         runtime = object.__new__(VariationalToLighterRuntime)
-        runtime.usdc_usdt_rate = Decimal("1.10")
         record = OrderLifecycle(
             trade_key="trade",
             trade_id="trade",
@@ -70,7 +87,28 @@ class SpreadMathTest(unittest.TestCase):
             trigger_spread_pct=Decimal("0.0100"),
         )
 
-        self.assertEqual(record.spread_slippage_pct(), Decimal("0.00100"))
+        expected_fill = Decimal("200") * Decimal("0.011") / Decimal("200.011")
+        self.assertEqual(record.spread_slippage_pct(), expected_fill - Decimal("0.0100"))
+
+    def test_short_fill_edge_and_slippage_use_current_symmetric_formula(self):
+        record = OrderLifecycle(
+            trade_key="short",
+            trade_id="short",
+            side="sell",
+            qty=Decimal("1"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal("100"),
+            lighter_fill_price=Decimal("100.08"),
+            trigger_spread_pct=Decimal("0.10"),
+        )
+
+        _diff, fill_edge = fill_diff_by_direction("sell", Decimal("100"), Decimal("100.08"))
+        expected_fill = Decimal("200") * Decimal("0.08") / Decimal("200.08")
+        self.assertEqual(fill_edge, expected_fill)
+        self.assertEqual(record.spread_slippage_pct(), Decimal("0.10") - expected_fill)
+        self.assertGreater(record.spread_slippage_pct(), 0)
 
     def test_leg_slippage_signs(self):
         # 做多 Var：触发100 成交98 → +2%(买得便宜=有利)；做空 Lighter 成交98 → -2%(卖得便宜=不利)

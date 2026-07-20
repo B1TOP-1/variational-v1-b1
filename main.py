@@ -44,6 +44,8 @@ from variational.listener import (
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 from variational.quote_comparator import QuoteComparator
+from variational.spread_store import SpreadStore
+from variational.spread_dashboard import SpreadDashboardServer
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -54,9 +56,12 @@ FORWARDER_HOST = "127.0.0.1"
 FORWARDER_WS_PORT = 8766
 FORWARDER_REST_PORT = 8767
 BROWSER_ORDER_BROKER_PORT = 8768
+SPREAD_DASHBOARD_PORT = 8780
+PRICE_MAPPING_RATIO = Decimal("1")
 LOG_DIR = Path("./log")
 OUTPUT_DIR = LOG_DIR
 APP_LOG_FILE = LOG_DIR / "runtime.log"
+SPREAD_HISTORY_DB_FILE = LOG_DIR / "spread_history.sqlite3"
 TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
 BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
@@ -80,21 +85,15 @@ MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 1.0
-# 价差走势 sparkline：滚动窗口 3 天，按此间隔取样（3天/120s ≈ 2160 点）。
+# 价差走势 sparkline：滚动窗口 3 天，数据直接来自 SQLite。
 SPREAD_TREND_WINDOW_SECONDS = 3 * 86400.0
-SPREAD_TREND_SAMPLE_SECONDS = 30.0
 DASHBOARD_ORDERS = 20
-SPREAD_HISTORY_SECONDS = 3600.0
 HOURLY_HISTORY_HOURS = 12
 CST_TZ = timezone(timedelta(hours=8))
 # Lines consumed by always-on chrome (header panel + quote/spread tables +
 # the hourly/orders table frames). Remaining terminal height is split between
 # the hourly-history and recent-orders rows so the dashboard fits one screen.
 DASHBOARD_FIXED_OVERHEAD_LINES = 30
-# Binance USDCUSDT spot price = USDT per 1 USDC. This is displayed and logged as
-# a reference basis signal; it must not rewrite the raw cross-venue price spread.
-BINANCE_USDCUSDT_URL = "https://api.binance.com/api/v3/ticker/price?symbol=USDCUSDT"
-USDC_USDT_POLL_SECONDS = 10.0
 ASSET_SWITCH_CONFIRM_TICKS = 3
 PENDING_TRIGGER_SPREAD_TTL_SECONDS = 30.0
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
@@ -171,10 +170,13 @@ def spread_value(aggressive_buy_ask: Decimal | None, aggressive_sell_bid: Decima
     return aggressive_sell_bid - aggressive_buy_ask
 
 
-def spread_percent(diff: Decimal | None, denominator: Decimal | None) -> Decimal | None:
-    if diff is None or denominator is None or denominator == 0:
+def symmetric_edge_percent(left_price: Decimal | None, mapped_right_price: Decimal | None) -> Decimal | None:
+    if left_price is None or mapped_right_price is None:
         return None
-    return (diff / denominator) * Decimal("100")
+    denominator = mapped_right_price + left_price
+    if denominator == 0:
+        return None
+    return Decimal("200") * (mapped_right_price - left_price) / denominator
 
 
 def book_spread_percent(bid: Decimal | None, ask: Decimal | None) -> Decimal | None:
@@ -191,10 +193,26 @@ def cross_spread_percentages(
     var_ask: Decimal | None,
     lighter_bid: Decimal | None,
     lighter_ask: Decimal | None,
+    price_mapping_ratio: Decimal = Decimal("1"),
 ) -> tuple[Decimal | None, Decimal | None]:
-    long_var_short_lighter_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
-    short_var_long_lighter_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+    mapped_lighter_bid = lighter_bid * price_mapping_ratio if lighter_bid is not None else None
+    mapped_lighter_ask = lighter_ask * price_mapping_ratio if lighter_ask is not None else None
+    long_var_short_lighter_pct = symmetric_edge_percent(var_ask, mapped_lighter_bid)
+    short_var_long_lighter_pct = symmetric_edge_percent(var_bid, mapped_lighter_ask)
     return long_var_short_lighter_pct, short_var_long_lighter_pct
+
+
+def edge_pnl_percent(
+    entry_edge_pct: Decimal | None,
+    executable_close_edge_pct: Decimal | None,
+    position_qty: Decimal,
+) -> Decimal | None:
+    """用反方向可执行平仓 Edge 估算持仓价差收益，正数代表有利。"""
+    if entry_edge_pct is None or executable_close_edge_pct is None or position_qty == 0:
+        return None
+    if position_qty > 0:
+        return entry_edge_pct - executable_close_edge_pct
+    return executable_close_edge_pct - entry_edge_pct
 
 
 def fill_diff_by_direction(
@@ -207,16 +225,14 @@ def fill_diff_by_direction(
     if side_n == "buy":
         # Long Var / Short Lighter: lighter_fill - var_fill
         diff = spread_value(var_fill_price, lighter)
-        pct = spread_percent(diff, var_fill_price)
+        pct = symmetric_edge_percent(var_fill_price, lighter)
         return diff, pct
     if side_n == "sell":
-        # Short Var / Long Lighter: var_fill - lighter_fill
-        diff = spread_value(lighter, var_fill_price)
-        pct = spread_percent(diff, lighter)
+        # Short Var / Long Lighter: lighter_fill - var_fill，数值越低越有利。
+        diff = spread_value(var_fill_price, lighter)
+        pct = symmetric_edge_percent(var_fill_price, lighter)
         return diff, pct
-    diff = spread_value(lighter, var_fill_price)
-    pct = spread_percent(diff, var_fill_price)
-    return diff, pct
+    return None, None
 
 
 def normalize_variational_status(status: str) -> str:
@@ -316,6 +332,8 @@ class OrderLifecycle:
         )
         if fill_pct is None:
             return None
+        if self.side.strip().lower() == "sell":
+            return self.trigger_spread_pct - fill_pct
         return fill_pct - self.trigger_spread_pct
 
     @staticmethod
@@ -403,6 +421,8 @@ class VariationalToLighterRuntime:
         self.stop_flag = False
         self.logger = logging.getLogger("var_lighter_runtime")
         self.logger.setLevel(logging.INFO)
+        for handler in self.logger.handlers:
+            handler.close()
         self.logger.handlers.clear()
         self.logger.propagate = False
 
@@ -434,8 +454,16 @@ class VariationalToLighterRuntime:
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._pending_variational_strategy_order_keys: deque[str] = deque()
         self._record_lock = asyncio.Lock()
-        self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
-        self.hourly_spread_buckets: dict[int, dict[str, list[float]]] = {}
+        spread_db_path = Path(self.args.spread_db) if self.args.spread_db else (
+            Path(":memory:") if self.args.browser_smoke_test else SPREAD_HISTORY_DB_FILE
+        )
+        self.spread_store = SpreadStore(spread_db_path)
+        self.spread_dashboard = SpreadDashboardServer(
+            self.spread_store,
+            FORWARDER_HOST,
+            self.args.dashboard_port,
+            Path(__file__).resolve().parent / "web" / "spread_dashboard.html",
+        )
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
         self._asset_switch_candidate_hits = 0
@@ -475,11 +503,6 @@ class VariationalToLighterRuntime:
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
-        self.usdc_usdt_task: asyncio.Task[None] | None = None
-
-        # USDC/USDT basis reference (Binance USDCUSDT = USDT per 1 USDC).
-        self.usdc_usdt_rate: Decimal | None = None
-
         # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
         self.current_page = 1
         self._stdin_fd: int | None = None
@@ -512,9 +535,6 @@ class VariationalToLighterRuntime:
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
         self._spread_stats_cache: dict[str, float | None] = {}
-        # 近3天价差走势取样：(mono_ts, long_float, short_float)
-        self._spread_trend: deque[tuple[float, float | None, float | None]] = deque()
-        self._last_trend_sample_ts = 0.0
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -627,24 +647,6 @@ class VariationalToLighterRuntime:
         self._keyboard_active = False
         self._stdin_fd = None
 
-    async def update_usdc_usdt_rate_loop(self) -> None:
-        """Poll Binance USDCUSDT (USDT per 1 USDC) as an independent basis signal."""
-        while not self.stop_flag:
-            try:
-                rate = await asyncio.to_thread(self._fetch_usdc_usdt_rate)
-                if rate is not None and rate > 0:
-                    self.usdc_usdt_rate = rate
-            except Exception as exc:
-                self.logger.warning("Failed to fetch USDCUSDT rate: %s", exc)
-            await asyncio.sleep(USDC_USDT_POLL_SECONDS)
-
-    @staticmethod
-    def _fetch_usdc_usdt_rate() -> Decimal | None:
-        response = requests.get(BINANCE_USDCUSDT_URL, timeout=5)
-        response.raise_for_status()
-        price = response.json().get("price")
-        return Decimal(str(price)) if price is not None else None
-
     def initialize_lighter_client(self) -> SignerClient:
         if self.lighter_client is None:
             api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or required_env("LIGHTER_PRIVATE_KEY")
@@ -743,8 +745,7 @@ class VariationalToLighterRuntime:
             self.lighter_client_order_to_trade_key.clear()
             self._pending_variational_strategy_order_keys.clear()
             self._pending_trigger_spreads.clear()
-        self.cross_spread_history.clear()
-        self.hourly_spread_buckets.clear()
+        # 历史价差按资产持久化，切换标的不删除数据库记录。
         # 换标的：清缓存仓位与在途/停止状态，避免用旧标的仓位误判平衡。
         self._cached_position_qty = None
         self._strategy_order_in_flight = False
@@ -1321,7 +1322,7 @@ class VariationalToLighterRuntime:
         while trade_key in self.records:
             trade_key = f"strategy:{int(time.time() * 1000) + len(self.records)}"
         asset = self.variational_ticker or self.ticker or "UNKNOWN"
-        # 触发价：开仓(side=buy)→Var买@ask、Lighter卖@bid；清仓(side=sell)→Var卖@bid、Lighter买@ask。
+        # 触发价：买 Var 时取 Var ask/Lighter bid；卖 Var 时取 Var bid/Lighter ask。
         prices = self._last_leg_prices
         if side == "buy":
             var_trigger = prices.get("var_ask")
@@ -1649,42 +1650,43 @@ class VariationalToLighterRuntime:
 
     def _record_cross_spreads(
         self,
+        asset: str,
+        var_bid: Decimal | None,
+        var_ask: Decimal | None,
+        lighter_bid: Decimal | None,
+        lighter_ask: Decimal | None,
         long_var_short_lighter_pct: Decimal | None,
         short_var_long_lighter_pct: Decimal | None,
     ) -> None:
-        now = time.monotonic()
-        self.cross_spread_history.append(
-            (
-                now,
-                self._decimal_as_float(long_var_short_lighter_pct),
-                self._decimal_as_float(short_var_long_lighter_pct),
-            )
+        self.spread_store.record(
+            asset=asset,
+            var_bid=var_bid,
+            var_ask=var_ask,
+            lighter_bid=lighter_bid,
+            lighter_ask=lighter_ask,
+            long_edge_pct=long_var_short_lighter_pct,
+            short_edge_pct=short_var_long_lighter_pct,
         )
-        cutoff = now - SPREAD_HISTORY_SECONDS
-        while self.cross_spread_history and self.cross_spread_history[0][0] < cutoff:
-            self.cross_spread_history.popleft()
-
-    def _cross_spread_values(self, window_seconds: float, long_side: bool) -> list[float]:
-        now = time.monotonic()
-        cutoff = now - window_seconds
-        value_index = 1 if long_side else 2
-        return [
-            row[value_index]
-            for row in self.cross_spread_history
-            if row[0] >= cutoff and row[value_index] is not None
-        ]
 
     def _median_cross_spread(self, window_seconds: float, long_side: bool) -> float | None:
-        values = self._cross_spread_values(window_seconds, long_side)
-        if not values:
+        asset = self.variational_ticker or self.ticker
+        if not asset:
             return None
-        return float(median(values))
+        median_value, _p90, _p10 = self.spread_store.window_stats(
+            asset, window_seconds, "long" if long_side else "short"
+        )
+        return median_value
 
     def _percentile_cross_spread(
         self, window_seconds: float, long_side: bool, pct: float
     ) -> float | None:
-        values = self._cross_spread_values(window_seconds, long_side)
-        return self._percentile(values, pct)
+        asset = self.variational_ticker or self.ticker
+        if not asset:
+            return None
+        _median, p90, p10 = self.spread_store.window_stats(
+            asset, window_seconds, "long" if long_side else "short"
+        )
+        return p90 if pct >= 50 else p10
 
     @staticmethod
     def _percentile(values: list[float], pct: float) -> float | None:
@@ -1705,42 +1707,25 @@ class VariationalToLighterRuntime:
         return float(ordered[low] + (ordered[high] - ordered[low]) * frac)
 
     def _window_stats(self, window_seconds: float, long_side: bool) -> tuple[float | None, float | None, float | None]:
-        """一次过滤+排序，同出 (median, p90, p10)，避免同窗口重复过滤三遍。"""
-        values = self._cross_spread_values(window_seconds, long_side)
-        if not values:
+        asset = self.variational_ticker or self.ticker
+        if not asset:
             return None, None, None
-        ordered = sorted(values)
-        mid = len(ordered) // 2
-        median_v = float(ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0)
-        return median_v, self._percentile_sorted(ordered, 90), self._percentile_sorted(ordered, 10)
-
-    def _sample_spread_trend(self, long_pct: Decimal | None, short_pct: Decimal | None) -> None:
-        """按取样间隔把当前价差写入近3天走势缓冲，并裁掉超窗样本。"""
-        now = time.monotonic()
-        if now - self._last_trend_sample_ts < SPREAD_TREND_SAMPLE_SECONDS:
-            return
-        long_f = self._decimal_as_float(long_pct)
-        short_f = self._decimal_as_float(short_pct)
-        if long_f is None and short_f is None:
-            return  # 价差还没算出来(盘口未就绪)，不存空值污染走势
-        self._last_trend_sample_ts = now
-        self._spread_trend.append((now, long_f, short_f))
-        cutoff = now - SPREAD_TREND_WINDOW_SECONDS
-        while self._spread_trend and self._spread_trend[0][0] < cutoff:
-            self._spread_trend.popleft()
+        return self.spread_store.window_stats(asset, window_seconds, "long" if long_side else "short")
 
     def _spread_trend_series(self, series_index: int, width: int, now: float) -> tuple[list[float | None], float | None, float | None]:
         """近3天该序列按时间分桶(width格)取均值；返回 (每桶值, 最小, 最大)，空桶为 None。"""
-        start = now - SPREAD_TREND_WINDOW_SECONDS
+        asset = self.variational_ticker or self.ticker
         buckets: list[list[float]] = [[] for _ in range(width)]
-        for ts, longv, shortv in self._spread_trend:
-            if ts < start:
-                continue
-            value = longv if series_index == 0 else shortv
+        if not asset:
+            return [None] * width, None, None
+        end_ms = int(time.time() * 1000)
+        start_ms = end_ms - int(SPREAD_TREND_WINDOW_SECONDS * 1000)
+        for point in self.spread_store.history(asset, SPREAD_TREND_WINDOW_SECONDS, max_points=width * 2):
+            value = point["longEdge"] if series_index == 0 else point["shortEdge"]
             if value is None:
                 continue
-            pos = int((ts - start) / SPREAD_TREND_WINDOW_SECONDS * width)
-            buckets[min(width - 1, max(0, pos))].append(value)
+            pos = int((point["timestampMs"] - start_ms) / (end_ms - start_ms) * width)
+            buckets[min(width - 1, max(0, pos))].append(float(value))
         avgs: list[float | None] = [sum(b) / len(b) if b else None for b in buckets]
         present = [a for a in avgs if a is not None]
         if not present:
@@ -1880,34 +1865,8 @@ class VariationalToLighterRuntime:
                 cache[f"{side_key}_p10_{tag}"] = p10
         self._spread_stats_cache = cache
 
-    def _record_hourly_spread(
-        self,
-        long_var_short_lighter_pct: Decimal | None,
-        short_var_long_lighter_pct: Decimal | None,
-    ) -> None:
-        hour_key = int(time.time() // 3600)
-        bucket = self.hourly_spread_buckets.get(hour_key)
-        if bucket is None:
-            bucket = {"long": [], "short": []}
-            self.hourly_spread_buckets[hour_key] = bucket
-        long_value = self._decimal_as_float(long_var_short_lighter_pct)
-        short_value = self._decimal_as_float(short_var_long_lighter_pct)
-        if long_value is not None:
-            bucket["long"].append(long_value)
-        if short_value is not None:
-            bucket["short"].append(short_value)
-        cutoff_key = hour_key - (HOURLY_HISTORY_HOURS - 1)
-        for stale_key in [k for k in self.hourly_spread_buckets if k < cutoff_key]:
-            del self.hourly_spread_buckets[stale_key]
-
-    def _hourly_bucket_cells(self, values: list[float]) -> tuple[str, str, str]:
-        if not values:
-            return "-", "-", "-"
-        return (
-            self._fmt_median_pct(float(median(values))),
-            self._fmt_median_pct(self._percentile(values, 90)),
-            self._fmt_median_pct(self._percentile(values, 10)),
-        )
+    def _hourly_bucket_cells(self, values: tuple[float | None, float | None, float | None]) -> tuple[str, str, str]:
+        return tuple(self._fmt_median_pct(value) for value in values)
 
     def _adaptive_row_limits(self) -> tuple[int, int]:
         """Return (hourly_rows, order_rows) that fit the current terminal height.
@@ -2189,6 +2148,8 @@ class VariationalToLighterRuntime:
         if self.variational_ticker and str(asset).strip().upper() != self.variational_ticker.strip().upper():
             return
         self._feed_quote_comparator("api", bid, ask, source_ts, browser_wall_ms=self._epoch_ms(captured_at))
+        # 主动报价到达即重新计算价差；200ms timeout 仅作为遗漏事件时的兜底。
+        self._strategy_wake.set()
 
     def _on_dom_quote(self, payload: dict[str, Any]) -> None:
         ts = payload.get("ts") or payload.get("capturedAtMs") or payload.get("timestamp")
@@ -2212,7 +2173,7 @@ class VariationalToLighterRuntime:
             "lighter_bid": sig_bid,
             "lighter_ask": sig_ask,
         }
-        return cross_spread_percentages(var_bid, var_ask, sig_bid, sig_ask)
+        return cross_spread_percentages(var_bid, var_ask, sig_bid, sig_ask, PRICE_MAPPING_RATIO)
 
     async def strategy_loop(self) -> None:
         """事件驱动评估：盘口刷新唤醒，外加 200ms 兜底覆盖 Var 报价变化。"""
@@ -2234,8 +2195,8 @@ class VariationalToLighterRuntime:
         if pos is None:
             self._latest_gradient_signal = None
             return
-        open_pct, close_pct = await self._compute_signal_spreads()
-        self._latest_gradient_signal = self._evaluate_gradient_signal(open_pct, close_pct, pos)
+        long_edge_pct, short_edge_pct = await self._compute_signal_spreads()
+        self._latest_gradient_signal = self._evaluate_gradient_signal(long_edge_pct, short_edge_pct, pos)
 
     def _record_dry_run_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
         logger = getattr(self, "logger", None)
@@ -2764,7 +2725,7 @@ class VariationalToLighterRuntime:
 
         signal_text = "无信号"
         if signal is not None:
-            action_text = "开仓" if signal.action == "open" else "清仓"
+            action_text = "买入 Var" if signal.action == "open" else "卖出 Var"
             # 显示"这一笔实际会下的量"（单次下单量与剩余的较小值，对齐 lot），
             # 剩余总差额单列，避免与单次下单量混淆。
             order_qty = self._quantize_to_lighter_lot(
@@ -2780,15 +2741,15 @@ class VariationalToLighterRuntime:
         strategy_table.add_row(f"当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
         strategy_table.add_row("")
         strategy_table.add_row(
-            "开仓区: 信号源 做多 Var / 做空 Lighter | "
-            f"当前价差: {self._fmt_pct(open_spread_pct)}"
+            "Long 梯度（Long Edge >= 阈值）: 做多 Var / 做空 Lighter | "
+            f"Long Edge: {self._fmt_pct(open_spread_pct)}"
         )
         for index, _row in enumerate(self.gradient_strategy.open_rows):
             strategy_table.add_row(self._strategy_row_text(StrategySection.OPEN, index))
         strategy_table.add_row("")
         strategy_table.add_row(
-            "清仓区: 信号源 做空 Var / 做多 Lighter | "
-            f"当前价差: {self._fmt_pct(close_spread_pct)}"
+            "Short 梯度（Short Edge <= 阈值）: 做空 Var / 做多 Lighter | "
+            f"Short Edge: {self._fmt_pct(close_spread_pct)}"
         )
         for index, _row in enumerate(self.gradient_strategy.close_rows):
             strategy_table.add_row(self._strategy_row_text(StrategySection.CLOSE, index))
@@ -2860,21 +2821,19 @@ class VariationalToLighterRuntime:
             var_ask,
             sig_bid,
             sig_ask,
+            PRICE_MAPPING_RATIO,
         )
         # 渲染回到 1s，每帧采样一次历史并刷新窗口统计缓存（单次过滤算 median/p90/p10）。
         self._record_cross_spreads(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
-        self._record_hourly_spread(
+            quote_asset or self.variational_ticker or self.ticker or "UNKNOWN",
+            var_bid,
+            var_ask,
+            sig_bid,
+            sig_ask,
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
         )
         self._refresh_spread_stats()
-        self._sample_spread_trend(
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
 
         st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
         long_pct_median_5m = st.get("long_median_5m")
@@ -2906,6 +2865,17 @@ class VariationalToLighterRuntime:
         # 廉价兜底刷新缓存仓位（仅 listener，无 DOM 往返），防外部手动改仓。
         await self._refresh_position_cache(allow_dom=False)
         display_position_qty = self._cached_position_qty if self._cached_position_qty is not None else position_qty
+        executable_close_edge_pct: Decimal | None = None
+        position_edge_pnl_pct: Decimal | None = None
+        if display_position_qty > 0:
+            executable_close_edge_pct = short_var_long_lighter_pct
+        elif display_position_qty < 0:
+            executable_close_edge_pct = long_var_short_lighter_pct
+        position_edge_pnl_pct = edge_pnl_percent(avg_open_pct, executable_close_edge_pct, display_position_qty)
+        if position_edge_pnl_pct is not None:
+            reference_price = var_ask if display_position_qty > 0 else sig_ask
+            if reference_price is not None:
+                unrealized_pnl = abs(display_position_qty) * reference_price * position_edge_pnl_pct / Decimal("100")
         self.quote_comparator.tick(time.monotonic() * 1000.0)  # 推进背离检测
 
         is_zh = self.args.lang == "zh"
@@ -2943,7 +2913,6 @@ class VariationalToLighterRuntime:
         hedge_color = "green" if self.args.auto_hedge else "red"
         hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
 
-        fx_text = f"{self.usdc_usdt_rate:.4f}" if self.usdc_usdt_rate else "-"
         r_color = "green" if realized_pnl >= 0 else "red"
         u_color = "green" if unrealized_pnl >= 0 else "red"
         realized_u = "0" if realized_pnl == 0 else f"{realized_pnl:.2f}u"
@@ -2959,8 +2928,15 @@ class VariationalToLighterRuntime:
         elif avg_open_pct is None:
             pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker}"
         else:
-            pos_color = "green" if avg_open_pct >= 0 else "red"
-            pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker} [{pos_color}]{avg_open_pct:+.4f}%[/]"
+            edge_color = "green" if position_edge_pnl_pct is not None and position_edge_pnl_pct >= 0 else "red"
+            if position_edge_pnl_pct is None or executable_close_edge_pct is None:
+                pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker} 入场Edge {avg_open_pct:+.4f}%"
+            else:
+                pos_text = (
+                    f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
+                    f"入场Edge {avg_open_pct:+.4f}% | 平仓Edge {executable_close_edge_pct:+.4f}% | "
+                    f"[{edge_color}]Edge收益 {position_edge_pnl_pct:+.4f}%[/]"
+                )
         lit_pos_text = ""
         if self.args.auto_hedge:
             lit_label = "Lit仓" if is_zh else "Litpos"
@@ -2997,7 +2973,7 @@ class VariationalToLighterRuntime:
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}USDC/USDT={fx_text} | {now_cst_display()}{lit_ready_text}",
+            f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}{now_cst_display()}{lit_ready_text}",
             border_style="red" if (self._strategy_halted or disconnected) else ("yellow" if imbalanced else "cyan"),
         )
 
@@ -3120,12 +3096,15 @@ class VariationalToLighterRuntime:
         hourly_table.add_column(col_h_short_up, justify="right")
         hourly_table.add_column(col_h_short_dn, justify="right")
 
-        hour_keys = sorted(self.hourly_spread_buckets.keys(), reverse=True)[:hourly_row_limit]
-        if not hour_keys:
+        hourly_rows = self.spread_store.hourly_stats(
+            quote_asset or self.variational_ticker or self.ticker or "UNKNOWN",
+            HOURLY_HISTORY_HOURS,
+        )[:hourly_row_limit]
+        if not hourly_rows:
             hourly_table.add_row(no_hourly_text, "-", "-", "-", "-", "-", "-")
         else:
-            for hour_key in hour_keys:
-                bucket = self.hourly_spread_buckets[hour_key]
+            for bucket in hourly_rows:
+                hour_key = bucket["hour_key"]
                 start = datetime.fromtimestamp(hour_key * 3600, tz=CST_TZ)
                 end = start + timedelta(hours=1)
                 hour_label = f"{start:%H:%M}-{end:%H:%M}"
@@ -3304,7 +3283,7 @@ class VariationalToLighterRuntime:
     async def run(self) -> None:
         self.setup_signal_handlers()
         self.setup_keyboard()
-        self.usdc_usdt_task = asyncio.create_task(self.update_usdc_usdt_rate_loop())
+        dashboard_started = self.spread_dashboard.start()
         await self.runtime.start()
         self.browser_order_server = await run_browser_order_broker(
             FORWARDER_HOST,
@@ -3314,6 +3293,12 @@ class VariationalToLighterRuntime:
         self._browser_order_queue.start()
         self._schedule_prepare_browser_order()
         self.print_startup_next_steps()
+        self.logger.info(
+            "Spread dashboard %s http://%s:%s",
+            "started at" if dashboard_started else "already available or port occupied at",
+            FORWARDER_HOST,
+            self.args.dashboard_port,
+        )
         self.logger.info(
             "Listening for Variational forwarder events on ws://%s:%s and ws://%s:%s; browser orders on ws://%s:%s",
             FORWARDER_HOST,
@@ -3346,10 +3331,6 @@ class VariationalToLighterRuntime:
     async def close(self) -> None:
         self.stop_flag = True
         self.restore_keyboard()
-
-        if self.usdc_usdt_task and not self.usdc_usdt_task.done():
-            self.usdc_usdt_task.cancel()
-            await asyncio.gather(self.usdc_usdt_task, return_exceptions=True)
 
         if self.dashboard_task and not self.dashboard_task.done():
             self.dashboard_task.cancel()
@@ -3394,6 +3375,8 @@ class VariationalToLighterRuntime:
             self.browser_order_server = None
 
         await self.runtime.stop()
+        self.spread_dashboard.stop()
+        self.spread_store.close()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -3417,6 +3400,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=2000.0,
         help="Lighter VWAP depth notional in USD used as the effective bid/ask for spreads (default: 2000)",
+    )
+    parser.add_argument(
+        "--spread-db",
+        type=str,
+        default=None,
+        help="SQLite spread history path (default: log/spread_history.sqlite3)",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=SPREAD_DASHBOARD_PORT,
+        help="Local spread dashboard port (default: 8780)",
     )
     parser.add_argument(
         "--browser-smoke-test",
