@@ -78,6 +78,10 @@ class VariationalMonitor:
         if payload.get("quoteAccepted") is False:
             return []
 
+        active_quote = payload.get("activeQuote")
+        if not isinstance(active_quote, dict) or not active_quote.get("sessionId") or active_quote.get("sequence") is None:
+            return []
+
         body = decode_response_body(payload)
         if body is None:
             return [f"[MONITOR] Failed to decode REST body for {url}"]
@@ -87,7 +91,11 @@ class VariationalMonitor:
             return [f"[MONITOR] REST body is not JSON for {url}"]
 
         async with self._lock:
-            self._update_quote(parsed, captured_at=payload.get("capturedAt") or payload.get("captured_at"))
+            self._update_quote(
+                parsed,
+                captured_at=payload.get("capturedAt") or payload.get("captured_at"),
+                active_quote=active_quote,
+            )
             self.last_update_at = utc_now()
             if self.snapshot_file is not None:
                 await asyncio.to_thread(write_json_file, self.snapshot_file, self.snapshot())
@@ -175,7 +183,7 @@ class VariationalMonitor:
 
         return lines, alerts
 
-    def _update_quote(self, payload: Any, captured_at: Any = None) -> None:
+    def _update_quote(self, payload: Any, captured_at: Any = None, active_quote: Any = None) -> None:
         if not isinstance(payload, dict):
             return
 
@@ -195,6 +203,8 @@ class VariationalMonitor:
             "ask": ask,
             "mark_price": mark,
             "timestamp": ts,
+            "quote_source": "active_api" if isinstance(active_quote, dict) else "native_api",
+            "active_quote": active_quote if isinstance(active_quote, dict) else None,
             "raw": payload,
         }
         self.current_quote_asset = asset

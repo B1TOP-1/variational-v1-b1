@@ -11,11 +11,16 @@ from main import OrderLifecycle
 from main import RunningStat
 from main import SIGNAL_CONFIRM_COUNT
 from main import SPREAD_TREND_WINDOW_SECONDS
+from main import DASHBOARD_REFRESH_SECONDS
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
+from variational.listener import VariationalMonitor
 
 
 class BrowserOrderCommandTest(unittest.TestCase):
+    def test_terminal_dashboard_refreshes_at_active_quote_frequency(self):
+        self.assertEqual(DASHBOARD_REFRESH_SECONDS, 0.2)
+
     def test_browser_smoke_test_args_are_available(self):
         args = parse_args(["--browser-smoke-test", "--browser-smoke-qty", "0.001"])
 
@@ -99,6 +104,29 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_listener_only_accepts_active_sequenced_quotes(self):
+        monitor = VariationalMonitor()
+        base_event = {
+            "kind": "rest_response",
+            "url": "https://omni.variational.io/api/quotes/indicative",
+            "body": json.dumps({
+                "instrument": {"underlying": "BTC"},
+                "bid": "100",
+                "ask": "101",
+            }),
+        }
+
+        await monitor.process_rest_event(base_event)
+        self.assertIsNone(monitor.current_quote_asset)
+
+        await monitor.process_rest_event({
+            **base_event,
+            "activeQuote": {"sessionId": "session-1", "sequence": 7, "asset": "BTC"},
+        })
+        self.assertEqual(monitor.current_quote_asset, "BTC")
+        self.assertEqual(monitor.quotes["BTC"]["quote_source"], "active_api")
+        self.assertEqual(monitor.quotes["BTC"]["active_quote"]["sequence"], 7)
+
     async def test_place_order_cleans_pending_after_timeout(self):
         class HangingWebSocket:
             async def send(self, raw):
@@ -528,6 +556,8 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt = self._runtime()
         rt.args.auto_hedge = False  # 隔离平衡闸
         rt.quote_comparator._last_acquire_ms["dom"] = time.monotonic() * 1000.0 - 4000.0
+        self.assertTrue(rt._strategy_order_allowed())  # DOM 仅用于对比，不阻断主动 API
+        rt.quote_comparator._last_acquire_ms["api"] = time.monotonic() * 1000.0 - 4000.0
         self.assertFalse(rt._strategy_order_allowed())
 
     def test_dom_transport_delay_recorded(self):

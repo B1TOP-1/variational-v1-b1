@@ -582,7 +582,8 @@ function quoteResponseAccepted(meta, payload) {
   const activeMeta = meta.activeQuote;
   const asset = String(payload?.instrument?.underlying || activeMeta?.asset || "UNKNOWN").toUpperCase();
   if (!activeMeta) {
-    return !(state.config.activeQuoteEnabled && state.activeQuoteStatus === "running" && state.activeQuoteAsset === asset);
+    // 主动轮询启用时，网页原生的约 1s 响应只用于学习请求模板，不能降级为交易报价。
+    return !state.config.activeQuoteEnabled;
   }
   if (!activeMeta.sessionId || activeMeta.sequence == null) {
     return false;

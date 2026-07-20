@@ -76,7 +76,7 @@ POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
-SIGNAL_CONFIRM_COUNT = 3
+SIGNAL_CONFIRM_COUNT = 2
 # Var 报价断线闸（默认开）：API 或 DOM 报价超过该时长(ms)没刷新 = 断线，不下单。设 None 关闭。
 VAR_QUOTE_DISCONNECT_MS: float | None = 3000.0
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
@@ -85,7 +85,7 @@ SPIKE_BASELINE_WINDOW_SECONDS = 30.0
 MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
-DASHBOARD_REFRESH_SECONDS = 1.0
+DASHBOARD_REFRESH_SECONDS = 0.2
 # 价差走势 sparkline：滚动窗口 3 天，数据直接来自 SQLite。
 SPREAD_TREND_WINDOW_SECONDS = 3 * 86400.0
 DASHBOARD_ORDERS = 20
@@ -1272,15 +1272,12 @@ class VariationalToLighterRuntime:
         return abs(net) <= self._balance_tolerance()
 
     def _var_quote_disconnected(self) -> bool:
-        """API 或 DOM 报价超过阈值没刷新 = 断线（曾收到过才算，从未收到不算）。"""
+        """主动 API 报价超过阈值没刷新 = 断线；DOM 仅用于观测对比。"""
         if VAR_QUOTE_DISCONNECT_MS is None:
             return False
         now_ms = time.monotonic() * 1000.0
-        for source in ("api", "dom"):
-            fresh = self.quote_comparator.freshness_ms(source, now_ms)
-            if fresh is not None and fresh > VAR_QUOTE_DISCONNECT_MS:
-                return True
-        return False
+        fresh = self.quote_comparator.freshness_ms("api", now_ms)
+        return fresh is not None and fresh > VAR_QUOTE_DISCONNECT_MS
 
     def _strategy_order_allowed(self) -> bool:
         if self._strategy_halted:
@@ -2702,14 +2699,20 @@ class VariationalToLighterRuntime:
             return f"{t}(+{d:.0f}ms)" if d is not None else t
         api_t = with_delay("api")
         dom_t = with_delay("dom")
+        asset = self.runtime.monitor.current_quote_asset
+        quote = self.runtime.monitor.quotes.get(asset) if asset else None
+        active = quote.get("active_quote") if isinstance(quote, dict) else None
+        api_mode = "主动200ms" if isinstance(active, dict) else "未确认"
+        api_sequence = active.get("sequence") if isinstance(active, dict) else None
+        api_mode_text = f"{api_mode} seq={api_sequence}" if api_sequence is not None else api_mode
         if is_zh:
             return (
-                f"报价对比 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
+                f"报价对比 API={api_mode_text} | 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
                 f"  最近获取(+传输延迟) api={api_t} dom={dom_t}\n"
                 f"  获取领先: {aleader} 均{aavg_t} | 背离 api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
             )
         return (
-            f"quote-cmp transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
+            f"quote-cmp API={api_mode_text} | transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
             f"  last-recv(+delay) api={api_t} dom={dom_t}\n"
             f"  acquire-lead: {aleader} avg {aavg_t} | divergence api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
         )
@@ -2824,7 +2827,7 @@ class VariationalToLighterRuntime:
             sig_ask,
             PRICE_MAPPING_RATIO,
         )
-        # 渲染回到 1s，每帧采样一次历史并刷新窗口统计缓存（单次过滤算 median/p90/p10）。
+        # 每个 200ms UI 帧记录当前价差；窗口统计内部按 1Hz 节流，避免重复排序。
         self._record_cross_spreads(
             quote_asset or self.variational_ticker or self.ticker or "UNKNOWN",
             var_bid,

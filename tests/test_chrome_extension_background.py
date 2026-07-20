@@ -123,6 +123,7 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("activeMeta.sessionId !== state.activeQuoteSessionId", background)
         self.assertIn("meta.status !== 200", background)
         self.assertIn("quoteAccepted", background)
+        self.assertIn("return !state.config.activeQuoteEnabled", background)
 
     def test_active_quote_runtime_state_is_restored(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()
@@ -140,6 +141,7 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn('id="activeQuoteIntervalMs"', popup)
         self.assertIn('id="activeQuoteMaxInFlight"', popup)
         self.assertIn("activeQuoteIntervalMs", popup_script)
+        self.assertIn("setInterval(refreshStatus, 200)", popup_script)
 
     def test_popup_renders_live_quote_and_collector_metrics(self):
         popup = (ROOT / "chrome_extension" / "popup.html").read_text()
@@ -151,7 +153,7 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("启用主动报价采集", popup)
         for element_id in ("bid", "ask", "mark", "spread", "latency", "sequence", "completed", "failed", "skipped"):
             self.assertIn(f'id="{element_id}"', popup)
-        self.assertIn("setInterval(refreshStatus, 250)", popup_script)
+        self.assertIn("setInterval(refreshStatus, 200)", popup_script)
         self.assertIn("quote.latencyMs", popup_script)
         self.assertIn("activeQuoteMetrics", background)
         self.assertIn("sentAtMs", background)

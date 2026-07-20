@@ -195,4 +195,4 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 void refreshStatus();
-setInterval(refreshStatus, 250);
+setInterval(refreshStatus, 200);
