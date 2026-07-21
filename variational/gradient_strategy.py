@@ -159,22 +159,31 @@ class GradientStrategyState:
     ) -> GradientSignal | None:
         if not self.enabled:
             return None
-        # Long Edge 只查 Long 梯度，Short Edge 只查 Short 梯度；梯度给出带符号目标仓位。
+        # 仓位增加只能由 Long Edge 驱动，仓位减少只能由 Short Edge 驱动。
         candidates: list[tuple[Decimal, StrategySection, GradientRow]] = []
         long_row = self._select_long_row(self.open_rows, open_spread_pct)
         short_row = self._select_short_row(self.close_rows, close_spread_pct)
-        if long_row is not None and open_spread_pct is not None:
+        if (
+            long_row is not None
+            and long_row.target_qty is not None
+            and long_row.target_qty > current_position_qty
+            and open_spread_pct is not None
+        ):
             candidates.append((open_spread_pct, StrategySection.OPEN, long_row))
-        if short_row is not None and close_spread_pct is not None:
+        if (
+            short_row is not None
+            and short_row.target_qty is not None
+            and short_row.target_qty < current_position_qty
+            and close_spread_pct is not None
+        ):
             candidates.append((close_spread_pct, StrategySection.CLOSE, short_row))
         if not candidates:
             return None
 
-        # 同时命中时选择数值更高的 Edge；相同则选择距离当前仓位更近的目标。
-        spread_pct, section, selected = max(
-            candidates,
-            key=lambda item: (item[0], -abs(item[2].target_qty - current_position_qty)),
-        )
+        # 两个相反方向同时有效说明梯度配置/行情发生冲突，必须 fail closed。
+        if len(candidates) != 1:
+            return None
+        spread_pct, section, selected = candidates[0]
         target_qty = selected.target_qty
         threshold_pct = selected.threshold_pct
         if target_qty is None or threshold_pct is None:

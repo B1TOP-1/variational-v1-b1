@@ -76,7 +76,8 @@ POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
-SIGNAL_CONFIRM_COUNT = 2
+SIGNAL_CONFIRM_SECONDS = 1.0
+SIGNAL_CONFIRM_MIN_QUOTES = 4
 # Var 报价断线闸（默认开）：API 或 DOM 报价超过该时长(ms)没刷新 = 断线，不下单。设 None 关闭。
 VAR_QUOTE_DISCONNECT_MS: float | None = 3000.0
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
@@ -100,6 +101,7 @@ PENDING_TRIGGER_SPREAD_TTL_SECONDS = 30.0
 LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
+BINANCE_USDCUSDT_WS_URL = "wss://data-stream.binance.vision/ws/usdcusdt@bookTicker"
 
 
 def utc_now() -> str:
@@ -274,6 +276,9 @@ class OrderLifecycle:
     var_submit_order_response: dict[str, Any] | None = None
 
     trigger_spread_pct: Decimal | None = None
+    first_hit_spread_pct: Decimal | None = None
+    confirmed_spread_pct: Decimal | None = None
+    preflight_spread_pct: Decimal | None = None
     # 触发信号那一刻两腿的预期价（Var 腿 / Lighter 腿），用于分腿滑点。
     var_trigger_price: Decimal | None = None
     lighter_trigger_price: Decimal | None = None
@@ -301,6 +306,9 @@ class OrderLifecycle:
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
+            "first_hit_spread_pct": decimal_to_str(self.first_hit_spread_pct),
+            "confirmed_spread_pct": decimal_to_str(self.confirmed_spread_pct),
+            "preflight_spread_pct": decimal_to_str(self.preflight_spread_pct),
             "spread_slippage_pct": decimal_to_str(self.spread_slippage_pct()),
             "var_slippage_pct": decimal_to_str(self.var_slippage_pct()),
             "dom_slippage_pct": decimal_to_str(self.dom_slippage_pct()),
@@ -504,6 +512,11 @@ class VariationalToLighterRuntime:
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+        self.binance_usdc_task: asyncio.Task[None] | None = None
+        self.binance_usdc_bid: Decimal | None = None
+        self.binance_usdc_ask: Decimal | None = None
+        self.binance_usdc_updated_at: float | None = None
+        self.binance_usdc_status = "connecting"
         # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
         self.current_page = 1
         self._stdin_fd: int | None = None
@@ -528,6 +541,10 @@ class VariationalToLighterRuntime:
         self._pending_signal_sig: tuple[str, str, str, str, str] | None = None
         self._pending_signal_count = 0
         self._pending_signal_started_at: float | None = None
+        self._pending_signal_quote_keys: set[tuple[str, int]] = set()
+        self._pending_signal_ready = False
+        self._pending_signal_first_edge: Decimal | None = None
+        self._pending_signal_confirmed_edge: Decimal | None = None
         # Var 报价双源对比器（观测记录：API vs DOM）。
         self.quote_comparator = QuoteComparator(("api", "dom"))
         self._last_dom_bid: Decimal | None = None
@@ -648,6 +665,47 @@ class VariationalToLighterRuntime:
         self._keyboard_active = False
         self._stdin_fd = None
 
+    def _update_binance_usdc_book(self, payload: Any) -> bool:
+        if not isinstance(payload, dict) or str(payload.get("s", "")).upper() != "USDCUSDT":
+            return False
+        bid = to_decimal(payload.get("b"))
+        ask = to_decimal(payload.get("a"))
+        if bid is None or ask is None or bid <= 0 or ask <= 0 or bid > ask:
+            return False
+        self.binance_usdc_bid = bid
+        self.binance_usdc_ask = ask
+        self.binance_usdc_updated_at = time.monotonic()
+        self.binance_usdc_status = "connected"
+        return True
+
+    async def binance_usdc_book_loop(self) -> None:
+        """Maintain an observation-only Binance USDC/USDT best bid/ask stream."""
+        retry_seconds = 1.0
+        while not self.stop_flag:
+            try:
+                self.binance_usdc_status = "connecting"
+                async with websockets.connect(
+                    BINANCE_USDCUSDT_WS_URL,
+                    ping_interval=20,
+                    ping_timeout=20,
+                    close_timeout=5,
+                ) as ws:
+                    retry_seconds = 1.0
+                    async for raw in ws:
+                        if self.stop_flag:
+                            return
+                        try:
+                            self._update_binance_usdc_book(json.loads(raw))
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.binance_usdc_status = "disconnected"
+                self.logger.warning("Binance USDCUSDT WS disconnected: %s; retry in %.0fs", exc, retry_seconds)
+                await asyncio.sleep(retry_seconds)
+                retry_seconds = min(30.0, retry_seconds * 2)
+
     def initialize_lighter_client(self) -> SignerClient:
         if self.lighter_client is None:
             api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or required_env("LIGHTER_PRIVATE_KEY")
@@ -753,8 +811,7 @@ class VariationalToLighterRuntime:
         self._strategy_halted = False
         self._halt_reason = ""
         self._last_gradient_signal_sig = None
-        self._pending_signal_sig = None
-        self._pending_signal_count = 0
+        self._reset_pending_signal_confirmation()
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -1340,6 +1397,9 @@ class VariationalToLighterRuntime:
             last_variational_status="strategy_submitted",
             lighter_side="SELL" if side == "buy" else "BUY",
             trigger_spread_pct=signal.spread_pct,
+            first_hit_spread_pct=getattr(self, "_pending_signal_first_edge", None),
+            confirmed_spread_pct=getattr(self, "_pending_signal_confirmed_edge", None),
+            preflight_spread_pct=signal.spread_pct,
             var_trigger_price=var_trigger,
             lighter_trigger_price=lighter_trigger,
             dom_trigger_price=dom_trigger,
@@ -2032,12 +2092,16 @@ class VariationalToLighterRuntime:
         open_spread_pct: Decimal | None,
         close_spread_pct: Decimal | None,
         position_qty: Decimal,
+        *,
+        active_quote_key: tuple[str, int] | None = None,
+        now_monotonic: float | None = None,
+        dispatch: bool = True,
     ) -> GradientSignal | None:
+        now = time.monotonic() if now_monotonic is None else now_monotonic
         signal = self.gradient_strategy.evaluate(open_spread_pct, close_spread_pct, position_qty)
         if signal is None:
             self._last_gradient_signal_sig = None
-            self._pending_signal_sig = None
-            self._pending_signal_count = 0
+            self._reset_pending_signal_confirmation()
             return None
         signal_sig = signal.signature()
         if signal_sig == self._last_gradient_signal_sig or self._strategy_order_in_flight:
@@ -2064,8 +2128,7 @@ class VariationalToLighterRuntime:
                 SPIKE_BASELINE_WINDOW_SECONDS, long_side=(signal.section == StrategySection.OPEN)
             )
             if baseline is not None and float(signal.spread_pct) - baseline > float(MAX_SPIKE_DEVIATION_PCT):
-                self._pending_signal_sig = None
-                self._pending_signal_count = 0
+                self._reset_pending_signal_confirmation()
                 spike_sig = ("spike", signal_sig)
                 if spike_sig != self._last_block_log_sig:
                     self._last_block_log_sig = spike_sig
@@ -2076,17 +2139,31 @@ class VariationalToLighterRuntime:
                         decimal_to_str(MAX_SPIKE_DEVIATION_PCT),
                     )
                 return signal
-        # 噪音过滤：同一信号需连续出现 SIGNAL_CONFIRM_COUNT 次才下单，单次(价差瞬时穿越)视为噪音。
+        # 抗尖刺：同一信号必须连续成立 1 秒，并覆盖至少 4 个不同的主动报价序号。
         if signal_sig == self._pending_signal_sig:
             self._pending_signal_count += 1
         else:
             self._pending_signal_sig = signal_sig
             self._pending_signal_count = 1
-            self._pending_signal_started_at = time.monotonic()
-        if self._pending_signal_count < SIGNAL_CONFIRM_COUNT:
+            self._pending_signal_started_at = now
+            self._pending_signal_quote_keys.clear()
+            self._pending_signal_first_edge = signal.spread_pct
+            self._pending_signal_confirmed_edge = None
+        if active_quote_key is not None:
+            self._pending_signal_quote_keys.add(active_quote_key)
+        elapsed = 0.0 if self._pending_signal_started_at is None else now - self._pending_signal_started_at
+        if elapsed < SIGNAL_CONFIRM_SECONDS or len(self._pending_signal_quote_keys) < SIGNAL_CONFIRM_MIN_QUOTES:
             return signal
-        if self._pending_signal_started_at is not None:
-            self._stat_signal_confirm.add((time.monotonic() - self._pending_signal_started_at) * 1000)
+        self._pending_signal_ready = True
+        self._pending_signal_confirmed_edge = signal.spread_pct
+        if dispatch:
+            self._dispatch_confirmed_gradient_signal(signal, elapsed)
+        return signal
+
+    def _dispatch_confirmed_gradient_signal(self, signal: GradientSignal, elapsed: float) -> None:
+        self._pending_signal_ready = False
+        self._stat_signal_confirm.add(elapsed * 1000)
+        signal_sig = signal.signature()
         self.logger.info(
             "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
             signal.action,
@@ -2102,7 +2179,26 @@ class VariationalToLighterRuntime:
             self._strategy_order_in_flight = True
             self._last_gradient_signal_sig = signal_sig
             self._stat_fired += 1
-        return signal
+
+    def _reset_pending_signal_confirmation(self) -> None:
+        self._pending_signal_sig = None
+        self._pending_signal_count = 0
+        self._pending_signal_started_at = None
+        self._pending_signal_quote_keys.clear()
+        self._pending_signal_ready = False
+        self._pending_signal_first_edge = None
+        self._pending_signal_confirmed_edge = None
+
+    def _current_active_quote_key(self) -> tuple[str, int] | None:
+        asset = self.runtime.monitor.current_quote_asset
+        quote = self.runtime.monitor.quotes.get(asset) if asset else None
+        active = quote.get("active_quote") if isinstance(quote, dict) else None
+        if not isinstance(active, dict) or not active.get("sessionId"):
+            return None
+        try:
+            return str(active["sessionId"]), int(active["sequence"])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _epoch_ms(ts: Any) -> float | None:
@@ -2194,7 +2290,32 @@ class VariationalToLighterRuntime:
             self._latest_gradient_signal = None
             return
         long_edge_pct, short_edge_pct = await self._compute_signal_spreads()
-        self._latest_gradient_signal = self._evaluate_gradient_signal(long_edge_pct, short_edge_pct, pos)
+        signal = self._evaluate_gradient_signal(
+            long_edge_pct,
+            short_edge_pct,
+            pos,
+            active_quote_key=self._current_active_quote_key(),
+            dispatch=False,
+        )
+        self._latest_gradient_signal = signal
+        if signal is None or not self._pending_signal_ready:
+            return
+
+        # 真正创建两腿订单前再读取一次两边报价；方向、阈值或目标任一变化都重新确认。
+        fresh_long_edge, fresh_short_edge = await self._compute_signal_spreads()
+        fresh_signal = self.gradient_strategy.evaluate(fresh_long_edge, fresh_short_edge, pos)
+        if fresh_signal is None or fresh_signal.signature() != signal.signature():
+            self.logger.info(
+                "信号发送前复核取消: confirmed=%s fresh=%s",
+                signal.signature(),
+                fresh_signal.signature() if fresh_signal is not None else None,
+            )
+            self._reset_pending_signal_confirmation()
+            self._latest_gradient_signal = fresh_signal
+            return
+        elapsed = 0.0 if self._pending_signal_started_at is None else time.monotonic() - self._pending_signal_started_at
+        self._latest_gradient_signal = fresh_signal
+        self._dispatch_confirmed_gradient_signal(fresh_signal, elapsed)
 
     def _record_dry_run_trigger_spread(self, side: str, spread_pct: Decimal) -> None:
         logger = getattr(self, "logger", None)
@@ -2974,7 +3095,28 @@ class VariationalToLighterRuntime:
             else:
                 warming_label = "Lighter预热中" if is_zh else "Lighter warming"
                 lit_ready_text = f" | [yellow]…{warming_label}[/]"
+        usdc_mid = None
+        usdc_basis_pct = None
+        usdc_book_bps = None
+        if self.binance_usdc_bid is not None and self.binance_usdc_ask is not None:
+            usdc_mid = (self.binance_usdc_bid + self.binance_usdc_ask) / Decimal("2")
+            usdc_basis_pct = (usdc_mid - Decimal("1")) * Decimal("100")
+            if usdc_mid > 0:
+                usdc_book_bps = (self.binance_usdc_ask - self.binance_usdc_bid) / usdc_mid * Decimal("10000")
+        usdc_age = None
+        if self.binance_usdc_updated_at is not None:
+            usdc_age = max(0.0, time.monotonic() - self.binance_usdc_updated_at)
+        if usdc_mid is None:
+            usdc_line = f"Binance USDC/USDT: {self.binance_usdc_status} | 仅观察，不参与下单"
+        else:
+            age_text = f"{usdc_age:.1f}s" if usdc_age is not None else "-"
+            usdc_line = (
+                f"Binance USDC/USDT  Bid {self.binance_usdc_bid:.5f}  Ask {self.binance_usdc_ask:.5f}  "
+                f"Mid {usdc_mid:.5f}  基差 {usdc_basis_pct:+.4f}%  盘口 {usdc_book_bps:.2f}bp  "
+                f"Age {age_text} | 仅观察"
+            )
         header = Panel(
+            f"[bold cyan]{usdc_line}[/]\n"
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
             f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}{now_cst_display()}{lit_ready_text}",
@@ -3185,6 +3327,9 @@ class VariationalToLighterRuntime:
                         "lighter_filled_price": payload["lighter_filled_price"],
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "trigger_spread_pct": payload["trigger_spread_pct"],
+                        "first_hit_spread_pct": payload["first_hit_spread_pct"],
+                        "confirmed_spread_pct": payload["confirmed_spread_pct"],
+                        "preflight_spread_pct": payload["preflight_spread_pct"],
                         "strategy_action": payload["strategy_action"],
                         "strategy_target_qty": payload["strategy_target_qty"],
                         "strategy_current_qty": payload["strategy_current_qty"],
@@ -3229,6 +3374,9 @@ class VariationalToLighterRuntime:
             "lighter_filled_price",
             "lighter_filled_at",
             "trigger_spread_pct",
+            "first_hit_spread_pct",
+            "confirmed_spread_pct",
+            "preflight_spread_pct",
             "strategy_action",
             "strategy_target_qty",
             "strategy_current_qty",
@@ -3288,6 +3436,7 @@ class VariationalToLighterRuntime:
         self.setup_signal_handlers()
         self.setup_keyboard()
         dashboard_started = self.spread_dashboard.start()
+        self.binance_usdc_task = asyncio.create_task(self.binance_usdc_book_loop())
         await self.runtime.start()
         self.browser_order_server = await run_browser_order_broker(
             FORWARDER_HOST,
@@ -3335,6 +3484,10 @@ class VariationalToLighterRuntime:
     async def close(self) -> None:
         self.stop_flag = True
         self.restore_keyboard()
+
+        if self.binance_usdc_task and not self.binance_usdc_task.done():
+            self.binance_usdc_task.cancel()
+            await asyncio.gather(self.binance_usdc_task, return_exceptions=True)
 
         if self.dashboard_task and not self.dashboard_task.done():
             self.dashboard_task.cancel()

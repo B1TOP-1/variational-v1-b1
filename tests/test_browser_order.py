@@ -9,7 +9,8 @@ from pathlib import Path
 from main import parse_args
 from main import OrderLifecycle
 from main import RunningStat
-from main import SIGNAL_CONFIRM_COUNT
+from main import SIGNAL_CONFIRM_MIN_QUOTES
+from main import SIGNAL_CONFIRM_SECONDS
 from main import SPREAD_TREND_WINDOW_SECONDS
 from main import DASHBOARD_REFRESH_SECONDS
 from main import VariationalToLighterRuntime
@@ -209,6 +210,37 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
     def _runtime():
         return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
 
+    def test_binance_usdc_book_is_observation_only(self):
+        rt = self._runtime()
+
+        self.assertTrue(rt._update_binance_usdc_book({
+            "s": "USDCUSDT", "b": "0.99980", "a": "0.99990",
+        }))
+        self.assertEqual(rt.binance_usdc_bid, Decimal("0.99980"))
+        self.assertEqual(rt.binance_usdc_ask, Decimal("0.99990"))
+        self.assertEqual(rt.binance_usdc_status, "connected")
+        self.assertFalse(rt._update_binance_usdc_book({
+            "s": "USDCUSDT", "b": "1.1", "a": "1.0",
+        }))
+
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+        self.assertIn("usdcusdt@bookTicker", source)
+        self.assertIn("仅观察，不参与下单", source)
+
+    @staticmethod
+    def _confirm_signal(rt, long_edge=Decimal("0.2"), short_edge=Decimal("0"), position=Decimal("0")):
+        start = 100.0
+        result = None
+        for index in range(SIGNAL_CONFIRM_MIN_QUOTES):
+            result = rt._evaluate_gradient_signal(
+                long_edge,
+                short_edge,
+                position,
+                active_quote_key=("session-test", index + 1),
+                now_monotonic=start + index * (SIGNAL_CONFIRM_SECONDS / (SIGNAL_CONFIRM_MIN_QUOTES - 1)),
+            )
+        return result
+
     async def test_eval_skips_and_reads_nothing_without_cached_position(self):
         rt = self._runtime()
         rt._cached_position_qty = None
@@ -281,12 +313,22 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         placed = []
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
-        # 需连续 SIGNAL_CONFIRM_COUNT 次确认：不足时不下单
-        for _ in range(SIGNAL_CONFIRM_COUNT - 1):
-            rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        # 未连续满 1 秒时不下单。
+        for index in range(SIGNAL_CONFIRM_MIN_QUOTES):
+            rt._evaluate_gradient_signal(
+                Decimal("0.2"),
+                Decimal("0"),
+                Decimal("0"),
+                active_quote_key=("session-test", index + 1),
+                now_monotonic=100.0 + index * 0.2,
+            )
         self.assertEqual(len(placed), 0)
-        # 补足最后一次 → 下单
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        # 连续满 1 秒且覆盖至少 4 个不同序号后下单。
+        rt._evaluate_gradient_signal(
+            Decimal("0.2"), Decimal("0"), Decimal("0"),
+            active_quote_key=("session-test", SIGNAL_CONFIRM_MIN_QUOTES + 1),
+            now_monotonic=101.0,
+        )
         self.assertEqual(len(placed), 1)
         self.assertTrue(rt._strategy_order_in_flight)
 
@@ -337,9 +379,8 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         original = main_mod.MAX_SPIKE_DEVIATION_PCT
         main_mod.MAX_SPIKE_DEVIATION_PCT = Decimal("0.02")
         try:
-            # 触发 0.12，偏离 0.005 <= 0.02 → 通过；连续确认满次数后下单
-            for _ in range(SIGNAL_CONFIRM_COUNT):
-                rt._evaluate_gradient_signal(Decimal("0.12"), Decimal("0"), Decimal("0"))
+            # 触发 0.12，偏离 0.005 <= 0.02 → 连续确认满 1 秒后下单。
+            self._confirm_signal(rt, long_edge=Decimal("0.12"))
         finally:
             main_mod.MAX_SPIKE_DEVIATION_PCT = original
         self.assertEqual(len(placed), 1)
@@ -354,14 +395,69 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
 
         # 信号出现→消失(噪音)→再出现：中断使连续计数清零
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
-        rt._evaluate_gradient_signal(None, None, Decimal("0"))
-        rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))  # 连续=1
+        rt._evaluate_gradient_signal(
+            Decimal("0.2"), Decimal("0"), Decimal("0"),
+            active_quote_key=("session-test", 1), now_monotonic=100.0,
+        )
+        rt._evaluate_gradient_signal(None, None, Decimal("0"), now_monotonic=100.4)
+        rt._evaluate_gradient_signal(
+            Decimal("0.2"), Decimal("0"), Decimal("0"),
+            active_quote_key=("session-test", 2), now_monotonic=100.6,
+        )
         self.assertEqual(len(placed), 0)
-        # 连续补齐到 SIGNAL_CONFIRM_COUNT → 下单
-        for _ in range(SIGNAL_CONFIRM_COUNT - 1):
-            rt._evaluate_gradient_signal(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        # 旧的 100.0 命中不能累计；从 100.6 重新连续满 1 秒才下单。
+        for index, now in enumerate((100.9, 101.2, 101.6), start=3):
+            rt._evaluate_gradient_signal(
+                Decimal("0.2"), Decimal("0"), Decimal("0"),
+                active_quote_key=("session-test", index), now_monotonic=now,
+            )
         self.assertEqual(len(placed), 1)
+
+    async def test_repeated_active_quote_sequence_cannot_satisfy_confirmation(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        for now in (100.0, 100.4, 100.8, 101.2):
+            rt._evaluate_gradient_signal(
+                Decimal("0.2"), Decimal("0"), Decimal("0"),
+                active_quote_key=("session-test", 1), now_monotonic=now,
+            )
+
+        self.assertEqual(len(placed), 0)
+
+    async def test_pre_dispatch_recheck_cancels_reverted_signal(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        initial = rt.gradient_strategy.evaluate(Decimal("0.2"), Decimal("0"), Decimal("0"))
+        self.assertIsNotNone(initial)
+        rt._pending_signal_sig = initial.signature()
+        rt._pending_signal_started_at = time.monotonic() - SIGNAL_CONFIRM_SECONDS
+        rt._pending_signal_quote_keys = {("session-test", 1), ("session-test", 2), ("session-test", 3)}
+        rt.runtime.monitor.current_quote_asset = "XAU"
+        rt.runtime.monitor.quotes["XAU"] = {
+            "active_quote": {"sessionId": "session-test", "sequence": 4},
+        }
+        spreads = [(Decimal("0.2"), Decimal("0")), (Decimal("0.05"), Decimal("0"))]
+
+        async def compute_spreads():
+            return spreads.pop(0)
+
+        rt._compute_signal_spreads = compute_spreads
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        await rt._run_strategy_evaluation()
+
+        self.assertEqual(placed, [])
+        self.assertIsNone(rt._pending_signal_sig)
 
     async def test_refresh_after_fill_waits_for_position_change(self):
         rt = self._runtime()

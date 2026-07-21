@@ -19,7 +19,7 @@ class GradientStrategyStateTest(unittest.TestCase):
         state.close_rows[1].threshold_pct = Decimal("0.3")
         state.close_rows[1].target_qty = Decimal("-0.1")
 
-        long_signal = state.evaluate(Decimal("0.65"), Decimal("0.2"), Decimal("0"))
+        long_signal = state.evaluate(Decimal("0.65"), Decimal("0.5"), Decimal("0"))
         self.assertIsNotNone(long_signal)
         self.assertEqual(long_signal.section, StrategySection.OPEN)
         self.assertEqual(long_signal.target_qty, Decimal("0.1"))
@@ -37,7 +37,10 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(short_signal.target_qty, Decimal("-0.1"))
         self.assertEqual(short_signal.action, "close")
 
-    def test_short_target_zero_buys_to_close_existing_short(self):
+        conflict = state.evaluate(Decimal("0.65"), Decimal("0.2"), Decimal("0"))
+        self.assertIsNone(conflict)
+
+    def test_short_edge_cannot_increase_position_to_close_existing_short(self):
         state = GradientStrategyState.default()
         state.enabled = True
         state.close_rows[0].threshold_pct = Decimal("0.4")
@@ -45,10 +48,19 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         signal = state.evaluate(Decimal("0.1"), Decimal("0.35"), Decimal("-0.1"))
 
-        self.assertIsNotNone(signal)
-        self.assertEqual(signal.action, "open")
-        self.assertEqual(signal.target_qty, Decimal("0"))
-        self.assertEqual(signal.delta_qty, Decimal("0.1"))
+        self.assertIsNone(signal)
+
+    def test_long_edge_cannot_reduce_an_existing_long_position(self):
+        state = GradientStrategyState.default()
+        state.enabled = True
+        state.open_rows[0].threshold_pct = Decimal("0.7")
+        state.open_rows[0].target_qty = Decimal("0.1")
+        state.close_rows[0].threshold_pct = Decimal("0.6")
+        state.close_rows[0].target_qty = Decimal("0")
+
+        signal = state.evaluate(Decimal("0.8"), Decimal("0.8"), Decimal("0.2"))
+
+        self.assertIsNone(signal)
 
     def test_default_rows_and_cursor_editing(self):
         state = GradientStrategyState.default()
