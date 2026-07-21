@@ -133,6 +133,32 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("chrome.tabs.onRemoved", background)
         self.assertIn("extension_keepalive", background)
 
+    def test_order_quantity_is_restored_after_page_reload(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn("preparedOrder: state.preparedOrder", background)
+        restore_assignment = "state.preparedOrder = normalizePreparedOrder(saved?.preparedOrder)"
+        self.assertIn(restore_assignment, background)
+        self.assertLess(background.index(restore_assignment), background.index("if (!saved?.active"))
+        self.assertIn("async function restorePreparedOrder(tabId)", background)
+        self.assertIn("void restorePreparedOrder(tabId)", background)
+        self.assertIn('state.preparedOrder = { side, qty }', background)
+        self.assertIn('snapshot?.qtyInputValue', background)
+
+    def test_order_response_wait_does_not_hold_strategy_for_twenty_seconds(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+
+        self.assertIn('ORDER_URL_PATHS = ["/api/orders/new/market", "/orders/new/market"]', background)
+        self.assertIn("ORDER_URL_PATHS.some((path) => url.includes(path))", background)
+        self.assertIn("orderResponseTimeoutMs", background)
+        self.assertIn("waitForNextOrderResponse(tabId, orderResponseTimeoutMs)", background)
+
+    def test_repository_includes_silent_chrome_launcher(self):
+        launcher = (ROOT / "scripts" / "start-variational-chrome.sh").read_text()
+
+        self.assertIn("--silent-debugger-extension-api", launcher)
+        self.assertIn("chrome://version", launcher)
+
     def test_popup_exposes_active_quote_controls(self):
         popup = (ROOT / "chrome_extension" / "popup.html").read_text()
         popup_script = (ROOT / "chrome_extension" / "popup.js").read_text()

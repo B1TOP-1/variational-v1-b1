@@ -60,11 +60,8 @@ BROWSER_ORDER_BROKER_PORT = 8768
 SPREAD_DASHBOARD_PORT = 8780
 PRICE_MAPPING_RATIO = Decimal("1")
 LOG_DIR = Path("./log")
-OUTPUT_DIR = LOG_DIR
-APP_LOG_FILE = LOG_DIR / "runtime.log"
+RUNS_DIR = LOG_DIR / "runs"
 SPREAD_HISTORY_DB_FILE = LOG_DIR / "spread_history.sqlite3"
-TRADE_RECORDS_CSV_FILE = LOG_DIR / "trade_records.csv"
-BROWSER_SMOKE_TEST_FILE = LOG_DIR / "browser_smoke_test.jsonl"
 READY_TIMEOUT_SECONDS = 60.0
 # broker 层等待必须 >= 页面内 timeout_ms，否则会在页面返回前假超时。
 BROWSER_ORDER_BROKER_MARGIN_SECONDS = 8.0
@@ -78,6 +75,9 @@ LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
 SIGNAL_CONFIRM_SECONDS = 1.0
 SIGNAL_CONFIRM_MIN_QUOTES = 4
+SIGNAL_FAST_CONFIRM_SECONDS = 0.4
+SIGNAL_FAST_CONFIRM_MIN_QUOTES = 3
+SIGNAL_FAST_MAX_EDGE_RANGE_PCT = Decimal("0.03")
 # Var 报价断线闸（默认开）：API 或 DOM 报价超过该时长(ms)没刷新 = 断线，不下单。设 None 关闭。
 VAR_QUOTE_DISCONNECT_MS: float | None = 3000.0
 # 尖峰过滤（默认关）：设为 Decimal 值开启——触发价差相对近期均值的最大允许偏离。
@@ -106,6 +106,22 @@ BINANCE_USDCUSDT_WS_URL = "wss://data-stream.binance.vision/ws/usdcusdt@bookTick
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def cst_now() -> datetime:
+    return datetime.now(CST_TZ)
+
+
+def cst_now_iso() -> str:
+    return cst_now().isoformat()
+
+
+class CstLogFormatter(logging.Formatter):
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        timestamp = datetime.fromtimestamp(record.created, tz=CST_TZ)
+        if datefmt:
+            return timestamp.strftime(datefmt)
+        return timestamp.strftime("%Y-%m-%d %H:%M:%S,") + f"{int(record.msecs):03d}"
 
 
 def now_cst_display() -> str:
@@ -435,13 +451,16 @@ class VariationalToLighterRuntime:
         self.logger.handlers.clear()
         self.logger.propagate = False
 
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(APP_LOG_FILE, encoding="utf-8")
-        file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-        self.logger.addHandler(file_handler)
+        self.run_started_at = cst_now()
+        run_name = self.run_started_at.strftime("%Y-%m-%d_%H-%M-%S_%f_UTC+8")
+        self.run_dir = RUNS_DIR / run_name
+        self.runtime_log_file = self.run_dir / "runtime.log"
+        self.orders_file = self.run_dir / "order_metrics.jsonl"
+        self.trade_records_csv_file = self.run_dir / "trade_records.csv"
+        self.browser_smoke_file = self.run_dir / "browser_smoke_test.jsonl"
+        self._session_logging_started = False
         self.dashboard_console = Console()
 
-        output_dir = OUTPUT_DIR.expanduser().resolve()
         self.runtime = VariationalRuntime(
             host=FORWARDER_HOST,
             ws_port=FORWARDER_WS_PORT,
@@ -452,8 +471,6 @@ class VariationalToLighterRuntime:
         self.browser_order_broker = BrowserOrderBroker()
         self.browser_order_server = None
 
-        self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
-        self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
         self._order_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
@@ -542,6 +559,7 @@ class VariationalToLighterRuntime:
         self._pending_signal_count = 0
         self._pending_signal_started_at: float | None = None
         self._pending_signal_quote_keys: set[tuple[str, int]] = set()
+        self._pending_signal_edge_samples: list[Decimal] = []
         self._pending_signal_ready = False
         self._pending_signal_first_edge: Decimal | None = None
         self._pending_signal_confirmed_edge: Decimal | None = None
@@ -565,6 +583,8 @@ class VariationalToLighterRuntime:
         self._stat_var_slip = RunningStat()       # Var 滑点(对 API 触发价)
         self._stat_var_slip_dom = RunningStat()   # Var 滑点(对 DOM 触发价)
         self._stat_lighter_slip = RunningStat()
+        self._stat_long_fill_edge = RunningStat()
+        self._stat_short_fill_edge = RunningStat()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
@@ -572,6 +592,15 @@ class VariationalToLighterRuntime:
         self._browser_order_queue: BrowserOrderDispatchQueue[BrowserOrderCommand] = (
             BrowserOrderDispatchQueue(self._send_browser_order_task)
         )
+
+    def _start_session_logging(self) -> None:
+        if self._session_logging_started:
+            return
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(self.runtime_log_file, encoding="utf-8")
+        file_handler.setFormatter(CstLogFormatter("%(asctime)s | %(levelname)s | %(message)s"))
+        self.logger.addHandler(file_handler)
+        self._session_logging_started = True
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -968,6 +997,16 @@ class VariationalToLighterRuntime:
             self._stat_var_slip_dom.add(float(vd))
         if l is not None:
             self._stat_lighter_slip.add(float(l))
+        _fill_diff, fill_edge = fill_diff_by_direction(
+            record.side,
+            record.var_fill_price,
+            record.lighter_fill_price,
+        )
+        if fill_edge is not None:
+            if record.side.strip().lower() == "buy":
+                self._stat_long_fill_edge.add(float(fill_edge))
+            elif record.side.strip().lower() == "sell":
+                self._stat_short_fill_edge.add(float(fill_edge))
         record.slippage_recorded = True
 
     def build_lighter_ws_url(self) -> str:
@@ -1133,7 +1172,7 @@ class VariationalToLighterRuntime:
             return
         row = {
             "event": event_type,
-            "logged_at": utc_now(),
+            "logged_at": cst_now_iso(),
             **payload,
         }
         line = json.dumps(row, ensure_ascii=True) + "\n"
@@ -2149,10 +2188,26 @@ class VariationalToLighterRuntime:
             self._pending_signal_quote_keys.clear()
             self._pending_signal_first_edge = signal.spread_pct
             self._pending_signal_confirmed_edge = None
-        if active_quote_key is not None:
+        if active_quote_key is not None and active_quote_key not in self._pending_signal_quote_keys:
             self._pending_signal_quote_keys.add(active_quote_key)
+            self._pending_signal_edge_samples.append(signal.spread_pct)
         elapsed = 0.0 if self._pending_signal_started_at is None else now - self._pending_signal_started_at
-        if elapsed < SIGNAL_CONFIRM_SECONDS or len(self._pending_signal_quote_keys) < SIGNAL_CONFIRM_MIN_QUOTES:
+        edge_range = (
+            max(self._pending_signal_edge_samples) - min(self._pending_signal_edge_samples)
+            if self._pending_signal_edge_samples
+            else None
+        )
+        fast_stable = (
+            elapsed >= SIGNAL_FAST_CONFIRM_SECONDS
+            and len(self._pending_signal_quote_keys) >= SIGNAL_FAST_CONFIRM_MIN_QUOTES
+            and edge_range is not None
+            and edge_range <= SIGNAL_FAST_MAX_EDGE_RANGE_PCT
+        )
+        standard_confirmed = (
+            elapsed >= SIGNAL_CONFIRM_SECONDS
+            and len(self._pending_signal_quote_keys) >= SIGNAL_CONFIRM_MIN_QUOTES
+        )
+        if not fast_stable and not standard_confirmed:
             return signal
         self._pending_signal_ready = True
         self._pending_signal_confirmed_edge = signal.spread_pct
@@ -2185,6 +2240,7 @@ class VariationalToLighterRuntime:
         self._pending_signal_count = 0
         self._pending_signal_started_at = None
         self._pending_signal_quote_keys.clear()
+        self._pending_signal_edge_samples.clear()
         self._pending_signal_ready = False
         self._pending_signal_first_edge = None
         self._pending_signal_confirmed_edge = None
@@ -2398,6 +2454,8 @@ class VariationalToLighterRuntime:
             self._prepared_order_side = side
 
     async def run_browser_smoke_test(self) -> None:
+        self._start_session_logging()
+        self.logger.info("Session logs: %s", self.run_dir.resolve())
         qty = Decimal(str(self.args.browser_smoke_qty))
         steps = [
             ("buy_submit", BrowserOrderCommand(side="buy", qty=qty, dry_run=False, wait_after_click_ms=0)),
@@ -2577,7 +2635,7 @@ class VariationalToLighterRuntime:
         qty_value = str(snapshot.get("qtyInputValue") or "")
         hints = [f"按钮='{submit_text}'", f"数量='{qty_value}'"]
         if isinstance(result.get("afterDisabledRetry"), dict):
-            hints.append("已在 disabled 后额外等待 3 秒并重新检查")
+            hints.append("已在 disabled 后等待恢复并重新检查")
         if "仅减仓" in parent_text and "当前仓位 -" in parent_text:
             hints.append("疑似仅减仓开启且当前无仓位，Var 页面禁止开仓")
         elif "仅减仓" in parent_text:
@@ -2611,7 +2669,7 @@ class VariationalToLighterRuntime:
         )
         row = {
             "event": "browser_smoke_progress",
-            "logged_at": utc_now(),
+            "logged_at": cst_now_iso(),
             "step_no": step_no,
             "total_steps": total_steps,
             "step": step_name,
@@ -2622,8 +2680,8 @@ class VariationalToLighterRuntime:
             row["command"] = command.to_payload()
         line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
         async with self._order_write_lock:
-            await asyncio.to_thread(BROWSER_SMOKE_TEST_FILE.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(self._append_line, BROWSER_SMOKE_TEST_FILE, line)
+            await asyncio.to_thread(self.browser_smoke_file.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, self.browser_smoke_file, line)
 
     async def _append_browser_smoke_log(
         self,
@@ -2634,7 +2692,7 @@ class VariationalToLighterRuntime:
     ) -> None:
         row = {
             "event": "browser_smoke_step",
-            "logged_at": utc_now(),
+            "logged_at": cst_now_iso(),
             "step": step_name,
             "elapsed_ms": elapsed_ms,
             "command": command.to_payload(),
@@ -2643,8 +2701,8 @@ class VariationalToLighterRuntime:
         }
         line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
         async with self._order_write_lock:
-            await asyncio.to_thread(BROWSER_SMOKE_TEST_FILE.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(self._append_line, BROWSER_SMOKE_TEST_FILE, line)
+            await asyncio.to_thread(self.browser_smoke_file.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(self._append_line, self.browser_smoke_file, line)
 
     async def _send_browser_order(self, command: BrowserOrderCommand) -> None:
         side = "sell" if command.side.strip().lower() == "sell" else "buy"
@@ -2775,10 +2833,17 @@ class VariationalToLighterRuntime:
             last_t = f"{stat.last:+.3f}%" if stat.last is not None else "-"
             return f"均 {avg_t} | 最近 {last_t} | n={stat.n}"
 
+        def fmt_fill_edge(stat: RunningStat) -> str:
+            if stat.n == 0:
+                return "- | 总和 - / 0笔"
+            return f"均 {stat.avg():+.4f}% | 总和 {stat.total:+.4f}% / {stat.n}笔"
+
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1)
         if is_zh:
             grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
+            grid.add_row(f"Long 实际成交Edge: {fmt_fill_edge(self._stat_long_fill_edge)}")
+            grid.add_row(f"Short 实际成交Edge: {fmt_fill_edge(self._stat_short_fill_edge)}")
             grid.add_row(f"信号确认时长: {fmt_ms(self._stat_signal_confirm)}")
             grid.add_row(f"Var 延迟(信号→成交): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  其中方向切换: {fmt_ms(self._stat_var_side_switch)}")
@@ -2786,10 +2851,11 @@ class VariationalToLighterRuntime:
             grid.add_row(f"V 滑点·api口径(有利+): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"V 滑点·dom口径(有利+): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
-            grid.add_row(self._fmt_quote_compare(is_zh))
             title = "统计（本地会话）"
         else:
             grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
+            grid.add_row(f"Long actual fill edge: {fmt_fill_edge(self._stat_long_fill_edge)}")
+            grid.add_row(f"Short actual fill edge: {fmt_fill_edge(self._stat_short_fill_edge)}")
             grid.add_row(f"signal confirm: {fmt_ms(self._stat_signal_confirm)}")
             grid.add_row(f"Var latency(signal->fill): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  side switch: {fmt_ms(self._stat_var_side_switch)}")
@@ -2797,46 +2863,8 @@ class VariationalToLighterRuntime:
             grid.add_row(f"V slippage/api(+good): {fmt_pct(self._stat_var_slip)}")
             grid.add_row(f"V slippage/dom(+good): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
-            grid.add_row(self._fmt_quote_compare(is_zh))
             title = "Stats (session)"
         return Panel(grid, title=title, border_style="magenta")
-
-    @staticmethod
-    def _fmt_wall_ms(wall: float | None) -> str:
-        if wall is None:
-            return "-"
-        return datetime.fromtimestamp(wall, tz=CST_TZ).strftime("%H:%M:%S.%f")[:-3]  # 精确到ms
-
-    def _fmt_quote_compare(self, is_zh: bool) -> str:
-        s = self.quote_comparator.snapshot()
-        tr = s["transitions"]
-        aleader = max(s["acquire_lead_counts"], key=s["acquire_lead_counts"].get) if s["acquire_lead_counts"] else "-"
-        aavg = s["acquire_lead_avg_ms"]
-        aavg_t = f"{aavg:.0f}ms" if aavg is not None else "-"
-        dv = s["divergences"]
-        def with_delay(source: str) -> str:
-            t = self._fmt_wall_ms(self._last_quote_wall.get(source))
-            d = self._last_quote_delay.get(source)
-            return f"{t}(+{d:.0f}ms)" if d is not None else t
-        api_t = with_delay("api")
-        dom_t = with_delay("dom")
-        asset = self.runtime.monitor.current_quote_asset
-        quote = self.runtime.monitor.quotes.get(asset) if asset else None
-        active = quote.get("active_quote") if isinstance(quote, dict) else None
-        api_mode = "主动200ms" if isinstance(active, dict) else "未确认"
-        api_sequence = active.get("sequence") if isinstance(active, dict) else None
-        api_mode_text = f"{api_mode} seq={api_sequence}" if api_sequence is not None else api_mode
-        if is_zh:
-            return (
-                f"报价对比 API={api_mode_text} | 变动次数 api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | 匹配={s['matched']}\n"
-                f"  最近获取(+传输延迟) api={api_t} dom={dom_t}\n"
-                f"  获取领先: {aleader} 均{aavg_t} | 背离 api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
-            )
-        return (
-            f"quote-cmp API={api_mode_text} | transitions api={tr.get('api', 0)}/dom={tr.get('dom', 0)} | matched={s['matched']}\n"
-            f"  last-recv(+delay) api={api_t} dom={dom_t}\n"
-            f"  acquire-lead: {aleader} avg {aavg_t} | divergence api={dv.get('api', 0)}/dom={dv.get('dom', 0)}"
-        )
 
     def _render_strategy_panel(
         self,
@@ -3433,6 +3461,8 @@ class VariationalToLighterRuntime:
                 await self.export_trade_records_csv()
 
     async def run(self) -> None:
+        self._start_session_logging()
+        self.logger.info("Session logs: %s", self.run_dir.resolve())
         self.setup_signal_handlers()
         self.setup_keyboard()
         dashboard_started = self.spread_dashboard.start()

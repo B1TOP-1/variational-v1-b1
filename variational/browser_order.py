@@ -22,10 +22,11 @@ class BrowserOrderCommand:
     trade_key: str | None = None
     submit_method: str = "js_click"
     timeout_ms: int = 20000
+    order_response_timeout_ms: int = 1000
     wait_after_side_ms: int = 30
     wait_before_input_ms: int = 0
-    wait_after_input_ms: int = 3000
-    disabled_retry_wait_ms: int = 3000
+    wait_after_input_ms: int = 500
+    disabled_retry_wait_ms: int = 1000
     wait_before_submit_ms: int = 0
     wait_after_click_ms: int = 0
 
@@ -42,6 +43,7 @@ class BrowserOrderCommand:
             "prepareOnly": bool(self.prepare_only),
             "simulateOnly": False,
             "timeoutMs": int(self.timeout_ms),
+            "orderResponseTimeoutMs": int(self.order_response_timeout_ms),
             "waitAfterSideMs": int(self.wait_after_side_ms),
             "waitBeforeInputMs": int(self.wait_before_input_ms),
             "waitAfterInputMs": int(self.wait_after_input_ms),

@@ -2,7 +2,7 @@ const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
 const QUOTE_URL_PATH = "/api/quotes/indicative";
-const ORDER_URL_PATH = "/orders/new/market";
+const ORDER_URL_PATHS = ["/api/orders/new/market", "/orders/new/market"];
 const ACTIVE_QUOTE_MARKER = "__var_active_quote";
 const RUNTIME_STATE_KEY = "forwarderRuntimeState";
 const CONFIG_VERSION = 2;
@@ -21,6 +21,7 @@ const DEFAULT_CONFIG = {
   activeQuoteMaxBackoffMs: 30000,
   restAllowlist: [
     "https://omni.variational.io/api/quotes/indicative",
+    "https://omni.variational.io/api/orders/new/market",
     "https://omni.variational.io/orders/new/market"
   ],
   wsAllowlist: [
@@ -48,6 +49,7 @@ const state = {
   activeQuoteMetrics: null,
   activeQuoteSupervisorTimer: null,
   activeQuoteSupervisorBusy: false,
+  preparedOrder: null,
   lastError: null,
   lastAutoReloadAt: 0
 };
@@ -350,7 +352,8 @@ async function persistRuntimeState() {
       [RUNTIME_STATE_KEY]: {
         active: state.active,
         attachedTabId: state.attachedTabId,
-        activeQuoteTemplate: state.activeQuoteTemplate
+        activeQuoteTemplate: state.activeQuoteTemplate,
+        preparedOrder: state.preparedOrder
       }
     });
   } catch {
@@ -373,6 +376,7 @@ async function restoreRuntimeState() {
   } catch {
     return;
   }
+  state.preparedOrder = normalizePreparedOrder(saved?.preparedOrder);
   if (!saved?.active || saved.attachedTabId == null) {
     return;
   }
@@ -455,6 +459,17 @@ function asStringOrDefault(value, fallback) {
   return trimmed.length > 0 ? trimmed : fallback;
 }
 
+function normalizePreparedOrder(value) {
+  if (!value || (value.side !== "buy" && value.side !== "sell")) {
+    return null;
+  }
+  const qty = String(value.qty || "").trim();
+  if (!qty || !Number.isFinite(Number(qty)) || Number(qty) <= 0) {
+    return null;
+  }
+  return { side: value.side, qty };
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -524,7 +539,7 @@ function parseActiveQuoteMeta(rawUrl) {
 }
 
 function isOrderUrl(url) {
-  return typeof url === "string" && url.includes(ORDER_URL_PATH);
+  return typeof url === "string" && ORDER_URL_PATHS.some((path) => url.includes(path));
 }
 
 function matchesDomainFilter(url) {
@@ -1600,6 +1615,32 @@ function prepareOrderSnapshotInPage(payload) {
   };
 }
 
+async function restorePreparedOrder(tabId) {
+  const prepared = normalizePreparedOrder(state.preparedOrder);
+  if (!state.active || tabId !== state.attachedTabId || !prepared) {
+    return false;
+  }
+  for (let attempt = 0; attempt < 24; attempt += 1) {
+    if (!state.active || tabId !== state.attachedTabId) {
+      return false;
+    }
+    try {
+      const snapshot = await runInTab(tabId, prepareOrderSnapshotInPage, [prepared]);
+      if (String(snapshot?.qtyInputValue || "").trim() === prepared.qty) {
+        state.lastError = null;
+        notifyStatus();
+        return true;
+      }
+    } catch {
+      // The SPA can report tab complete before the trading form has mounted.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  state.lastError = `Failed to restore order quantity: ${prepared.qty}`;
+  notifyStatus();
+  return false;
+}
+
 function interactWithSubmitButtonInPage(payload) {
   const method = String(payload?.method || "js_click").trim();
   const button = document.querySelector("button[data-testid='submit-button']");
@@ -1660,6 +1701,7 @@ async function handlePlaceBrowserOrder(payload) {
   const prepareOnly = Boolean(payload?.prepareOnly);
   const dryRun = payload?.dryRun !== false;
   const timeoutMs = Math.max(1000, Number(payload?.timeoutMs ?? 20000));
+  const orderResponseTimeoutMs = Math.max(100, Number(payload?.orderResponseTimeoutMs ?? 1000));
 
   function inferSnapshotSide(snapshot) {
     const activeSide = String(snapshot?.activeSide || "").trim().toLowerCase();
@@ -1731,6 +1773,10 @@ async function handlePlaceBrowserOrder(payload) {
   timing.stages.beforeSubmitSnapshot = performance.now();
   let after = submitSnapshotAfterInput || await runInTab(tabId, prepareOrderSnapshotInPage, [{ side, qty: null }]);
   timing.stages.afterSubmitSnapshot = performance.now();
+  if (qty && String(after?.qtyInputValue || "").trim() === qty) {
+    state.preparedOrder = { side, qty };
+    await persistRuntimeState();
+  }
   if (!dryRun && !prepareOnly) {
     if (!after?.submitButtonRect) {
       return { ok: false, side, qty, dryRun, prepareOnly, before, after, error: "submit_button_missing" };
@@ -1781,7 +1827,7 @@ async function handlePlaceBrowserOrder(payload) {
     }
     const submitMethod = payload?.submitMethod || "js_click";
     let orderResponse = null;
-    const waitForOrder = waitForNextOrderResponse(tabId, timeoutMs);
+    const waitForOrder = waitForNextOrderResponse(tabId, orderResponseTimeoutMs);
     const clickStartedAtMs = Date.now();
     const clickStartedAt = new Date(clickStartedAtMs).toISOString();
     timing.stages.beforeSubmitClick = performance.now();
@@ -2223,6 +2269,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (state.active && tabId === state.attachedTabId && changeInfo.status === "complete") {
     void installDomQuoteObserver(tabId);
+    void restorePreparedOrder(tabId);
     if (state.activeQuoteTemplate) {
       void installActiveQuotePoller(tabId, state.activeQuoteTemplate);
     }

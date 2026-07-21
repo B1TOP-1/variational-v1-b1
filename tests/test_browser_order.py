@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 import unittest
 from asyncio import Future
@@ -11,8 +12,11 @@ from main import OrderLifecycle
 from main import RunningStat
 from main import SIGNAL_CONFIRM_MIN_QUOTES
 from main import SIGNAL_CONFIRM_SECONDS
+from main import SIGNAL_FAST_CONFIRM_MIN_QUOTES
+from main import SIGNAL_FAST_CONFIRM_SECONDS
 from main import SPREAD_TREND_WINDOW_SECONDS
 from main import DASHBOARD_REFRESH_SECONDS
+from main import CstLogFormatter
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
 from variational.listener import VariationalMonitor
@@ -36,6 +40,18 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(runtime.account_index, 0)
         self.assertEqual(runtime.api_key_index, 0)
 
+    def test_session_log_paths_are_isolated_and_runtime_time_is_utc_plus_8(self):
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        self.assertEqual(runtime.run_dir.parent.name, "runs")
+        self.assertTrue(runtime.run_dir.name.endswith("_UTC+8"))
+        self.assertEqual(runtime.orders_file.name, "order_metrics.jsonl")
+        self.assertNotEqual(runtime.spread_store.path, runtime.run_dir / "spread_history.sqlite3")
+
+        record = logging.LogRecord("test", logging.INFO, __file__, 1, "message", (), None)
+        record.created = 0
+        record.msecs = 0
+        self.assertEqual(CstLogFormatter().formatTime(record), "1970-01-01 08:00:00,000")
+
     def test_builds_dry_run_browser_order_payload(self):
         command = BrowserOrderCommand(side="buy", qty=Decimal("0.001"))
 
@@ -46,8 +62,9 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["dryRun"], True)
         self.assertEqual(payload["submitMethod"], "js_click")
         self.assertEqual(payload["waitBeforeInputMs"], 0)
-        self.assertEqual(payload["waitAfterInputMs"], 3000)
-        self.assertEqual(payload["disabledRetryWaitMs"], 3000)
+        self.assertEqual(payload["waitAfterInputMs"], 500)
+        self.assertEqual(payload["disabledRetryWaitMs"], 1000)
+        self.assertEqual(payload["orderResponseTimeoutMs"], 1000)
         self.assertEqual(payload["skipInputWhenMatched"], True)
         json.dumps(payload)
 
@@ -75,6 +92,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
         background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
 
         self.assertIn("https://omni.variational.io/api/quotes/indicative", background)
+        self.assertIn("https://omni.variational.io/api/orders/new/market", background)
         self.assertIn("https://omni.variational.io/orders/new/market", background)
 
     def test_listener_ignores_quote_responses_rejected_by_extension_ordering(self):
@@ -316,7 +334,7 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         # 未连续满 1 秒时不下单。
         for index in range(SIGNAL_CONFIRM_MIN_QUOTES):
             rt._evaluate_gradient_signal(
-                Decimal("0.2"),
+                Decimal("0.2") if index % 2 == 0 else Decimal("0.25"),
                 Decimal("0"),
                 Decimal("0"),
                 active_quote_key=("session-test", index + 1),
@@ -426,6 +444,43 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
             rt._evaluate_gradient_signal(
                 Decimal("0.2"), Decimal("0"), Decimal("0"),
                 active_quote_key=("session-test", 1), now_monotonic=now,
+            )
+
+        self.assertEqual(len(placed), 0)
+
+    async def test_stable_edge_uses_fast_confirmation_path(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        edges = (Decimal("0.200"), Decimal("0.205"), Decimal("0.203"))
+        for index in range(SIGNAL_FAST_CONFIRM_MIN_QUOTES):
+            rt._evaluate_gradient_signal(
+                edges[index], Decimal("0"), Decimal("0"),
+                active_quote_key=("session-fast", index + 1),
+                now_monotonic=100.0 + index * (SIGNAL_FAST_CONFIRM_SECONDS / (SIGNAL_FAST_CONFIRM_MIN_QUOTES - 1)),
+            )
+
+        self.assertEqual(len(placed), 1)
+
+    async def test_volatile_edge_cannot_use_fast_confirmation_path(self):
+        rt = self._runtime()
+        rt._cached_position_qty = Decimal("0")
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.1")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.05")
+        placed = []
+        rt._handle_new_gradient_signal = lambda sig: placed.append(sig) or "rec"
+
+        for index, edge in enumerate((Decimal("0.20"), Decimal("0.28"), Decimal("0.21"))):
+            rt._evaluate_gradient_signal(
+                edge, Decimal("0"), Decimal("0"),
+                active_quote_key=("session-volatile", index + 1),
+                now_monotonic=100.0 + index * 0.2,
             )
 
         self.assertEqual(len(placed), 0)
@@ -554,6 +609,34 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt._stat_var_slip_dom.n, 1)   # dom 口径也记一次
         self.assertEqual(rt._stat_var_slip_dom.last, float((Decimal("99") - Decimal("98")) / Decimal("99") * 100))
         self.assertEqual(rt._stat_lighter_slip.last, -2.0)  # 做空 100→98 = -2%
+        self.assertEqual(rt._stat_long_fill_edge.n, 1)
+        self.assertEqual(rt._stat_long_fill_edge.last, 0.0)
+        self.assertEqual(rt._stat_short_fill_edge.n, 0)
+
+        short = OrderLifecycle(
+            trade_key="strategy:y",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="XAU",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal("100"),
+            lighter_fill_price=Decimal("99"),
+        )
+        rt._maybe_record_slippage_stats(short)
+        self.assertEqual(rt._stat_short_fill_edge.n, 1)
+        self.assertAlmostEqual(
+            rt._stat_short_fill_edge.last,
+            float(Decimal("200") * Decimal("-1") / Decimal("199")),
+        )
+
+    def test_stats_panel_omits_quote_transport_comparison(self):
+        source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
+        self.assertNotIn("最近获取(+传输延迟)", source)
+        self.assertNotIn("获取领先:", source)
+        self.assertIn("Long 实际成交Edge", source)
+        self.assertIn("Short 实际成交Edge", source)
 
     def test_quantize_to_lighter_lot_floors_to_step(self):
         rt = self._runtime()

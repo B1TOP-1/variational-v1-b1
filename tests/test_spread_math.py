@@ -218,6 +218,8 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(command.side, "buy")
         self.assertEqual(command.qty, Decimal("0.001"))
         self.assertTrue(command.prepare_only)
+        self.assertEqual(command.wait_after_input_ms, 500)
+        self.assertEqual(command.disabled_retry_wait_ms, 1000)
 
     def test_prepare_browser_order_keeps_current_panel_side_when_cursor_moves_to_close_section(self):
         class Queue:
