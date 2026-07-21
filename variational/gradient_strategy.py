@@ -159,7 +159,8 @@ class GradientStrategyState:
     ) -> GradientSignal | None:
         if not self.enabled:
             return None
-        # 仓位增加只能由 Long Edge 驱动，仓位减少只能由 Short Edge 驱动。
+        # Long 只产生买单（目标仓位高于当前仓位），Short 只产生卖单
+        # （目标仓位低于当前仓位）；两种方向都允许跨过零仓位。
         candidates: list[tuple[Decimal, StrategySection, GradientRow]] = []
         long_row = self._select_long_row(self.open_rows, open_spread_pct)
         short_row = self._select_short_row(self.close_rows, close_spread_pct)

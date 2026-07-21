@@ -62,6 +62,32 @@ class GradientStrategyStateTest(unittest.TestCase):
 
         self.assertIsNone(signal)
 
+    def test_short_edge_can_sell_across_zero_to_negative_target(self):
+        state = GradientStrategyState.default()
+        state.enabled = True
+        state.close_rows[0].threshold_pct = Decimal("0.6")
+        state.close_rows[0].target_qty = Decimal("-0.2")
+
+        signal = state.evaluate(Decimal("0.1"), Decimal("0.5"), Decimal("0.2"))
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.section, StrategySection.CLOSE)
+        self.assertEqual(signal.target_qty, Decimal("-0.2"))
+        self.assertEqual(signal.delta_qty, Decimal("0.4"))
+
+    def test_long_edge_can_buy_across_zero_to_positive_target(self):
+        state = GradientStrategyState.default()
+        state.enabled = True
+        state.open_rows[0].threshold_pct = Decimal("0.7")
+        state.open_rows[0].target_qty = Decimal("0.2")
+
+        signal = state.evaluate(Decimal("0.8"), Decimal("0.9"), Decimal("-0.2"))
+
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.section, StrategySection.OPEN)
+        self.assertEqual(signal.target_qty, Decimal("0.2"))
+        self.assertEqual(signal.delta_qty, Decimal("0.4"))
+
     def test_default_rows_and_cursor_editing(self):
         state = GradientStrategyState.default()
 
