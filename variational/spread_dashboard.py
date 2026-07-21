@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import errno
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +42,9 @@ class SpreadDashboardServer:
                         return
                     window_seconds = self._bounded_number(query, "range", 86400, 60, 31 * 86400)
                     max_points = int(self._bounded_number(query, "points", 1200, 100, 3000))
+                    now_ms = int(time.time() * 1000)
+                    end_ms = int(self._bounded_number(query, "end", now_ms, 0, now_ms))
+                    start_ms = end_ms - int(window_seconds * 1000)
                     stats = {}
                     for seconds, label in ((300, "5m"), (1800, "30m"), (3600, "1h")):
                         stats[label] = {
@@ -50,9 +54,11 @@ class SpreadDashboardServer:
                     self._send_json({
                         "asset": asset,
                         "rangeSeconds": window_seconds,
+                        "windowStartMs": start_ms,
+                        "windowEndMs": end_ms,
                         "latest": store.latest(asset),
-                        "sampleCount": store.sample_count(asset, window_seconds),
-                        "points": store.history(asset, window_seconds, max_points),
+                        "sampleCount": store.sample_count(asset, window_seconds, end_ms=end_ms),
+                        "points": store.history(asset, window_seconds, max_points, end_ms=end_ms),
                         "stats": stats,
                     })
                     return

@@ -132,8 +132,15 @@ class SpreadStore:
             })
         return result
 
-    def history(self, asset: str, window_seconds: float, max_points: int = 600) -> list[dict[str, Any]]:
-        end_ms = int(time.time() * 1000)
+    def history(
+        self,
+        asset: str,
+        window_seconds: float,
+        max_points: int = 600,
+        *,
+        end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        end_ms = int(time.time() * 1000) if end_ms is None else int(end_ms)
         start_ms = end_ms - int(window_seconds * 1000)
         bucket_ms = max(1000, int(window_seconds * 1000 / max_points))
         with self._read_lock:
@@ -144,11 +151,11 @@ class SpreadStore:
                     AVG(long_edge_pct) AS long_edge_pct,
                     AVG(short_edge_pct) AS short_edge_pct
                 FROM spread_samples
-                WHERE asset = ? AND timestamp_ms >= ?
+                WHERE asset = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
                 GROUP BY bucket_ms
                 ORDER BY bucket_ms
                 """,
-                (bucket_ms, bucket_ms, asset.upper(), start_ms),
+                (bucket_ms, bucket_ms, asset.upper(), start_ms, end_ms),
             ).fetchall()
         return [
             {
@@ -159,12 +166,19 @@ class SpreadStore:
             for row in rows
         ]
 
-    def sample_count(self, asset: str, window_seconds: float | None = None) -> int:
+    def sample_count(
+        self,
+        asset: str,
+        window_seconds: float | None = None,
+        *,
+        end_ms: int | None = None,
+    ) -> int:
         query = "SELECT COUNT(*) AS count FROM spread_samples WHERE asset = ?"
         params: tuple[Any, ...] = (asset.upper(),)
         if window_seconds is not None:
-            query += " AND timestamp_ms >= ?"
-            params = (asset.upper(), int((time.time() - window_seconds) * 1000))
+            window_end_ms = int(time.time() * 1000) if end_ms is None else int(end_ms)
+            query += " AND timestamp_ms >= ? AND timestamp_ms <= ?"
+            params = (asset.upper(), window_end_ms - int(window_seconds * 1000), window_end_ms)
         with self._read_lock:
             row = self._reader.execute(query, params).fetchone()
         return int(row["count"])

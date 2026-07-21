@@ -66,6 +66,18 @@ class SpreadStoreTest(unittest.TestCase):
             self.assertTrue(all(point["longEdge"] != 9.9 for point in history))
             reopened.close()
 
+    def test_history_can_read_a_window_ending_in_the_past(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpreadStore(Path(directory) / "spreads.sqlite3")
+            for timestamp_ms in (1_000, 2_000, 3_000, 4_000):
+                store.record(asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4, long_edge_pct=5, short_edge_pct=6, timestamp_ms=timestamp_ms)
+
+            history = store.history("BTC", 2, end_ms=3_000)
+
+            self.assertEqual([point["timestampMs"] for point in history], [1_000, 2_000, 3_000])
+            self.assertEqual(store.sample_count("BTC", 2, end_ms=3_000), 3)
+            store.close()
+
 
 class SpreadDashboardTest(unittest.TestCase):
     def test_production_dashboard_has_chart_controls(self):
@@ -83,6 +95,9 @@ class SpreadDashboardTest(unittest.TestCase):
         self.assertIn('data-series="short"', html)
         self.assertIn('addEventListener("wheel"', html)
         self.assertIn('addEventListener("dblclick"', html)
+        self.assertIn('addEventListener("mousedown"', html)
+        self.assertIn('timeZone: TIME_ZONE', html)
+        self.assertIn('UTC+8', html)
         self.assertIn("setTimeout(refreshLoop", html)
 
     def test_dashboard_serves_html_assets_and_history(self):
