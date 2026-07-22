@@ -44,6 +44,7 @@ from variational.listener import (
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 from variational.quote_comparator import QuoteComparator
+from variational.round_exit_strategy import RoundExitConfig, RoundExitLedger, RoundStateError
 from variational.spread_store import SpreadStore
 from variational.spread_dashboard import SpreadDashboardServer
 
@@ -62,6 +63,7 @@ PRICE_MAPPING_RATIO = Decimal("1")
 LOG_DIR = Path("./log")
 RUNS_DIR = LOG_DIR / "runs"
 SPREAD_HISTORY_DB_FILE = LOG_DIR / "spread_history.sqlite3"
+ROUND_EXIT_STATE_FILE = LOG_DIR / "round_exit_state.json"
 READY_TIMEOUT_SECONDS = 60.0
 # broker 层等待必须 >= 页面内 timeout_ms，否则会在页面返回前假超时。
 BROWSER_ORDER_BROKER_MARGIN_SECONDS = 8.0
@@ -298,10 +300,14 @@ class OrderLifecycle:
     # 触发信号那一刻两腿的预期价（Var 腿 / Lighter 腿），用于分腿滑点。
     var_trigger_price: Decimal | None = None
     lighter_trigger_price: Decimal | None = None
-    dom_trigger_price: Decimal | None = None  # 触发时 DOM 报价，用于对比 DOM 口径滑点
+    dom_trigger_price: Decimal | None = None  # 网页DOM约1s报价，仅用于滑点对照
     strategy_action: str | None = None
+    strategy_signal_source: str | None = None
     strategy_target_qty: Decimal | None = None
     strategy_current_qty: Decimal | None = None
+    round_id: int | None = None
+    round_fill_role: str | None = None
+    round_accounted: bool = False
     slippage_recorded: bool = False
     # 信号触发时刻(monotonic秒)，用于端到端延迟；两腿延迟只记一次。
     signal_trigger_monotonic: float | None = None
@@ -330,8 +336,11 @@ class OrderLifecycle:
             "dom_slippage_pct": decimal_to_str(self.dom_slippage_pct()),
             "lighter_slippage_pct": decimal_to_str(self.lighter_slippage_pct()),
             "strategy_action": self.strategy_action,
+            "strategy_signal_source": self.strategy_signal_source,
             "strategy_target_qty": decimal_to_str(self.strategy_target_qty),
             "strategy_current_qty": decimal_to_str(self.strategy_current_qty),
+            "round_id": self.round_id,
+            "round_fill_role": self.round_fill_role,
             "auto_hedge_enabled": self.auto_hedge_enabled,
             "var_order_error": self.var_order_error,
             "var_submit_ok": self.var_submit_ok,
@@ -533,6 +542,7 @@ class VariationalToLighterRuntime:
         self.binance_usdc_bid: Decimal | None = None
         self.binance_usdc_ask: Decimal | None = None
         self.binance_usdc_updated_at: float | None = None
+        self.binance_usdc_received_ms: int | None = None
         self.binance_usdc_status = "connecting"
         # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
         self.current_page = 1
@@ -541,6 +551,10 @@ class VariationalToLighterRuntime:
         self._keyboard_active = False
 
         self.gradient_strategy = GradientStrategyState.default()
+        self.round_exit_state_file: Path | None = None if self.args.browser_smoke_test else ROUND_EXIT_STATE_FILE
+        self.round_exit_ledger = self._load_round_exit_ledger()
+        self._round_ledger_synced = False
+        self._round_ledger_sync_warning_logged = False
         self._last_dom_position_qty: Decimal | None = None
         self._cached_position_qty: Decimal | None = None
         self._latest_gradient_signal: GradientSignal | None = None
@@ -555,7 +569,7 @@ class VariationalToLighterRuntime:
         self._halt_reason = ""
         self._last_block_log_sig: tuple[str, Any] | None = None
         self._last_leg_prices: dict[str, Decimal | None] = {}
-        self._pending_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._pending_signal_sig: tuple[str, str, str, str, str, str] | None = None
         self._pending_signal_count = 0
         self._pending_signal_started_at: float | None = None
         self._pending_signal_quote_keys: set[tuple[str, int]] = set()
@@ -580,12 +594,12 @@ class VariationalToLighterRuntime:
         self._stat_lighter_latency = RunningStat()   # 信号触发→Lighter WS成交(端到端)
         self._stat_var_side_switch = RunningStat()   # Var 方向切换耗时(不切=0)
         self._stat_signal_confirm = RunningStat()
-        self._stat_var_slip = RunningStat()       # Var 滑点(对 API 触发价)
-        self._stat_var_slip_dom = RunningStat()   # Var 滑点(对 DOM 触发价)
+        self._stat_var_slip = RunningStat()       # Var 滑点(对200ms主动API触发价)
+        self._stat_var_slip_dom = RunningStat()   # Var 滑点(对网页DOM约1s触发价)
         self._stat_lighter_slip = RunningStat()
         self._stat_long_fill_edge = RunningStat()
         self._stat_short_fill_edge = RunningStat()
-        self._last_gradient_signal_sig: tuple[str, str, str, str, str] | None = None
+        self._last_gradient_signal_sig: tuple[str, str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._prepared_order_side: str = "buy"
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
@@ -704,6 +718,7 @@ class VariationalToLighterRuntime:
         self.binance_usdc_bid = bid
         self.binance_usdc_ask = ask
         self.binance_usdc_updated_at = time.monotonic()
+        self.binance_usdc_received_ms = int(time.time() * 1000)
         self.binance_usdc_status = "connected"
         return True
 
@@ -1007,7 +1022,133 @@ class VariationalToLighterRuntime:
                 self._stat_long_fill_edge.add(float(fill_edge))
             elif record.side.strip().lower() == "sell":
                 self._stat_short_fill_edge.add(float(fill_edge))
+            self._account_round_fill(record, fill_edge)
         record.slippage_recorded = True
+
+    def _normal_close_threshold_for_entry_side(self, entry_side: str) -> Decimal | None:
+        if entry_side.strip().lower() == "sell":
+            values = [
+                row.threshold_pct
+                for row in self.gradient_strategy.open_rows
+                if row.is_complete() and row.target_qty is not None and row.target_qty >= 0
+            ]
+            return min(values) if values else None
+        values = [
+            row.threshold_pct
+            for row in self.gradient_strategy.close_rows
+            if row.is_complete() and row.target_qty is not None and row.target_qty <= 0
+        ]
+        return max(values) if values else None
+
+    def _account_round_fill(self, record: OrderLifecycle, fill_edge: Decimal) -> None:
+        """Feed one fully-filled two-leg order into the live round ledger."""
+        if record.round_accounted or not self._round_ledger_synced:
+            return
+        ledger = self.round_exit_ledger
+        side = record.side.strip().lower()
+        if ledger.position_qty == 0:
+            role = "entry"
+        elif (ledger.side == "long" and side == "buy") or (ledger.side == "short" and side == "sell"):
+            role = "entry"
+        elif record.qty > abs(ledger.position_qty):
+            role = "close_and_new_entry"
+        else:
+            role = "close"
+        existing_round_id = ledger.round_id
+        normal_threshold = self._normal_close_threshold_for_entry_side(side)
+        try:
+            completed = ledger.apply_fill(
+                side,
+                record.qty,
+                fill_edge,
+                normal_close_threshold=normal_threshold,
+                next_normal_close_threshold=normal_threshold,
+            )
+        except RoundStateError as exc:
+            record.round_accounted = True
+            record.round_fill_role = "rejected_conflict"
+            self._strategy_halted = True
+            self._halt_reason = f"本轮账本冲突: {exc}"
+            self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+            return
+        record.round_id = existing_round_id or (completed[0].round_id if completed else ledger.round_id)
+        record.round_fill_role = role
+        record.round_accounted = True
+        self._persist_round_exit_ledger()
+        for item in completed:
+            self.logger.info(
+                "本轮归零: round=%s side=%s entry_edge=%s close_edge=%s edge_pnl=%s",
+                item.round_id,
+                item.side,
+                decimal_to_str(item.entry_edge_actual),
+                decimal_to_str(item.close_edge_actual),
+                decimal_to_str(item.edge_pnl),
+            )
+
+    def _load_round_exit_ledger(self) -> RoundExitLedger:
+        config = RoundExitConfig(self.gradient_strategy.single_order_qty)
+        path = self.round_exit_state_file
+        if path is None or not path.exists():
+            return RoundExitLedger(config)
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            return RoundExitLedger.from_state(config, state)
+        except Exception as exc:
+            self.logger.error("本轮状态恢复失败，保护模块将等待归零后重新同步: %s", exc)
+            return RoundExitLedger(config)
+
+    def _persist_round_exit_ledger(self) -> None:
+        path = self.round_exit_state_file
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = path.with_suffix(path.suffix + ".tmp")
+            temporary.write_text(
+                json.dumps(self.round_exit_ledger.to_state(), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(path)
+        except Exception:
+            self.logger.exception("本轮状态写入失败: %s", path)
+
+    def _sync_round_ledger_with_live_position(self, live_position_qty: Decimal) -> None:
+        if self._round_ledger_synced:
+            return
+        tracked = self.round_exit_ledger.position_qty
+        if tracked != 0:
+            if abs(tracked - live_position_qty) <= self._balance_tolerance():
+                self._round_ledger_synced = True
+                self.logger.info(
+                    "本轮账本恢复成功: round=%s position=%s",
+                    self.round_exit_ledger.round_id,
+                    decimal_to_str(tracked),
+                )
+                return
+            if live_position_qty == 0:
+                self.round_exit_ledger = RoundExitLedger(
+                    RoundExitConfig(self.gradient_strategy.single_order_qty)
+                )
+                self._round_ledger_synced = True
+                self._persist_round_exit_ledger()
+                self.logger.warning("持久化本轮仓位与实盘不一致但实盘已归零，已清空旧轮次")
+                return
+            self._strategy_halted = True
+            self._halt_reason = (
+                f"恢复本轮仓位不一致: ledger={decimal_to_str(tracked)} "
+                f"live={decimal_to_str(live_position_qty)}"
+            )
+            if not self._round_ledger_sync_warning_logged:
+                self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+                self._round_ledger_sync_warning_logged = True
+            return
+        if live_position_qty == 0:
+            self._round_ledger_synced = True
+            self._persist_round_exit_ledger()
+            self.logger.info("本轮账本已同步：当前仓位为0，下一笔实际成交将创建新轮次")
+        elif not self._round_ledger_sync_warning_logged:
+            self.logger.warning("启动时已有仓位但没有可恢复成本账本，本轮保护暂停至仓位归零")
+            self._round_ledger_sync_warning_logged = True
 
     def build_lighter_ws_url(self) -> str:
         params: list[str] = []
@@ -1408,6 +1549,20 @@ class VariationalToLighterRuntime:
         )
         self.logger.error("策略已停止（需手动重新启用）：%s", self._halt_reason)
 
+    async def _wait_for_round_accounting(self, trade_key: str | None, timeout_seconds: float = 2.0) -> None:
+        if not trade_key or not self.args.auto_hedge or not self._round_ledger_synced:
+            return
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline and not self.stop_flag:
+            async with self._record_lock:
+                record = self.records.get(trade_key)
+                if record is not None and record.round_accounted:
+                    return
+            await asyncio.sleep(0.05)
+        self._strategy_halted = True
+        self._halt_reason = f"两腿已平衡但本轮成交记账超时: {trade_key}"
+        self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+
     def _make_strategy_trade_key(self) -> str:
         return f"strategy:{time.time_ns()}"
 
@@ -1443,6 +1598,7 @@ class VariationalToLighterRuntime:
             lighter_trigger_price=lighter_trigger,
             dom_trigger_price=dom_trigger,
             strategy_action=signal.action,
+            strategy_signal_source=signal.source,
             strategy_target_qty=signal.target_qty,
             strategy_current_qty=signal.current_qty,
             signal_trigger_monotonic=time.monotonic(),
@@ -1688,6 +1844,36 @@ class VariationalToLighterRuntime:
         side_u = side_n.upper() if side_n else "-"
         return side_u, side_u
 
+    @staticmethod
+    def _compact_direction_label(side: str) -> str:
+        side_n = side.strip().lower()
+        if side_n == "buy":
+            return "做多V/做空L"
+        if side_n == "sell":
+            return "做空V/做多L"
+        return side_n.upper() if side_n else "-"
+
+    @staticmethod
+    def _order_time_label(record: OrderLifecycle) -> str:
+        timestamp: datetime | None = None
+        if record.var_submit_click_started_at_ms is not None:
+            with contextlib.suppress(TypeError, ValueError, OSError):
+                timestamp = datetime.fromtimestamp(
+                    float(record.var_submit_click_started_at_ms) / 1000.0,
+                    tz=CST_TZ,
+                )
+        if timestamp is None:
+            raw = record.var_submit_click_started_at or record.var_fill_ts_iso
+            if raw:
+                with contextlib.suppress(TypeError, ValueError):
+                    parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    timestamp = parsed.astimezone(CST_TZ)
+        if timestamp is None:
+            return "-"
+        return f"{timestamp.month}/{timestamp.day} {timestamp:%H.%M}"
+
     def _fmt_pct(self, value: Decimal | None) -> str:
         if value is None:
             return "-"
@@ -1763,6 +1949,9 @@ class VariationalToLighterRuntime:
             lighter_ask=lighter_ask,
             long_edge_pct=long_var_short_lighter_pct,
             short_edge_pct=short_var_long_lighter_pct,
+            usdc_usdt_bid=self.binance_usdc_bid,
+            usdc_usdt_ask=self.binance_usdc_ask,
+            usdc_usdt_received_ms=self.binance_usdc_received_ms,
         )
 
     def _median_cross_spread(self, window_seconds: float, long_side: bool) -> float | None:
@@ -2126,6 +2315,73 @@ class VariationalToLighterRuntime:
         if pos is not None:
             self._cached_position_qty = pos
 
+    @staticmethod
+    def _make_round_exit_signal(
+        *,
+        position_qty: Decimal,
+        target_qty: Decimal,
+        spread_pct: Decimal,
+        entry_edge_pct: Decimal,
+    ) -> GradientSignal:
+        is_short = position_qty < 0
+        return GradientSignal(
+            action="open" if is_short else "close",
+            section=StrategySection.OPEN if is_short else StrategySection.CLOSE,
+            spread_pct=spread_pct,
+            threshold_pct=entry_edge_pct,
+            target_qty=target_qty,
+            current_qty=position_qty,
+            delta_qty=abs(target_qty - position_qty),
+            source="round_exit_guard",
+        )
+
+    def _select_strategy_signal(
+        self,
+        long_edge_pct: Decimal | None,
+        short_edge_pct: Decimal | None,
+        position_qty: Decimal,
+    ) -> GradientSignal | None:
+        self._latest_long_edge_pct = long_edge_pct
+        self._latest_short_edge_pct = short_edge_pct
+        if not self.gradient_strategy.enabled or self.gradient_strategy.validation_errors():
+            return None
+        regular = self.gradient_strategy.evaluate(long_edge_pct, short_edge_pct, position_qty)
+        if regular is not None:
+            return regular
+
+        ledger = self.round_exit_ledger
+        if self._round_ledger_synced and ledger.position_qty != 0:
+            executable_edge = long_edge_pct if position_qty < 0 else short_edge_pct
+            exit_target = self.gradient_strategy.round_exit_target(
+                long_edge_pct,
+                short_edge_pct,
+                position_qty,
+            )
+            if executable_edge is not None and exit_target is not None:
+                decision = ledger.decision(
+                    executable_edge,
+                    live_position_qty=None if self._strategy_order_in_flight else position_qty,
+                    order_qty=self.gradient_strategy.single_order_qty,
+                    target_position_qty=exit_target,
+                )
+                if decision.action == "halt":
+                    self._strategy_halted = True
+                    self._halt_reason = (
+                        f"本轮账本与真实仓位不一致: ledger={decimal_to_str(ledger.position_qty)} "
+                        f"live={decimal_to_str(position_qty)}"
+                    )
+                    self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+                    return None
+                if decision.action == "close" and ledger.entry_edge_actual is not None:
+                    return self._make_round_exit_signal(
+                        position_qty=position_qty,
+                        target_qty=exit_target,
+                        spread_pct=executable_edge,
+                        entry_edge_pct=ledger.entry_edge_actual,
+                    )
+
+        return None
+
     def _evaluate_gradient_signal(
         self,
         open_spread_pct: Decimal | None,
@@ -2137,7 +2393,11 @@ class VariationalToLighterRuntime:
         dispatch: bool = True,
     ) -> GradientSignal | None:
         now = time.monotonic() if now_monotonic is None else now_monotonic
-        signal = self.gradient_strategy.evaluate(open_spread_pct, close_spread_pct, position_qty)
+        signal = self._select_strategy_signal(
+            open_spread_pct,
+            close_spread_pct,
+            position_qty,
+        )
         if signal is None:
             self._last_gradient_signal_sig = None
             self._reset_pending_signal_confirmation()
@@ -2220,7 +2480,8 @@ class VariationalToLighterRuntime:
         self._stat_signal_confirm.add(elapsed * 1000)
         signal_sig = signal.signature()
         self.logger.info(
-            "GRADIENT signal: action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
+            "STRATEGY signal: source=%s action=%s section=%s spread=%s threshold=%s current_qty=%s target_qty=%s delta_qty=%s",
+            signal.source,
             signal.action,
             signal.section.value,
             decimal_to_str(signal.spread_pct),
@@ -2229,6 +2490,42 @@ class VariationalToLighterRuntime:
             decimal_to_str(signal.target_qty),
             decimal_to_str(signal.delta_qty),
         )
+        if signal.source == "round_exit_guard":
+            ledger = self.round_exit_ledger
+            entry = ledger.entry_edge_actual
+            margin = ledger.config.minimum_profit_pct
+            trigger_line = None
+            if entry is not None:
+                trigger_line = entry + margin if ledger.side == "short" else entry - margin
+            self.logger.info(
+                "万一Edge触发: round=%s 持仓方向=%s 当前LongEdge=%s 当前ShortEdge=%s "
+                "实际入场均价=%s 万一=%s 触发线=%s 当前可执行平仓Edge=%s "
+                "梯度档位目标=%s 当前仓位=%s 本次方向=%s 本次最大数量=%s",
+                ledger.round_id,
+                ledger.side,
+                decimal_to_str(getattr(self, "_latest_long_edge_pct", None)),
+                decimal_to_str(getattr(self, "_latest_short_edge_pct", None)),
+                decimal_to_str(entry),
+                decimal_to_str(margin),
+                decimal_to_str(trigger_line),
+                decimal_to_str(signal.spread_pct),
+                decimal_to_str(signal.target_qty),
+                decimal_to_str(signal.current_qty),
+                "买入Var/平Short" if signal.action == "open" else "卖出Var/平Long",
+                decimal_to_str(min(self.gradient_strategy.single_order_qty, signal.delta_qty)),
+            )
+        else:
+            self.logger.info(
+                "梯度阈值触发: 当前LongEdge=%s 当前ShortEdge=%s 使用方向=%s 命中阈值=%s "
+                "梯度目标=%s 当前仓位=%s 剩余调仓=%s",
+                decimal_to_str(getattr(self, "_latest_long_edge_pct", None)),
+                decimal_to_str(getattr(self, "_latest_short_edge_pct", None)),
+                "Long" if signal.section == StrategySection.OPEN else "Short",
+                decimal_to_str(signal.threshold_pct),
+                decimal_to_str(signal.target_qty),
+                decimal_to_str(signal.current_qty),
+                decimal_to_str(signal.delta_qty),
+            )
         record = self._handle_new_gradient_signal(signal)
         if record is not None:
             self._strategy_order_in_flight = True
@@ -2345,6 +2642,7 @@ class VariationalToLighterRuntime:
         if pos is None:
             self._latest_gradient_signal = None
             return
+        self._sync_round_ledger_with_live_position(pos)
         long_edge_pct, short_edge_pct = await self._compute_signal_spreads()
         signal = self._evaluate_gradient_signal(
             long_edge_pct,
@@ -2359,7 +2657,11 @@ class VariationalToLighterRuntime:
 
         # 真正创建两腿订单前再读取一次两边报价；方向、阈值或目标任一变化都重新确认。
         fresh_long_edge, fresh_short_edge = await self._compute_signal_spreads()
-        fresh_signal = self.gradient_strategy.evaluate(fresh_long_edge, fresh_short_edge, pos)
+        fresh_signal = self._select_strategy_signal(
+            fresh_long_edge,
+            fresh_short_edge,
+            pos,
+        )
         if fresh_signal is None or fresh_signal.signature() != signal.signature():
             self.logger.info(
                 "信号发送前复核取消: confirmed=%s fresh=%s",
@@ -2744,6 +3046,8 @@ class VariationalToLighterRuntime:
                 # 下单后确认：Var 单边仅刷新仓位；对冲模式在 10s 内确认两腿平衡，否则硬停。
                 if is_live_strategy_order:
                     await self._confirm_hedge_or_halt(self._cached_position_qty)
+                    if not self._strategy_halted:
+                        await self._wait_for_round_accounting(command.trade_key)
         finally:
             # 无论成败都释放在途单闸并唤醒评估循环，避免卡死步进。
             if is_live_strategy_order:
@@ -2848,8 +3152,8 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Var 延迟(信号→成交): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  其中方向切换: {fmt_ms(self._stat_var_side_switch)}")
             grid.add_row(f"Lighter 延迟(信号→WS成交): {fmt_ms(self._stat_lighter_latency)}")
-            grid.add_row(f"V 滑点·api口径(有利+): {fmt_pct(self._stat_var_slip)}")
-            grid.add_row(f"V 滑点·dom口径(有利+): {fmt_pct(self._stat_var_slip_dom)}")
+            grid.add_row(f"V 滑点·200ms主动报价(有利+): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V 滑点·DOM约1s报价(有利+): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L 滑点(有利+): {fmt_pct(self._stat_lighter_slip)}")
             title = "统计（本地会话）"
         else:
@@ -2860,8 +3164,8 @@ class VariationalToLighterRuntime:
             grid.add_row(f"Var latency(signal->fill): {fmt_ms(self._stat_var_latency)}")
             grid.add_row(f"  side switch: {fmt_ms(self._stat_var_side_switch)}")
             grid.add_row(f"Lighter latency(signal->wsfill): {fmt_ms(self._stat_lighter_latency)}")
-            grid.add_row(f"V slippage/api(+good): {fmt_pct(self._stat_var_slip)}")
-            grid.add_row(f"V slippage/dom(+good): {fmt_pct(self._stat_var_slip_dom)}")
+            grid.add_row(f"V slippage/200ms active quote(+good): {fmt_pct(self._stat_var_slip)}")
+            grid.add_row(f"V slippage/DOM ~1s quote(+good): {fmt_pct(self._stat_var_slip_dom)}")
             grid.add_row(f"L slippage(+good): {fmt_pct(self._stat_lighter_slip)}")
             title = "Stats (session)"
         return Panel(grid, title=title, border_style="magenta")
@@ -2879,17 +3183,21 @@ class VariationalToLighterRuntime:
         signal_text = "无信号"
         if signal is not None:
             action_text = "买入 Var" if signal.action == "open" else "卖出 Var"
+            source_text = "万一Edge退出" if signal.source == "round_exit_guard" else "普通梯度"
             # 显示"这一笔实际会下的量"（单次下单量与剩余的较小值，对齐 lot），
             # 剩余总差额单列，避免与单次下单量混淆。
             order_qty = self._quantize_to_lighter_lot(
                 min(self.gradient_strategy.single_order_qty, signal.delta_qty)
             )
             signal_text = (
-                f"[bold yellow]{action_text} {order_qty:f} {self.ticker}[/] "
+                f"[bold yellow]{source_text} · {action_text} {order_qty:f} {self.ticker}[/] "
                 f"目标 {signal.target_qty:f} | 当前 {signal.current_qty:f} | "
                 f"剩余 {signal.delta_qty:f} | 触发 {signal.threshold_pct:f}%"
             )
         strategy_table.add_row(self._strategy_enabled_row_text())
+        validation_errors = self.gradient_strategy.validation_errors()
+        for validation_error in validation_errors:
+            strategy_table.add_row(f"[bold red]配置错误：{validation_error}[/]")
         strategy_table.add_row(self._strategy_single_order_qty_row_text())
         strategy_table.add_row(f"当前净仓位: {position_qty:f} {self.ticker} | 信号: {signal_text}")
         strategy_table.add_row("")
@@ -3013,7 +3321,7 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             recent_keys = list(self.record_order)[-order_row_limit:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
-            realized_pnl, unrealized_pnl, _pnl_pending, position_qty, avg_open_pct = self.compute_pnl()
+            realized_pnl, unrealized_pnl, _pnl_pending, position_qty, _avg_open_pct = self.compute_pnl()
 
         # 廉价兜底刷新缓存仓位（仅 listener，无 DOM 往返），防外部手动改仓。
         await self._refresh_position_cache(allow_dom=False)
@@ -3024,11 +3332,16 @@ class VariationalToLighterRuntime:
             executable_close_edge_pct = short_var_long_lighter_pct
         elif display_position_qty < 0:
             executable_close_edge_pct = long_var_short_lighter_pct
-        position_edge_pnl_pct = edge_pnl_percent(avg_open_pct, executable_close_edge_pct, display_position_qty)
-        if position_edge_pnl_pct is not None:
-            reference_price = var_ask if display_position_qty > 0 else sig_ask
-            if reference_price is not None:
-                unrealized_pnl = abs(display_position_qty) * reference_price * position_edge_pnl_pct / Decimal("100")
+        ledger = self.round_exit_ledger
+        ledger_matches_position = (
+            self._round_ledger_synced
+            and display_position_qty != 0
+            and ledger.position_qty != 0
+            and abs(display_position_qty - ledger.position_qty) <= self._balance_tolerance()
+        )
+        actual_entry_edge_pct = ledger.entry_edge_actual if ledger_matches_position else None
+        actual_close_edge_pct = ledger.close_edge_actual if ledger_matches_position else None
+        position_edge_pnl_pct = ledger.realized_edge_pnl if ledger_matches_position else None
         self.quote_comparator.tick(time.monotonic() * 1000.0)  # 推进背离检测
 
         is_zh = self.args.lang == "zh"
@@ -3078,18 +3391,26 @@ class VariationalToLighterRuntime:
         pos_label = "持仓" if is_zh else "pos"
         if display_position_qty == 0:
             pos_text = f"{pos_label} 0"
-        elif avg_open_pct is None:
-            pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker}"
+        elif actual_entry_edge_pct is None:
+            close_market_text = self._fmt_pct(executable_close_edge_pct)
+            pos_text = (
+                f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
+                f"入场Edge -- | 实际平仓Edge -- | 可执行平仓Edge {close_market_text}"
+            )
         else:
             edge_color = "green" if position_edge_pnl_pct is not None and position_edge_pnl_pct >= 0 else "red"
-            if position_edge_pnl_pct is None or executable_close_edge_pct is None:
-                pos_text = f"{pos_label}{display_position_qty:+.3f}{self.ticker} 入场Edge {avg_open_pct:+.4f}%"
-            else:
-                pos_text = (
-                    f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
-                    f"入场Edge {avg_open_pct:+.4f}% | 平仓Edge {executable_close_edge_pct:+.4f}% | "
-                    f"[{edge_color}]Edge收益 {position_edge_pnl_pct:+.4f}%[/]"
-                )
+            actual_close_text = "--" if actual_close_edge_pct is None else f"{actual_close_edge_pct:+.4f}%"
+            edge_pnl_text = "--" if position_edge_pnl_pct is None else f"{position_edge_pnl_pct:+.4f}%"
+            close_market_text = self._fmt_pct(executable_close_edge_pct)
+            pos_text = (
+                f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
+                f"入场Edge {actual_entry_edge_pct:+.4f}% | 实际平仓Edge {actual_close_text} | "
+                f"可执行平仓Edge {close_market_text} | "
+                f"[{edge_color}]已平Edge收益 {edge_pnl_text}[/]"
+            )
+        active_signal = self._latest_gradient_signal
+        if active_signal is not None and active_signal.source == "round_exit_guard":
+            pos_text += f" | [bold yellow]万一Edge→{active_signal.target_qty:+.3f}[/]"
         lit_pos_text = ""
         if self.args.auto_hedge:
             lit_label = "Lit仓" if is_zh else "Litpos"
@@ -3233,8 +3554,14 @@ class VariationalToLighterRuntime:
                     row.var_fill_price,
                     row.lighter_fill_price,
                 )
-                side_zh, side_en = self._direction_labels(row.side)
-                side_display = side_zh if is_zh else side_en
+                _side_zh, side_en = self._direction_labels(row.side)
+                if is_zh:
+                    side_display = (
+                        f"{self._compact_direction_label(row.side)} "
+                        f"({self._order_time_label(row)})"
+                    )
+                else:
+                    side_display = side_en
                 orders_table.add_row(
                     trade_display,
                     side_display,
@@ -3359,8 +3686,11 @@ class VariationalToLighterRuntime:
                         "confirmed_spread_pct": payload["confirmed_spread_pct"],
                         "preflight_spread_pct": payload["preflight_spread_pct"],
                         "strategy_action": payload["strategy_action"],
+                        "strategy_signal_source": payload["strategy_signal_source"],
                         "strategy_target_qty": payload["strategy_target_qty"],
                         "strategy_current_qty": payload["strategy_current_qty"],
+                        "round_id": payload["round_id"],
+                        "round_fill_role": payload["round_fill_role"],
                         "fill_diff": decimal_to_str(fill_diff),
                         "fill_diff_pct": decimal_to_str(fill_diff_pct),
                         "spread_slippage_pct": decimal_to_str(slippage_pct),
@@ -3406,8 +3736,11 @@ class VariationalToLighterRuntime:
             "confirmed_spread_pct",
             "preflight_spread_pct",
             "strategy_action",
+            "strategy_signal_source",
             "strategy_target_qty",
             "strategy_current_qty",
+            "round_id",
+            "round_fill_role",
             "fill_diff",
             "fill_diff_pct",
             "spread_slippage_pct",

@@ -112,11 +112,11 @@ Debugger 提示条，同时保留报价、成交事件和可信点击所需的 C
 
 ### 长期价差记录与本地浏览器看板
 
-`main.py` 每秒把当前资产的 Var bid/ask、Lighter 深度 VWAP bid/ask、Long Edge 和 Short Edge 追加到 `log/spread_history.sqlite3`。数据库使用 SQLite WAL 模式，程序重启和切换币种不会删除历史；不同资产按 symbol 隔离。
+`main.py` 约每 `200ms` 把当前资产的 Var bid/ask、Lighter 深度 VWAP bid/ask、Long Edge 和 Short Edge 追加到 `log/spread_history.sqlite3`。数据库使用 SQLite WAL 模式，程序重启和切换币种不会删除历史；不同资产按 symbol 隔离。
 
-5分钟、30分钟、1小时窗口、12小时分时统计和三天终端走势图都以 SQLite 为数据源，不再依赖重启即丢失的原始内存队列。可通过 `--spread-db /path/to/file.sqlite3` 修改数据库位置。
+5分钟、30分钟、1小时窗口、12小时分时统计和三天终端走势图都以 SQLite 为数据源，不再依赖重启即丢失的原始内存队列。每条约 `200ms` 的价差样本同时保存 Binance `USDC/USDT` bid/ask 及其最近接收时间，供后续分析稳定币基差和识别陈旧数据，但不参与当前交易 Edge。旧数据库启动时会自动增加字段。可通过 `--spread-db /path/to/file.sqlite3` 修改数据库位置。
 
-`main` 启动时同时提供本地看板 [http://127.0.0.1:8780](http://127.0.0.1:8780)。页面支持资产切换、Long/Short Edge 双线、1小时/6小时/24小时/7天范围、悬停读数、最新两边价格和5分钟中位数，每5秒自动刷新。可使用 `--dashboard-port` 修改端口。数据库保留原始每秒记录，API 下采样只影响图表显示点数，不会删除原始数据。Chrome 插件继续只负责报价采集与运行状态。
+`main` 启动时同时提供本地看板 [http://127.0.0.1:8780](http://127.0.0.1:8780)。页面支持资产切换、Long/Short Edge 双线、1小时/6小时/24小时/7天范围、悬停读数、最新两边价格和5分钟中位数，每5秒自动刷新。可使用 `--dashboard-port` 修改端口。数据库保留约 `200ms` 的原始记录，API 下采样只影响图表显示点数，不会删除原始数据。Chrome 插件继续只负责报价采集与运行状态。
 
 运行数天时，请在 Chrome 性能设置中将 `omni.variational.io` 加入“始终保持这些网站处于活动状态”，并确保系统不会自动睡眠。网页切换标的后，应在插件状态中确认 `Active quote` 显示新的 asset。
 
@@ -154,6 +154,10 @@ python main.py --lang en
 - `-`：删除当前梯度；每个区至少保留一行，删除最后一行会清空参数。
 
 Long Edge 只查询 Long 梯度，并在 `Long Edge >= 阈值` 时命中；它只能产生买单，将目标净仓位向更大的方向推进，例如从 `-0.2` 买到 `0`，再买到 `+0.2`。Short Edge 只查询 Short 梯度，并在 `Short Edge <= 阈值` 时命中；它只能产生卖单，将目标净仓位向更小的方向推进，例如从 `+0.2` 卖到 `0`，再卖到 `-0.2`。每行仓位都是带符号的目标净仓位：正数代表做多 Var / 做空 Lighter，`0` 代表清仓，负数代表做空 Var / 做多 Lighter。若 Long 与 Short 同时要求向相反方向下单，策略不会择优猜测，而是停止本次触发。最终按 `min(单次下单数量, 目标仓位与当前仓位的差额)` 分批执行。
+
+启动策略前会校验配置：禁止半填写行、重复阈值、重复目标仓位和非正数单次下单量。Long 阈值升高时目标仓位必须严格增大；Short 阈值降低时目标仓位必须严格减小。非法配置会在策略面板显示具体行和值，并保持未启动状态。
+
+“万一 Edge 退出”把梯度和成交成本分开处理：普通 Long/Short 梯度照常决定开仓方向；持仓后以真实入场成交的数量加权 Edge 为成本。Short 持仓仅当当前可执行 Long Edge 达到入场均价 `+0.0100%`，Long 持仓仅当当前可执行 Short Edge 达到入场均价 `-0.0100%`，才允许向当前同方向梯度档位的最大仓位减仓。每次发单只判断当前可执行 Edge，实际平仓均价只记录复盘，不阻止下一笔。完整规则见 [`docs/round_break_even_exit_strategy.md`](docs/round_break_even_exit_strategy.md)，测试报告见 [`docs/round_exit_strategy_test_report.md`](docs/round_exit_strategy_test_report.md)。
 
 Chrome 插件启动后会同时连接浏览器下单 broker，默认地址为 `ws://127.0.0.1:8768`。策略信号触发后会创建一条本地策略订单记录，并同时提交 Variational 浏览器订单和 Lighter 对冲单；Lighter 不等待 Variational 成交确认。后续两边成交事件会分别回填到同一条策略记录，用于成交价差和滑点统计。`--no-hedge` 只关闭 Lighter 自动对冲，不会关闭 Variational 浏览器下单。
 

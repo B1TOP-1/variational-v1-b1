@@ -2,6 +2,7 @@ import tempfile
 import time
 import unittest
 import json
+import sqlite3
 import urllib.request
 import threading
 from pathlib import Path
@@ -11,6 +12,48 @@ from variational.spread_dashboard import SpreadDashboardServer
 
 
 class SpreadStoreTest(unittest.TestCase):
+    def test_records_stablecoin_book_with_each_spread_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpreadStore(Path(directory) / "spreads.sqlite3")
+            store.record(
+                asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                long_edge_pct=5, short_edge_pct=6,
+                usdc_usdt_bid="0.9998", usdc_usdt_ask="0.9999",
+                usdc_usdt_received_ms=123456,
+            )
+
+            latest = store.latest("BTC")
+
+            self.assertEqual(latest["usdcUsdtBid"], 0.9998)
+            self.assertEqual(latest["usdcUsdtAsk"], 0.9999)
+            self.assertEqual(latest["usdcUsdtReceivedMs"], 123456)
+            store.close()
+
+    def test_existing_database_is_migrated_for_stablecoin_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "spreads.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """CREATE TABLE spread_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp_ms INTEGER NOT NULL,
+                    asset TEXT NOT NULL, var_bid REAL, var_ask REAL, lighter_bid REAL,
+                    lighter_ask REAL, long_edge_pct REAL, short_edge_pct REAL
+                )"""
+            )
+            connection.commit()
+            connection.close()
+
+            store = SpreadStore(path)
+            store.record(
+                asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                long_edge_pct=5, short_edge_pct=6,
+                usdc_usdt_bid="0.9998", usdc_usdt_ask="0.9999",
+                usdc_usdt_received_ms=123456,
+            )
+
+            self.assertEqual(store.latest("BTC")["usdcUsdtBid"], 0.9998)
+            self.assertEqual(store.latest("BTC")["usdcUsdtReceivedMs"], 123456)
+            store.close()
     def test_history_read_lock_does_not_block_writer(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SpreadStore(Path(directory) / "spreads.sqlite3")

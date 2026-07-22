@@ -34,10 +34,26 @@ class SpreadStore:
                     lighter_bid REAL,
                     lighter_ask REAL,
                     long_edge_pct REAL,
-                    short_edge_pct REAL
+                    short_edge_pct REAL,
+                    usdc_usdt_bid REAL,
+                    usdc_usdt_ask REAL,
+                    usdc_usdt_received_ms INTEGER
                 )
                 """
             )
+            existing_columns = {
+                str(row[1]) for row in self._writer.execute("PRAGMA table_info(spread_samples)").fetchall()
+            }
+            migration_columns = {
+                "usdc_usdt_bid": "REAL",
+                "usdc_usdt_ask": "REAL",
+                "usdc_usdt_received_ms": "INTEGER",
+            }
+            for column, column_type in migration_columns.items():
+                if column not in existing_columns:
+                    self._writer.execute(
+                        f"ALTER TABLE spread_samples ADD COLUMN {column} {column_type}"
+                    )
             self._writer.execute(
                 "CREATE INDEX IF NOT EXISTS idx_spread_samples_asset_time "
                 "ON spread_samples(asset, timestamp_ms)"
@@ -63,6 +79,9 @@ class SpreadStore:
         lighter_ask: Any,
         long_edge_pct: Any,
         short_edge_pct: Any,
+        usdc_usdt_bid: Any = None,
+        usdc_usdt_ask: Any = None,
+        usdc_usdt_received_ms: int | None = None,
         timestamp_ms: int | None = None,
     ) -> None:
         if long_edge_pct is None and short_edge_pct is None:
@@ -76,14 +95,18 @@ class SpreadStore:
             self._float_or_none(lighter_ask),
             self._float_or_none(long_edge_pct),
             self._float_or_none(short_edge_pct),
+            self._float_or_none(usdc_usdt_bid),
+            self._float_or_none(usdc_usdt_ask),
+            usdc_usdt_received_ms,
         )
         with self._write_lock:
             self._writer.execute(
                 """
                 INSERT INTO spread_samples (
                     timestamp_ms, asset, var_bid, var_ask, lighter_bid, lighter_ask,
-                    long_edge_pct, short_edge_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    long_edge_pct, short_edge_pct, usdc_usdt_bid, usdc_usdt_ask,
+                    usdc_usdt_received_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 values,
             )
@@ -195,7 +218,8 @@ class SpreadStore:
             row = self._reader.execute(
                 """
                 SELECT timestamp_ms, asset, var_bid, var_ask, lighter_bid, lighter_ask,
-                       long_edge_pct, short_edge_pct
+                       long_edge_pct, short_edge_pct, usdc_usdt_bid, usdc_usdt_ask,
+                       usdc_usdt_received_ms
                 FROM spread_samples WHERE asset = ? ORDER BY timestamp_ms DESC LIMIT 1
                 """,
                 (asset.upper(),),
@@ -211,6 +235,9 @@ class SpreadStore:
             "lighterAsk": row["lighter_ask"],
             "longEdge": row["long_edge_pct"],
             "shortEdge": row["short_edge_pct"],
+            "usdcUsdtBid": row["usdc_usdt_bid"],
+            "usdcUsdtAsk": row["usdc_usdt_ask"],
+            "usdcUsdtReceivedMs": row["usdc_usdt_received_ms"],
         }
 
     @staticmethod

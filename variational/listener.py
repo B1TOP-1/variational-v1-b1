@@ -78,10 +78,6 @@ class VariationalMonitor:
         if payload.get("quoteAccepted") is False:
             return []
 
-        active_quote = payload.get("activeQuote")
-        if not isinstance(active_quote, dict) or not active_quote.get("sessionId") or active_quote.get("sequence") is None:
-            return []
-
         body = decode_response_body(payload)
         if body is None:
             return [f"[MONITOR] Failed to decode REST body for {url}"]
@@ -89,6 +85,10 @@ class VariationalMonitor:
         parsed = try_parse_json(body)
         if parsed is None:
             return [f"[MONITOR] REST body is not JSON for {url}"]
+
+        active_quote = payload.get("activeQuote")
+        if not isinstance(active_quote, dict) or not active_quote.get("sessionId") or active_quote.get("sequence") is None:
+            return []
 
         async with self._lock:
             self._update_quote(
@@ -101,6 +101,7 @@ class VariationalMonitor:
                 await asyncio.to_thread(write_json_file, self.snapshot_file, self.snapshot())
 
         return []
+
 
     async def process_ws_event(self, payload: dict[str, Any]) -> list[str]:
         kind = str(payload.get("kind", ""))

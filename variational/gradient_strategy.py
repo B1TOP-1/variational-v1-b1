@@ -39,9 +39,11 @@ class GradientSignal:
     target_qty: Decimal
     current_qty: Decimal
     delta_qty: Decimal
+    source: str = "gradient"
 
-    def signature(self) -> tuple[str, str, str, str, str]:
+    def signature(self) -> tuple[str, str, str, str, str, str]:
         return (
+            self.source,
             self.action,
             self.section.value,
             format(self.threshold_pct, "f"),
@@ -60,6 +62,7 @@ class GradientStrategyState:
     cursor_index: int = 0
     cursor_field: EditableField = EditableField.THRESHOLD
     enabled: bool = False
+    validation_error: str = ""
     edit_buffer: str | None = None
     _escape_buffer: str = ""
 
@@ -86,6 +89,7 @@ class GradientStrategyState:
         self.cursor_section = target_section
         self.cursor_index = insert_at
         self.cursor_field = EditableField.THRESHOLD
+        self._refresh_enabled_validation()
 
     def delete_current_row(self) -> None:
         self._commit_edit()
@@ -96,9 +100,11 @@ class GradientStrategyState:
             rows[0] = GradientRow()
             self.cursor_index = 0
             self.cursor_field = EditableField.THRESHOLD
+            self._refresh_enabled_validation()
             return
         del rows[self.cursor_index]
         self.cursor_index = min(self.cursor_index, len(rows) - 1)
+        self._refresh_enabled_validation()
 
     def move_cursor(self, delta: int) -> None:
         self._commit_edit()
@@ -139,7 +145,13 @@ class GradientStrategyState:
             return True
         if key in ("\r", "\n"):
             if self.cursor_target == CursorTarget.ENABLED:
-                self.enabled = not self.enabled
+                if self.enabled:
+                    self.enabled = False
+                    self.validation_error = ""
+                else:
+                    errors = self.validation_errors()
+                    self.validation_error = errors[0] if errors else ""
+                    self.enabled = not errors
                 return True
             self._commit_edit()
             return True
@@ -157,7 +169,7 @@ class GradientStrategyState:
         close_spread_pct: Decimal | None,
         current_position_qty: Decimal,
     ) -> GradientSignal | None:
-        if not self.enabled:
+        if not self.enabled or self.validation_errors():
             return None
         # Long 只产生买单（目标仓位高于当前仓位），Short 只产生卖单
         # （目标仓位低于当前仓位）；两种方向都允许跨过零仓位。
@@ -201,6 +213,90 @@ class GradientStrategyState:
             current_qty=current_position_qty,
             delta_qty=abs(signed_delta),
         )
+
+    def round_exit_target(
+        self,
+        long_edge_pct: Decimal | None,
+        short_edge_pct: Decimal | None,
+        current_position_qty: Decimal,
+    ) -> Decimal | None:
+        """Return the current ladder limit that can unwind an existing round."""
+        if current_position_qty < 0:
+            row = self._select_short_row(self.close_rows, short_edge_pct)
+            target = row.target_qty if row is not None else Decimal("0")
+            return target if target is not None and current_position_qty < target <= 0 else None
+        if current_position_qty > 0:
+            row = self._select_long_row(self.open_rows, long_edge_pct)
+            target = row.target_qty if row is not None else Decimal("0")
+            return target if target is not None and 0 <= target < current_position_qty else None
+        return None
+
+    def validation_errors(self) -> list[str]:
+        errors: list[str] = []
+        if self.single_order_qty <= 0:
+            errors.append("单次下单数量必须大于 0")
+
+        complete_count = 0
+        for section, label in ((StrategySection.OPEN, "Long"), (StrategySection.CLOSE, "Short")):
+            rows = self.rows_for(section)
+            partial = [
+                index + 1
+                for index, row in enumerate(rows)
+                if (row.threshold_pct is None) != (row.target_qty is None)
+            ]
+            if partial:
+                errors.append(f"{label} 第 {','.join(map(str, partial))} 行只填写了一半")
+
+            complete = [row for row in rows if row.is_complete()]
+            complete_count += len(complete)
+            threshold_rows: dict[Decimal, list[int]] = {}
+            target_rows: dict[Decimal, list[int]] = {}
+            for index, row in enumerate(rows, start=1):
+                if not row.is_complete():
+                    continue
+                threshold_rows.setdefault(row.threshold_pct, []).append(index)
+                target_rows.setdefault(row.target_qty, []).append(index)
+            for value, row_numbers in threshold_rows.items():
+                if len(row_numbers) > 1:
+                    errors.append(
+                        f"{label} 第 {','.join(map(str, row_numbers))} 行重复阈值 {value:f}%"
+                    )
+            for value, row_numbers in target_rows.items():
+                if len(row_numbers) > 1:
+                    errors.append(
+                        f"{label} 第 {','.join(map(str, row_numbers))} 行重复目标仓位 {value:f}"
+                    )
+
+            ordered = sorted(
+                complete,
+                key=lambda row: row.threshold_pct,
+                reverse=section == StrategySection.CLOSE,
+            )
+            for previous, current in zip(ordered, ordered[1:]):
+                if section == StrategySection.OPEN and current.target_qty <= previous.target_qty:
+                    errors.append(
+                        "Long 阈值升高时目标仓位必须严格增大："
+                        f"{previous.threshold_pct:f}%→{previous.target_qty:f}，"
+                        f"{current.threshold_pct:f}%→{current.target_qty:f}"
+                    )
+                    break
+                if section == StrategySection.CLOSE and current.target_qty >= previous.target_qty:
+                    errors.append(
+                        "Short 阈值降低时目标仓位必须严格减小："
+                        f"{previous.threshold_pct:f}%→{previous.target_qty:f}，"
+                        f"{current.threshold_pct:f}%→{current.target_qty:f}"
+                    )
+                    break
+
+        if complete_count == 0:
+            errors.append("至少配置一条完整的 Long 或 Short 梯度")
+        return errors
+
+    def _refresh_enabled_validation(self) -> None:
+        errors = self.validation_errors()
+        self.validation_error = errors[0] if errors else ""
+        if self.enabled and errors:
+            self.enabled = False
 
     def display_value(self, section: StrategySection, index: int, field_name: EditableField) -> str:
         if (
@@ -314,6 +410,7 @@ class GradientStrategyState:
             else:
                 row.target_qty = value
         self.edit_buffer = None
+        self._refresh_enabled_validation()
 
     def _current_field_value(self) -> Decimal | None:
         if self.cursor_target == CursorTarget.ENABLED:

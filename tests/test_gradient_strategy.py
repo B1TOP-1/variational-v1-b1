@@ -1,10 +1,83 @@
 import unittest
 from decimal import Decimal
 
-from variational.gradient_strategy import CursorTarget, EditableField, GradientStrategyState, StrategySection
+from variational.gradient_strategy import (
+    CursorTarget,
+    EditableField,
+    GradientRow,
+    GradientStrategyState,
+    StrategySection,
+)
 
 
 class GradientStrategyStateTest(unittest.TestCase):
+    @staticmethod
+    def _complete_minimum_config(state):
+        state.open_rows[0].threshold_pct = Decimal("0.06")
+        state.open_rows[0].target_qty = Decimal("0.005")
+
+    def test_strategy_cannot_enable_without_a_complete_gradient(self):
+        state = GradientStrategyState.default()
+
+        state.handle_key("\r")
+
+        self.assertFalse(state.enabled)
+        self.assertIn("至少配置一条", state.validation_error)
+
+    def test_duplicate_threshold_and_position_are_rejected(self):
+        state = GradientStrategyState.default()
+        self._complete_minimum_config(state)
+        state.add_row(StrategySection.OPEN)
+        state.open_rows[1].threshold_pct = Decimal("0.06")
+        state.open_rows[1].target_qty = Decimal("0.005")
+
+        errors = state.validation_errors()
+
+        self.assertTrue(any("重复阈值" in error for error in errors))
+        self.assertTrue(any("重复目标仓位" in error for error in errors))
+
+    def test_long_targets_must_strictly_increase_with_threshold(self):
+        state = GradientStrategyState.default()
+        self._complete_minimum_config(state)
+        state.add_row(StrategySection.OPEN)
+        state.open_rows[1].threshold_pct = Decimal("0.07")
+        state.open_rows[1].target_qty = Decimal("0.004")
+
+        self.assertTrue(any("Long" in error and "严格增大" in error for error in state.validation_errors()))
+
+    def test_short_targets_must_strictly_decrease_as_threshold_falls(self):
+        state = GradientStrategyState.default()
+        self._complete_minimum_config(state)
+        state.close_rows[0].threshold_pct = Decimal("0.05")
+        state.close_rows[0].target_qty = Decimal("-0.005")
+        state.add_row(StrategySection.CLOSE)
+        state.close_rows[1].threshold_pct = Decimal("0.04")
+        state.close_rows[1].target_qty = Decimal("-0.004")
+
+        state.cursor_target = CursorTarget.ENABLED
+        state.handle_key("\r")
+
+        self.assertFalse(state.enabled)
+        self.assertIn("严格减小", state.validation_error)
+
+    def test_valid_monotonic_gradients_can_enable(self):
+        state = GradientStrategyState.default()
+        self._complete_minimum_config(state)
+        state.add_row(StrategySection.OPEN)
+        state.open_rows[1].threshold_pct = Decimal("0.07")
+        state.open_rows[1].target_qty = Decimal("0.01")
+        state.close_rows[0].threshold_pct = Decimal("0.05")
+        state.close_rows[0].target_qty = Decimal("-0.005")
+        state.add_row(StrategySection.CLOSE)
+        state.close_rows[1].threshold_pct = Decimal("0.04")
+        state.close_rows[1].target_qty = Decimal("-0.01")
+
+        state.cursor_target = CursorTarget.ENABLED
+        state.handle_key("\r")
+
+        self.assertTrue(state.enabled)
+        self.assertEqual(state.validation_error, "")
+
     def test_long_and_short_edges_resolve_one_signed_target_position(self):
         state = GradientStrategyState.default()
         state.enabled = True
@@ -97,6 +170,7 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(state.cursor_target, CursorTarget.ENABLED)
         self.assertFalse(state.enabled)
 
+        self._complete_minimum_config(state)
         state.handle_key("\r")
         self.assertTrue(state.enabled)
         state.handle_key("\r")
@@ -206,12 +280,12 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_open_signal_uses_target_position_delta(self):
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.open_rows[0].threshold_pct = Decimal("0.11")
         state.open_rows[0].target_qty = Decimal("0.001")
         state.add_row(StrategySection.OPEN)
         state.open_rows[1].threshold_pct = Decimal("0.12")
         state.open_rows[1].target_qty = Decimal("0.002")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.12"),
@@ -240,9 +314,9 @@ class GradientStrategyStateTest(unittest.TestCase):
     def test_short_fires_when_edge_at_or_below_threshold(self):
         # Short 阈值 -0.1：Edge -0.12（≤ -0.1）→ 命中。
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("-0.1")
         state.close_rows[0].target_qty = Decimal("0")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
@@ -258,9 +332,9 @@ class GradientStrategyStateTest(unittest.TestCase):
     def test_short_holds_when_edge_above_threshold(self):
         # Short 阈值 -0.1：Edge -0.08（> -0.1）→ 不命中。
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("-0.1")
         state.close_rows[0].target_qty = Decimal("0")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
@@ -272,6 +346,7 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_short_gradient_picks_lower_level_as_edge_falls(self):
         state = GradientStrategyState.default()
+        self._complete_minimum_config(state)
         state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("0.4")
         state.close_rows[0].target_qty = Decimal("0")
@@ -298,9 +373,9 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertEqual(short.delta_qty, Decimal("0.1"))
     def test_open_signal_uses_signed_position(self):
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.open_rows[0].threshold_pct = Decimal("0.11")
         state.open_rows[0].target_qty = Decimal("0.1")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.12"),
@@ -314,9 +389,9 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_close_can_go_short_to_negative_target(self):
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("0.07")
         state.close_rows[0].target_qty = Decimal("-0.1")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
@@ -331,9 +406,9 @@ class GradientStrategyStateTest(unittest.TestCase):
 
     def test_close_stops_at_negative_target(self):
         state = GradientStrategyState.default()
-        state.handle_key("\r")
         state.close_rows[0].threshold_pct = Decimal("0.07")
         state.close_rows[0].target_qty = Decimal("-0.1")
+        state.enabled = True
 
         signal = state.evaluate(
             open_spread_pct=Decimal("0.00"),
@@ -355,6 +430,30 @@ class GradientStrategyStateTest(unittest.TestCase):
         state.handle_key("\r")
 
         self.assertEqual(state.close_rows[0].target_qty, Decimal("-0.1"))
+
+    def test_round_exit_target_uses_current_short_ladder_limit(self):
+        state = GradientStrategyState.default()
+        state.close_rows = [
+            GradientRow(Decimal("0.05"), Decimal("-0.005")),
+            GradientRow(Decimal("0.045"), Decimal("-0.010")),
+            GradientRow(Decimal("0.04"), Decimal("-0.015")),
+        ]
+        self.assertEqual(
+            state.round_exit_target(Decimal("0.03"), Decimal("0.0489"), Decimal("-0.015")),
+            Decimal("-0.005"),
+        )
+
+    def test_round_exit_target_uses_current_long_ladder_limit(self):
+        state = GradientStrategyState.default()
+        state.open_rows = [
+            GradientRow(Decimal("0.06"), Decimal("0.005")),
+            GradientRow(Decimal("0.065"), Decimal("0.010")),
+            GradientRow(Decimal("0.07"), Decimal("0.015")),
+        ]
+        self.assertEqual(
+            state.round_exit_target(Decimal("0.062"), Decimal("0.08"), Decimal("0.015")),
+            Decimal("0.005"),
+        )
 
 
 if __name__ == "__main__":

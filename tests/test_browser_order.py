@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import tempfile
 import time
 import unittest
 from asyncio import Future
@@ -23,6 +24,22 @@ from variational.listener import VariationalMonitor
 
 
 class BrowserOrderCommandTest(unittest.TestCase):
+    def test_order_table_uses_compact_chinese_direction_and_cst_time(self):
+        record = OrderLifecycle(
+            trade_key="strategy:test",
+            trade_id="order-1",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_submit_click_started_at="2026-07-21T07:42:30.000Z",
+        )
+
+        self.assertEqual(VariationalToLighterRuntime._compact_direction_label("sell"), "做空V/做多L")
+        self.assertEqual(VariationalToLighterRuntime._compact_direction_label("buy"), "做多V/做空L")
+        self.assertEqual(VariationalToLighterRuntime._order_time_label(record), "7/21 15.42")
+
     def test_terminal_dashboard_refreshes_at_active_quote_frequency(self):
         self.assertEqual(DASHBOARD_REFRESH_SECONDS, 0.2)
 
@@ -236,6 +253,7 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         }))
         self.assertEqual(rt.binance_usdc_bid, Decimal("0.99980"))
         self.assertEqual(rt.binance_usdc_ask, Decimal("0.99990"))
+        self.assertIsNotNone(rt.binance_usdc_received_ms)
         self.assertEqual(rt.binance_usdc_status, "connected")
         self.assertFalse(rt._update_binance_usdc_book({
             "s": "USDCUSDT", "b": "1.1", "a": "1.0",
@@ -244,6 +262,218 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
         self.assertIn("usdcusdt@bookTicker", source)
         self.assertIn("仅观察，不参与下单", source)
+
+    @staticmethod
+    def _configure_round_exit_gradients(rt):
+        rt.gradient_strategy.enabled = True
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.06")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.005")
+        rt.gradient_strategy.close_rows[0].threshold_pct = Decimal("0.05")
+        rt.gradient_strategy.close_rows[0].target_qty = Decimal("-0.02")
+
+    @staticmethod
+    def _account_round_fill(rt, side, edge, qty="0.001"):
+        record = OrderLifecycle(
+            trade_key=f"strategy:{side}:{len(rt.records)}",
+            trade_id="",
+            side=side,
+            qty=Decimal(qty),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+        )
+        rt.records[record.trade_key] = record
+        rt.record_order.append(record.trade_key)
+        rt._account_round_fill(record, Decimal(edge))
+        return record
+
+    def test_actual_fills_create_round_and_order_metadata(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+
+        record = self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("-0.003"))
+        self.assertEqual(rt.round_exit_ledger.entry_edge_actual, Decimal("0.042"))
+        self.assertEqual(record.round_id, 1)
+        self.assertEqual(record.round_fill_role, "entry")
+
+    def test_no_round_exit_before_actual_close_fill(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+
+        signal = rt._select_strategy_signal(Decimal("0.055"), Decimal("0.03"), Decimal("-0.003"))
+
+        self.assertEqual(signal.source, "gradient")
+        self.assertEqual(signal.target_qty, Decimal("-0.02"))
+
+    def test_profitable_actual_close_enables_cost_line_exit_without_normal_threshold(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt.gradient_strategy.close_rows[0].target_qty = Decimal("-0.005")
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.010")
+        close_record = self._account_round_fill(rt, "buy", "0.052")
+
+        signal = rt._select_strategy_signal(Decimal("0.052"), Decimal("0.048"), Decimal("-0.009"))
+
+        self.assertTrue(rt.round_exit_ledger.guard_started)
+        self.assertEqual(close_record.round_fill_role, "close")
+        self.assertEqual(signal.source, "round_exit_guard")
+        self.assertEqual(signal.target_qty, Decimal("-0.005"))
+        self.assertEqual(signal.threshold_pct, Decimal("0.042"))
+
+    def test_one_basis_point_can_trigger_first_exit_without_actual_close_history(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt.gradient_strategy.close_rows[0].target_qty = Decimal("-0.005")
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.0448", qty="0.010")
+
+        signal = rt._select_strategy_signal(
+            Decimal("0.0548"),
+            Decimal("0.0489"),
+            Decimal("-0.010"),
+        )
+
+        self.assertIsNone(rt.round_exit_ledger.close_edge_actual)
+        self.assertEqual(signal.source, "round_exit_guard")
+        self.assertEqual(signal.target_qty, Decimal("-0.005"))
+        self.assertEqual(signal.spread_pct, Decimal("0.0548"))
+
+    def test_normal_gradient_can_refill_after_actual_close(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+        self._account_round_fill(rt, "buy", "0.040")
+
+        signal = rt._select_strategy_signal(Decimal("0.05"), Decimal("0.03"), Decimal("-0.002"))
+
+        self.assertEqual(signal.source, "gradient")
+        self.assertEqual(signal.target_qty, Decimal("-0.02"))
+
+    def test_normal_gradient_cross_zero_keeps_configured_target(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+        self._account_round_fill(rt, "buy", "0.040")
+
+        signal = rt._select_strategy_signal(Decimal("0.07"), Decimal("0.10"), Decimal("-0.002"))
+
+        self.assertEqual(signal.source, "gradient")
+        self.assertEqual(signal.target_qty, Decimal("0.005"))
+        self.assertEqual(signal.delta_qty, Decimal("0.007"))
+
+    def test_actual_refill_after_close_updates_entry_cost(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+        self._account_round_fill(rt, "buy", "0.052")
+
+        refill = self._account_round_fill(rt, "sell", "0.04")
+
+        self.assertFalse(rt._strategy_halted)
+        self.assertEqual(refill.round_fill_role, "entry")
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("-0.003"))
+
+    def test_runtime_round_state_persists_and_restores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "round_exit_state.json"
+            rt = self._runtime()
+            self._configure_round_exit_gradients(rt)
+            rt.round_exit_state_file = path
+            rt._round_ledger_synced = True
+            self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+            self._account_round_fill(rt, "buy", "0.052")
+
+            restored_runtime = self._runtime()
+            restored_runtime.round_exit_state_file = path
+            restored_runtime.round_exit_ledger = restored_runtime._load_round_exit_ledger()
+            restored_runtime._sync_round_ledger_with_live_position(Decimal("-0.002"))
+
+            self.assertTrue(restored_runtime._round_ledger_synced)
+            self.assertEqual(restored_runtime.round_exit_ledger.entry_edge_actual, Decimal("0.042"))
+            self.assertEqual(restored_runtime.round_exit_ledger.close_edge_actual, Decimal("0.052"))
+
+    def test_restored_round_position_mismatch_halts(self):
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.042", qty="0.003")
+        rt._round_ledger_synced = False
+
+        rt._sync_round_ledger_with_live_position(Decimal("-0.002"))
+
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("恢复本轮仓位不一致", rt._halt_reason)
+
+    async def test_round_accounting_waits_for_actual_fill_record(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+        rt._round_ledger_synced = True
+        record = OrderLifecycle(
+            trade_key="strategy:wait",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[record.trade_key] = record
+
+        async def complete_accounting():
+            await asyncio.sleep(0.01)
+            async with rt._record_lock:
+                record.round_accounted = True
+
+        task = asyncio.create_task(complete_accounting())
+        await rt._wait_for_round_accounting(record.trade_key, timeout_seconds=0.2)
+        await task
+
+        self.assertFalse(rt._strategy_halted)
+
+    async def test_round_accounting_timeout_halts(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+        rt._round_ledger_synced = True
+        record = OrderLifecycle(
+            trade_key="strategy:timeout",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[record.trade_key] = record
+
+        await rt._wait_for_round_accounting(record.trade_key, timeout_seconds=0.01)
+
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("本轮成交记账超时", rt._halt_reason)
+
+    def test_cross_spread_sample_includes_binance_usdcusdt_book(self):
+        rt = self._runtime()
+        rt.binance_usdc_bid = Decimal("0.99980")
+        rt.binance_usdc_ask = Decimal("0.99990")
+        rt.binance_usdc_received_ms = 123456
+
+        rt._record_cross_spreads(
+            "BTC", Decimal("65000"), Decimal("65001"),
+            Decimal("65002"), Decimal("65003"), Decimal("0.1"), Decimal("0.2"),
+        )
+
+        latest = rt.spread_store.latest("BTC")
+        self.assertEqual(latest["usdcUsdtBid"], 0.9998)
+        self.assertEqual(latest["usdcUsdtAsk"], 0.9999)
+        self.assertEqual(latest["usdcUsdtReceivedMs"], 123456)
 
     @staticmethod
     def _confirm_signal(rt, long_edge=Decimal("0.2"), short_edge=Decimal("0"), position=Decimal("0")):
@@ -606,7 +836,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt._stat_both_filled, 1)
         self.assertEqual(rt._stat_var_slip.n, 1)
         self.assertEqual(rt._stat_var_slip.last, 2.0)  # 做多 对api100→98 = +2%
-        self.assertEqual(rt._stat_var_slip_dom.n, 1)   # dom 口径也记一次
+        self.assertEqual(rt._stat_var_slip_dom.n, 1)
         self.assertEqual(rt._stat_var_slip_dom.last, float((Decimal("99") - Decimal("98")) / Decimal("99") * 100))
         self.assertEqual(rt._stat_lighter_slip.last, -2.0)  # 做空 100→98 = -2%
         self.assertEqual(rt._stat_long_fill_edge.n, 1)
@@ -635,6 +865,8 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         source = (Path(__file__).resolve().parents[1] / "main.py").read_text()
         self.assertNotIn("最近获取(+传输延迟)", source)
         self.assertNotIn("获取领先:", source)
+        self.assertIn("V 滑点·200ms主动报价", source)
+        self.assertIn("V 滑点·DOM约1s报价", source)
         self.assertIn("Long 实际成交Edge", source)
         self.assertIn("Short 实际成交Edge", source)
 
