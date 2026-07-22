@@ -909,6 +909,50 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(123, rt.lighter_client_order_to_trade_key)
         self.assertEqual(rt.records[key].lighter_fill_price, Decimal("4000"))
 
+    async def test_immediate_lighter_fill_is_mapped_before_create_order_returns(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+        rt.base_amount_multiplier = 1000
+        rt.price_multiplier = 100
+        rt.lighter_market_index = 1
+
+        async def best_prices():
+            return Decimal("66000"), Decimal("66001")
+
+        rt.get_lighter_best_bid_ask = best_prices
+        record = OrderLifecycle(
+            trade_key="strategy:immediate-fill",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[record.trade_key] = record
+        rt.record_order.append(record.trade_key)
+
+        class ImmediateFillClient:
+            ORDER_TYPE_LIMIT = 0
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 0
+
+            async def create_order(self, **kwargs):
+                await rt.handle_lighter_fill_update({
+                    "status": "filled",
+                    "client_order_id": kwargs["client_order_index"],
+                    "filled_quote_amount": "66.2",
+                    "filled_base_amount": "0.001",
+                })
+                return None, "tx-test", None
+
+        rt.lighter_client = ImmediateFillClient()
+
+        await rt.place_lighter_order(record)
+
+        self.assertEqual(record.lighter_fill_price, Decimal("66200"))
+        self.assertIsNotNone(record.lighter_fill_ts_iso)
+        self.assertNotIn(record.lighter_client_order_id, rt.lighter_client_order_to_trade_key)
+
     async def test_lighter_latency_recorded_from_signal_trigger(self):
         rt = self._runtime()
         key = "strategy:lat"

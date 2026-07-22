@@ -976,6 +976,11 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
             if not trade_key:
+                self.logger.warning(
+                    "收到未匹配的Lighter成交: coid=%s market=%s，可能发生映射竞态或进程重启",
+                    client_order_id,
+                    self.lighter_market_index,
+                )
                 return
             record = self.records.get(trade_key)
             if record is None:
@@ -1363,6 +1368,11 @@ class VariationalToLighterRuntime:
             client_order_id = int(time.time() * 1000)
             while client_order_id in self.lighter_client_order_to_trade_key:
                 client_order_id += 1
+            # Register before create_order: an immediate fill WS event may arrive
+            # before the request coroutine returns.
+            record.lighter_side = side
+            record.lighter_client_order_id = client_order_id
+            self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
 
         try:
             async with self._lighter_signer_lock:
@@ -1384,11 +1394,8 @@ class VariationalToLighterRuntime:
                 raise RuntimeError(f"Sign error: {error}")
 
             async with self._record_lock:
-                record.lighter_side = side
-                record.lighter_client_order_id = client_order_id
                 record.lighter_tx_hash = tx_hash
                 record.hedge_error = None
-                self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
                 # 上限淘汰最旧未成交项，避免映射表无限增长。
                 while len(self.lighter_client_order_to_trade_key) > LIGHTER_ORDER_MAP_MAX:
                     oldest = next(iter(self.lighter_client_order_to_trade_key))
@@ -1401,6 +1408,8 @@ class VariationalToLighterRuntime:
             async with self._record_lock:
                 record.lighter_side = side
                 record.hedge_error = str(exc)
+                if record.lighter_fill_ts_iso is None:
+                    self.lighter_client_order_to_trade_key.pop(client_order_id, None)
                 payload = record.to_payload()
             self.logger.warning("Lighter 对冲失败(下单异常): key=%s side=%s error=%s", record.trade_key, side, exc)
             await self.append_order_log("lighter_error", payload)
@@ -2365,12 +2374,14 @@ class VariationalToLighterRuntime:
                     target_position_qty=exit_target,
                 )
                 if decision.action == "halt":
-                    self._strategy_halted = True
-                    self._halt_reason = (
+                    halt_reason = (
                         f"本轮账本与真实仓位不一致: ledger={decimal_to_str(ledger.position_qty)} "
                         f"live={decimal_to_str(position_qty)}"
                     )
-                    self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+                    if not self._strategy_halted or self._halt_reason != halt_reason:
+                        self._strategy_halted = True
+                        self._halt_reason = halt_reason
+                        self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
                     return None
                 if decision.action == "close" and ledger.entry_edge_actual is not None:
                     return self._make_round_exit_signal(
