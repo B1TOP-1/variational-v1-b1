@@ -9,6 +9,8 @@ from asyncio import Future
 from decimal import Decimal
 from pathlib import Path
 
+from rich.console import Console
+
 from main import parse_args
 from main import OrderLifecycle
 from main import RunningStat
@@ -866,6 +868,48 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         await rt._refresh_history_cache_if_due("BTC", 80)
 
         self.assertEqual(calls, [("BTC", 80)])
+
+    async def test_spread_sampling_persists_without_dashboard_render(self):
+        rt = self._runtime()
+        rt.variational_ticker = "BTC"
+        rt.get_variational_best_bid_ask = AsyncMock(
+            return_value=(Decimal("100"), Decimal("101"), "BTC")
+        )
+        rt.get_lighter_best_bid_ask = AsyncMock(
+            return_value=(Decimal("102"), Decimal("103"))
+        )
+        rt.get_lighter_depth_quote = AsyncMock(
+            return_value=(Decimal("102"), Decimal("103"))
+        )
+        rt._refresh_spread_stats_if_due = AsyncMock()
+        recorded = []
+        rt._record_cross_spreads = lambda *args: recorded.append(args)
+
+        await rt._sample_current_spread()
+
+        self.assertEqual(recorded[0][0], "BTC")
+        self.assertIsNotNone(recorded[0][5])
+        self.assertIsNotNone(recorded[0][6])
+        rt._refresh_spread_stats_if_due.assert_awaited_once_with("BTC")
+
+    async def test_strategy_and_history_use_separate_terminal_pages(self):
+        rt = self._runtime()
+        rt.variational_ticker = "BTC"
+        rt.ticker = "BTC"
+        rt._cached_position_qty = Decimal("0")
+        rt.current_page = 2
+        strategy_console = Console(record=True, width=160, height=50)
+        strategy_console.print(await rt.render_dashboard())
+        strategy_text = strategy_console.export_text()
+
+        rt.current_page = 3
+        history_console = Console(record=True, width=160, height=50)
+        history_console.print(await rt.render_dashboard())
+        history_text = history_console.export_text()
+
+        self.assertIn("触发策略", strategy_text)
+        self.assertNotIn("历史价差", strategy_text)
+        self.assertIn("历史价差", history_text)
 
     def test_spread_trend_series_and_line_chart(self):
         rt = self._runtime()

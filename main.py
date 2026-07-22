@@ -22,7 +22,6 @@ from typing import Any
 import websockets
 from dotenv import load_dotenv
 from rich.console import Console, Group
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 
@@ -41,6 +40,7 @@ from variational.listener import (
 )
 from variational.lighter_rust import RustLighterGateway
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
+from variational.differential_screen import DifferentialScreen
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 from variational.quote_comparator import QuoteComparator
 from variational.round_exit_strategy import RoundExitConfig, RoundExitLedger, RoundStateError
@@ -493,13 +493,14 @@ class VariationalToLighterRuntime:
         self.lighter_order_book_ready = False
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+        self.spread_sampling_task: asyncio.Task[None] | None = None
         self.binance_usdc_task: asyncio.Task[None] | None = None
         self.binance_usdc_bid: Decimal | None = None
         self.binance_usdc_ask: Decimal | None = None
         self.binance_usdc_updated_at: float | None = None
         self.binance_usdc_received_ms: int | None = None
         self.binance_usdc_status = "connecting"
-        # Two-page dashboard: 1 = live (quotes/signal/orders), 2 = hourly history.
+        # Dashboard pages: 1 = live, 2 = strategy, 3 = low-frequency history.
         self.current_page = 1
         self._stdin_fd: int | None = None
         self._stdin_old_settings: Any = None
@@ -646,7 +647,7 @@ class VariationalToLighterRuntime:
         if key in ("q", "Q", "\x03"):  # q / Ctrl-C
             self.shutdown()
         elif key == "\t":
-            self.current_page = 2 if self.current_page == 1 else 1
+            self.current_page = self.current_page % 3 + 1
             if self.current_page == 2:
                 self._schedule_prepare_browser_order()
             dashboard_changed = True
@@ -668,6 +669,9 @@ class VariationalToLighterRuntime:
         elif key == "2":
             self.current_page = 2
             self._schedule_prepare_browser_order()
+            dashboard_changed = True
+        elif key == "3":
+            self.current_page = 3
             dashboard_changed = True
         if dashboard_changed:
             self._dashboard_wake.set()
@@ -3148,19 +3152,8 @@ class VariationalToLighterRuntime:
             sig_ask,
             PRICE_MAPPING_RATIO,
         )
-        # 每个 200ms UI 帧记录当前价差；窗口统计内部按 1Hz 节流，避免重复排序。
+        # 采集和落库由独立的 spread_sampling_loop 负责；渲染只读最新状态。
         active_asset = quote_asset or self.variational_ticker or self.ticker or "UNKNOWN"
-        await asyncio.to_thread(
-            self._record_cross_spreads,
-            active_asset,
-            var_bid,
-            var_ask,
-            sig_bid,
-            sig_ask,
-            long_var_short_lighter_pct,
-            short_var_long_lighter_pct,
-        )
-        await self._refresh_spread_stats_if_due(active_asset)
 
         st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
         long_pct_median_5m = st.get("long_median_5m")
@@ -3463,7 +3456,7 @@ class VariationalToLighterRuntime:
         hourly_table.add_column(col_h_short_up, justify="right")
         hourly_table.add_column(col_h_short_dn, justify="right")
 
-        if self.current_page == 2:
+        if self.current_page == 3:
             history_width = max(20, min(200, self.dashboard_console.size.width - 14))
             await self._refresh_history_cache_if_due(active_asset, history_width)
             hourly_rows = self._hourly_rows_cache[:hourly_row_limit]
@@ -3498,10 +3491,10 @@ class VariationalToLighterRuntime:
             signal,
         )
         if is_zh:
-            page_hint = "[1]实时 [2]策略 Tab切换 q退出"
+            page_hint = "[1]实时 [2]策略 [3]历史 Tab切换 q退出"
             page_label = f"第{self.current_page}页"
         else:
-            page_hint = "[1]Live [2]Strategy Tab q"
+            page_hint = "[1]Live [2]Strategy [3]History Tab q"
             page_label = f"Page {self.current_page}"
         footer = Panel(f"{page_hint}  |  {page_label}", border_style="dim")
 
@@ -3511,8 +3504,11 @@ class VariationalToLighterRuntime:
             body.add_column(ratio=3)
             body.add_column(ratio=2)
             body.add_row(strategy_panel, stats_panel)
+            return Group(header, body, footer)
+        if self.current_page == 3:
+            stats_panel = self._render_stats_panel(is_zh)
             trend_panel = self._render_spread_trend_panel(is_zh)
-            return Group(header, hourly_table, body, trend_panel, footer)
+            return Group(header, hourly_table, stats_panel, trend_panel, footer)
         return Group(header, quote_table, spread_table, orders_table, footer)
 
     async def export_trade_records_csv(self) -> None:
@@ -3657,17 +3653,51 @@ class VariationalToLighterRuntime:
             return True
         return now < self._dashboard_resize_deadline
 
+    async def _sample_current_spread(self) -> None:
+        var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
+        lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+        vwap_bid, vwap_ask = await self.get_lighter_depth_quote(Decimal(str(self.args.depth_notional)))
+        sig_bid = vwap_bid if vwap_bid is not None else lighter_bid
+        sig_ask = vwap_ask if vwap_ask is not None else lighter_ask
+        long_edge, short_edge = cross_spread_percentages(
+            var_bid,
+            var_ask,
+            sig_bid,
+            sig_ask,
+            PRICE_MAPPING_RATIO,
+        )
+        asset = quote_asset or self.variational_ticker or self.ticker or "UNKNOWN"
+        await asyncio.to_thread(
+            self._record_cross_spreads,
+            asset,
+            var_bid,
+            var_ask,
+            sig_bid,
+            sig_ask,
+            long_edge,
+            short_edge,
+        )
+        await self._refresh_spread_stats_if_due(asset)
+
+    async def spread_sampling_loop(self) -> None:
+        while not self.stop_flag:
+            started = time.monotonic()
+            try:
+                await self._sample_current_spread()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("价差采集异常")
+            remaining = DASHBOARD_REFRESH_SECONDS - (time.monotonic() - started)
+            await asyncio.sleep(max(0.0, remaining))
+
     async def dashboard_loop(self) -> None:
         refresh_interval = DASHBOARD_REFRESH_SECONDS
         initial_render = await self.render_dashboard()
         self._dashboard_resize_in_progress(time.monotonic())
         await self.export_trade_records_csv()
-        with Live(
-            initial_render,
-            console=self.dashboard_console,
-            auto_refresh=False,
-            screen=True,
-        ) as live:
+        with DifferentialScreen(self.dashboard_console) as screen:
+            screen.update(initial_render)
             while not self.stop_flag:
                 keyboard_wake = False
                 try:
@@ -3679,7 +3709,7 @@ class VariationalToLighterRuntime:
                     self._dashboard_wake.clear()
                 if self._dashboard_resize_in_progress(time.monotonic()):
                     continue
-                live.update(await self.render_dashboard(), refresh=True)
+                screen.update(await self.render_dashboard())
                 await self.export_trade_records_csv()
 
     async def run(self) -> None:
@@ -3724,6 +3754,7 @@ class VariationalToLighterRuntime:
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
 
         self.trade_task = asyncio.create_task(self.trade_loop())
+        self.spread_sampling_task = asyncio.create_task(self.spread_sampling_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
         self._strategy_task = asyncio.create_task(self.strategy_loop())
         while not self.stop_flag:
@@ -3738,8 +3769,10 @@ class VariationalToLighterRuntime:
             await asyncio.gather(self.binance_usdc_task, return_exceptions=True)
 
         if self.dashboard_task and not self.dashboard_task.done():
-            self.dashboard_task.cancel()
             await asyncio.gather(self.dashboard_task, return_exceptions=True)
+
+        if self.spread_sampling_task and not self.spread_sampling_task.done():
+            await asyncio.gather(self.spread_sampling_task, return_exceptions=True)
 
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
