@@ -73,6 +73,7 @@ STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
 POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
 POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
+ROUND_POSITION_MISMATCH_CONFIRM_SECONDS = 5.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
 # 噪音过滤：同一信号需连续出现这么多次才下单（单次视为噪音）。
 SIGNAL_CONFIRM_SECONDS = 1.0
@@ -555,6 +556,8 @@ class VariationalToLighterRuntime:
         self.round_exit_ledger = self._load_round_exit_ledger()
         self._round_ledger_synced = False
         self._round_ledger_sync_warning_logged = False
+        self._round_position_mismatch_sig: tuple[str, str] | None = None
+        self._round_position_mismatch_since: float | None = None
         self._last_dom_position_qty: Decimal | None = None
         self._cached_position_qty: Decimal | None = None
         self._latest_gradient_signal: GradientSignal | None = None
@@ -854,6 +857,8 @@ class VariationalToLighterRuntime:
         self._strategy_order_in_flight = False
         self._strategy_halted = False
         self._halt_reason = ""
+        self._round_position_mismatch_sig = None
+        self._round_position_mismatch_since = None
         self._last_gradient_signal_sig = None
         self._reset_pending_signal_confirmation()
         async with self._trade_csv_write_lock:
@@ -1000,6 +1005,17 @@ class VariationalToLighterRuntime:
             self.lighter_client_order_to_trade_key.pop(client_order_id, None)
 
         await self.append_order_log("lighter_fill", payload)
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "Lighter WS成交回填: key=%s coid=%s side=%s qty=%s price=%s fill_time=%s",
+                record.trade_key,
+                client_order_id,
+                record.lighter_side,
+                decimal_to_str(record.qty),
+                decimal_to_str(fill_price),
+                now_iso,
+            )
 
     def _maybe_record_slippage_stats(self, record: OrderLifecycle) -> None:
         """两腿都成交后累计一次分腿滑点（仅策略单有触发价；调用方持 _record_lock）。"""
@@ -1028,6 +1044,30 @@ class VariationalToLighterRuntime:
             elif record.side.strip().lower() == "sell":
                 self._stat_short_fill_edge.add(float(fill_edge))
             self._account_round_fill(record, fill_edge)
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "两腿成交完成: key=%s var_side=%s qty=%s var_price=%s var_time=%s "
+                "lighter_side=%s lighter_price=%s lighter_time=%s actual_edge=%s "
+                "var_slip_200ms=%s var_slip_dom=%s lighter_slip=%s round=%s role=%s "
+                "ledger_position=%s remaining_entry_edge=%s",
+                record.trade_key,
+                record.side,
+                decimal_to_str(record.qty),
+                decimal_to_str(record.var_fill_price),
+                record.var_fill_ts_iso,
+                record.lighter_side,
+                decimal_to_str(record.lighter_fill_price),
+                record.lighter_fill_ts_iso,
+                decimal_to_str(fill_edge),
+                decimal_to_str(v),
+                decimal_to_str(vd),
+                decimal_to_str(l),
+                record.round_id,
+                record.round_fill_role,
+                decimal_to_str(self.round_exit_ledger.position_qty),
+                    decimal_to_str(self.round_exit_ledger.entry_edge_actual),
+                )
         record.slippage_recorded = True
 
     def _normal_close_threshold_for_entry_side(self, entry_side: str) -> Decimal | None:
@@ -1799,6 +1839,17 @@ class VariationalToLighterRuntime:
 
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    "Var成交回填: key=%s trade_id=%s side=%s qty=%s price=%s fill_time=%s",
+                    record.trade_key,
+                    record.trade_id,
+                    record.side,
+                    decimal_to_str(record.qty),
+                    decimal_to_str(record.var_fill_price),
+                    record.var_fill_ts_iso,
+                )
         if should_hedge_manual:
             self._schedule_background_task(self.place_lighter_order(record))
 
@@ -2354,11 +2405,39 @@ class VariationalToLighterRuntime:
         self._latest_short_edge_pct = short_edge_pct
         if not self.gradient_strategy.enabled or self.gradient_strategy.validation_errors():
             return None
+        ledger = self.round_exit_ledger
+        if self._round_ledger_synced and ledger.position_qty != position_qty:
+            if self._strategy_order_in_flight:
+                self._round_position_mismatch_sig = None
+                self._round_position_mismatch_since = None
+                return None
+            mismatch_sig = (decimal_to_str(ledger.position_qty), decimal_to_str(position_qty))
+            now = time.monotonic()
+            if self._round_position_mismatch_sig != mismatch_sig:
+                self._round_position_mismatch_sig = mismatch_sig
+                self._round_position_mismatch_since = now
+                return None
+            if (
+                self._round_position_mismatch_since is None
+                or now - self._round_position_mismatch_since < ROUND_POSITION_MISMATCH_CONFIRM_SECONDS
+            ):
+                return None
+            halt_reason = (
+                f"本轮账本与真实仓位持续不一致: ledger={decimal_to_str(ledger.position_qty)} "
+                f"live={decimal_to_str(position_qty)} confirm={ROUND_POSITION_MISMATCH_CONFIRM_SECONDS:.1f}s"
+            )
+            if not self._strategy_halted or self._halt_reason != halt_reason:
+                self._strategy_halted = True
+                self._halt_reason = halt_reason
+                self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
+            return None
+        self._round_position_mismatch_sig = None
+        self._round_position_mismatch_since = None
+
         regular = self.gradient_strategy.evaluate(long_edge_pct, short_edge_pct, position_qty)
         if regular is not None:
             return regular
 
-        ledger = self.round_exit_ledger
         if self._round_ledger_synced and ledger.position_qty != 0:
             executable_edge = long_edge_pct if position_qty < 0 else short_edge_pct
             exit_target = self.gradient_strategy.round_exit_target(
@@ -2369,20 +2448,10 @@ class VariationalToLighterRuntime:
             if executable_edge is not None and exit_target is not None:
                 decision = ledger.decision(
                     executable_edge,
-                    live_position_qty=None if self._strategy_order_in_flight else position_qty,
+                    live_position_qty=None,
                     order_qty=self.gradient_strategy.single_order_qty,
                     target_position_qty=exit_target,
                 )
-                if decision.action == "halt":
-                    halt_reason = (
-                        f"本轮账本与真实仓位不一致: ledger={decimal_to_str(ledger.position_qty)} "
-                        f"live={decimal_to_str(position_qty)}"
-                    )
-                    if not self._strategy_halted or self._halt_reason != halt_reason:
-                        self._strategy_halted = True
-                        self._halt_reason = halt_reason
-                        self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
-                    return None
                 if decision.action == "close" and ledger.entry_edge_actual is not None:
                     return self._make_round_exit_signal(
                         position_qty=position_qty,
@@ -2419,7 +2488,13 @@ class VariationalToLighterRuntime:
         # 信号已达但被闸拦（已停止 / 两腿不平衡）→ 节流打日志，免得排查半天没线索。
         if not self._strategy_order_allowed():
             reason = "已停止" if self._strategy_halted else "两腿不平衡"
-            block_sig = (reason, signal_sig)
+            block_sig = (
+                reason,
+                self._halt_reason if self._strategy_halted else (
+                    decimal_to_str(self._cached_position_qty),
+                    decimal_to_str(self._current_lighter_position()),
+                ),
+            )
             if block_sig != self._last_block_log_sig:
                 self._last_block_log_sig = block_sig
                 self.logger.warning(
