@@ -166,8 +166,15 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("/proc/meminfo", monitor)
         self.assertIn("chrome-renderer", monitor)
         self.assertIn("variational-main", monitor)
+        self.assertIn("lighter-rust", monitor)
         self.assertIn("snapshots", monitor)
         self.assertIn("--sort=-rss", monitor)
+
+    def test_repository_includes_lighter_rust_build_script(self):
+        builder = (ROOT / "scripts" / "build-lighter-rust.sh").read_text()
+
+        self.assertIn("cargo build", builder)
+        self.assertIn("variational_lighter_gateway", builder)
 
     def test_main_automatically_manages_memory_monitor(self):
         main_source = (ROOT / "main.py").read_text()

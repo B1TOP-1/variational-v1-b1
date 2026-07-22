@@ -4,6 +4,7 @@ import asyncio
 import argparse
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from main import (
     BrowserOrderCommand,
@@ -14,6 +15,7 @@ from main import (
     cross_spread_percentages,
     edge_pnl_percent,
     fill_diff_by_direction,
+    parse_args,
     PRICE_MAPPING_RATIO,
     resolve_lighter_ticker,
     resolve_variational_ticker,
@@ -278,7 +280,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime.gradient_strategy.single_order_qty = Decimal("0.001")
         runtime.variational_ticker = "BTC"
-        runtime.base_amount_multiplier = 0
+        runtime.lighter_gateway = SimpleNamespace(size_multiplier=None)
         runtime._last_leg_prices = {}
         runtime._last_dom_bid = None
         runtime._last_dom_ask = None
@@ -333,7 +335,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime.gradient_strategy.single_order_qty = Decimal("0.005")
         runtime.variational_ticker = "BTC"
-        runtime.base_amount_multiplier = 0
+        runtime.lighter_gateway = SimpleNamespace(size_multiplier=None)
         runtime._last_leg_prices = {}
         runtime._last_dom_bid = None
         runtime._last_dom_ask = None
@@ -359,11 +361,10 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(record.lighter_side, "BUY")
         self.assertEqual(record.qty, Decimal("0.003"))
 
-    def test_no_hedge_lighter_ws_url_is_readonly(self):
-        runtime = object.__new__(VariationalToLighterRuntime)
-        runtime.args = argparse.Namespace(auto_hedge=False)
+    def test_no_hedge_uses_readonly_rust_gateway(self):
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test", "--no-hedge"]))
 
-        self.assertEqual(runtime.build_lighter_ws_url(), "wss://mainnet.zklighter.elliot.ai/stream?readonly=true")
+        self.assertFalse(runtime.lighter_gateway.execution_enabled)
 
 
 class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
@@ -411,25 +412,18 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.var_submit_timing["totalDuration"], 88.5)
         self.assertEqual(runtime.logged[0][0], "variational_order_submitted")
 
-    async def test_no_hedge_activate_asset_uses_market_config_and_readonly_ws(self):
+    async def test_no_hedge_activate_asset_uses_rust_gateway(self):
         runtime = object.__new__(VariationalToLighterRuntime)
-        runtime.args = argparse.Namespace(auto_hedge=False)
+        runtime.args = argparse.Namespace(auto_hedge=False, depth_notional=2000.0)
         runtime.variational_ticker = None
         runtime.ticker = None
         runtime._asset_switch_lock = asyncio.Lock()
-        runtime.lighter_ws_task = None
         runtime.calls = []
 
-        def get_lighter_market_config():
-            runtime.calls.append("get_lighter_market_config")
-            return 92, 1000, 100
-
-        async def handle_lighter_ws():
-            runtime.calls.append("handle_lighter_ws")
-
-        async def wait_for_lighter_order_book_ready():
-            await asyncio.sleep(0)
-            runtime.calls.append("wait_for_lighter_order_book_ready")
+        class Gateway:
+            async def set_market(self, symbol, depth_notional, timeout):
+                runtime.calls.append(("set_market", symbol, depth_notional))
+                return 92
 
         async def reset_lighter_order_book():
             runtime.calls.append("reset_lighter_order_book")
@@ -437,9 +431,7 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
         async def reset_state_for_asset_switch():
             runtime.calls.append("reset_state_for_asset_switch")
 
-        runtime.get_lighter_market_config = get_lighter_market_config
-        runtime.handle_lighter_ws = handle_lighter_ws
-        runtime.wait_for_lighter_order_book_ready = wait_for_lighter_order_book_ready
+        runtime.lighter_gateway = Gateway()
         runtime.reset_lighter_order_book = reset_lighter_order_book
         runtime._reset_state_for_asset_switch = reset_state_for_asset_switch
         runtime.logger = type("Logger", (), {"info": lambda *args, **kwargs: None})()
@@ -449,37 +441,31 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime.ticker, "BTC")
         self.assertEqual(runtime.variational_ticker, "BTC")
         self.assertEqual(runtime.lighter_market_index, 92)
-        self.assertEqual(runtime.base_amount_multiplier, 1000)
-        self.assertEqual(runtime.price_multiplier, 100)
         self.assertEqual(
             runtime.calls,
             [
-                "get_lighter_market_config",
                 "reset_lighter_order_book",
                 "reset_state_for_asset_switch",
-                "handle_lighter_ws",
-                "wait_for_lighter_order_book_ready",
+                ("set_market", "BTC", Decimal("2000.0")),
             ],
         )
 
     async def test_activate_variational_cl_uses_lighter_wti(self):
         runtime = object.__new__(VariationalToLighterRuntime)
-        runtime.args = argparse.Namespace(auto_hedge=False)
+        runtime.args = argparse.Namespace(auto_hedge=False, depth_notional=2000.0)
         runtime.variational_ticker = None
         runtime.ticker = None
         runtime._asset_switch_lock = asyncio.Lock()
-        runtime.lighter_ws_task = None
 
-        def get_lighter_market_config():
-            self.assertEqual(runtime.ticker, "WTI")
-            return 93, 100, 1000
+        class Gateway:
+            async def set_market(_self, symbol, depth_notional, timeout):
+                self.assertEqual(symbol, "WTI")
+                return 93
 
         async def noop():
             return None
 
-        runtime.get_lighter_market_config = get_lighter_market_config
-        runtime.handle_lighter_ws = noop
-        runtime.wait_for_lighter_order_book_ready = noop
+        runtime.lighter_gateway = Gateway()
         runtime.reset_lighter_order_book = noop
         runtime._reset_state_for_asset_switch = noop
         runtime.logger = type("Logger", (), {"info": lambda *args, **kwargs: None})()

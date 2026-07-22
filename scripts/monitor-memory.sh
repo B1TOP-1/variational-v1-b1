@@ -42,6 +42,7 @@ classify_process() {
     *--type=utility*) printf '%s' 'chrome-utility' ;;
     *google-chrome*|*chromium*) printf '%s' 'chrome-browser' ;;
     *python*main.py*) printf '%s' 'variational-main' ;;
+    *variational_lighter_gateway*) printf '%s' 'lighter-rust' ;;
     *astro-core*) printf '%s' 'astro-core' ;;
     *sub2api*) printf '%s' 'sub2api' ;;
     *) printf '%s' 'other' ;;

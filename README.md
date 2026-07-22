@@ -49,6 +49,32 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
+### Lighter Rust 全流程
+
+Lighter 的公共订单簿、指定美元深度 VWAP、市场精度、nonce、原生签名、HTTP
+下单/撤单、私有 WebSocket、成交与仓位均由 `bybot/lighter` 的常驻 Rust gateway
+持有。Python 不再依赖 `lighter-sdk`，也不再维护第二份 Lighter 订单簿或账户流。
+
+首次部署需要同时克隆 bybot 并构建 release binary：
+
+```bash
+mkdir -p ~/git/bybot
+git clone git@github.com:B1TOP-1/bybot.git ~/git/bybot/bybot
+
+cd ~/git/var/variational-v1
+./scripts/build-lighter-rust.sh
+```
+
+默认 binary 路径是
+`~/git/bybot/bybot/lighter/target/release/variational_lighter_gateway`。自定义位置可在
+`.env` 设置 `LIGHTER_RUST_GATEWAY_BIN=/absolute/path/variational_lighter_gateway`。
+日常启动命令仍是 `python main.py`，主程序会启动和回收 gateway。`--no-hedge`
+会让 gateway 进入只读行情模式，不读取私钥、不启动私有账户流。
+
+完整执行模式必须部署在能访问 Lighter 标准 `wss://.../stream` 的 VPS。受限地区只能
+连接 `?readonly=true`，可以看行情但不能取得认证私有账户快照，因此程序会保持未就绪，
+不能用于自动对冲。Rust gateway 运行中退出或订单簿失效时，Python 会清空旧报价并停止策略。
+
 如需在 Lighter WebSocket 新旧逻辑切换期间临时强制使用旧的应用层 ping/pong 逻辑，可额外设置：
 ```bash
 LIGHTER_WS_SERVER_PINGS=true

@@ -4,6 +4,7 @@ import logging
 import tempfile
 import time
 import unittest
+from unittest.mock import AsyncMock
 from asyncio import Future
 from decimal import Decimal
 from pathlib import Path
@@ -54,8 +55,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
         runtime = VariationalToLighterRuntime(args)
 
-        self.assertEqual(runtime.account_index, 0)
-        self.assertEqual(runtime.api_key_index, 0)
+        self.assertIsNone(runtime.lighter_gateway.process)
 
     def test_session_log_paths_are_isolated_and_runtime_time_is_utc_plus_8(self):
         runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
@@ -896,14 +896,14 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
     def test_quantize_to_lighter_lot_floors_to_step(self):
         rt = self._runtime()
-        rt.base_amount_multiplier = 1000  # 最小步长 0.001
+        rt.lighter_gateway.size_multiplier = 1000  # 最小步长 0.001
         self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0015")), Decimal("0.001"))
         self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.012")), Decimal("0.012"))
         self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0005")), Decimal("0"))
 
     def test_quantize_passthrough_without_multiplier(self):
         rt = self._runtime()
-        rt.base_amount_multiplier = 0
+        rt.lighter_gateway.size_multiplier = None
         self.assertEqual(rt._quantize_to_lighter_lot(Decimal("0.0015")), Decimal("0.0015"))
 
     async def test_lighter_fill_pops_mapping(self):
@@ -923,22 +923,49 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         await rt.handle_lighter_fill_update(
             {
-                "status": "filled",
-                "client_order_id": 123,
-                "filled_quote_amount": "40",
-                "filled_base_amount": "0.01",
+                "kind": "fill",
+                "client_order_index": 123,
+                "price": "4000",
+                "quantity": "0.01",
             }
         )
 
         self.assertNotIn(123, rt.lighter_client_order_to_trade_key)
         self.assertEqual(rt.records[key].lighter_fill_price, Decimal("4000"))
 
+    async def test_rust_partial_fills_accumulate_vwap_until_complete(self):
+        rt = self._runtime()
+        key = "strategy:partial"
+        rt.records[key] = OrderLifecycle(
+            trade_key=key,
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.01"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        rt.lighter_client_order_to_trade_key[88] = key
+
+        await rt.handle_lighter_fill_update(
+            {"kind": "fill", "client_order_index": 88, "price": "100", "quantity": "0.004"}
+        )
+        self.assertIn(88, rt.lighter_client_order_to_trade_key)
+        self.assertIsNone(rt.records[key].lighter_fill_ts_iso)
+
+        await rt.handle_lighter_fill_update(
+            {"kind": "fill", "client_order_index": 88, "price": "110", "quantity": "0.006"}
+        )
+        self.assertNotIn(88, rt.lighter_client_order_to_trade_key)
+        self.assertEqual(rt.records[key].lighter_fill_price, Decimal("106"))
+        self.assertIsNotNone(rt.records[key].lighter_fill_ts_iso)
+
     async def test_immediate_lighter_fill_is_mapped_before_create_order_returns(self):
         rt = self._runtime()
         rt.args.auto_hedge = True
-        rt.base_amount_multiplier = 1000
-        rt.price_multiplier = 100
+        rt.lighter_gateway.size_multiplier = 1000
         rt.lighter_market_index = 1
+        rt.ticker = "BTC"
 
         async def best_prices():
             return Decimal("66000"), Decimal("66001")
@@ -956,20 +983,17 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt.records[record.trade_key] = record
         rt.record_order.append(record.trade_key)
 
-        class ImmediateFillClient:
-            ORDER_TYPE_LIMIT = 0
-            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 0
-
-            async def create_order(self, **kwargs):
+        class ImmediateFillGateway:
+            async def place_order(self, **kwargs):
                 await rt.handle_lighter_fill_update({
-                    "status": "filled",
-                    "client_order_id": kwargs["client_order_index"],
-                    "filled_quote_amount": "66.2",
-                    "filled_base_amount": "0.001",
+                    "kind": "fill",
+                    "client_order_index": kwargs["client_order_index"],
+                    "price": "66200",
+                    "quantity": "0.001",
                 })
-                return None, "tx-test", None
+                return "tx-test"
 
-        rt.lighter_client = ImmediateFillClient()
+        rt.lighter_gateway = ImmediateFillGateway()
 
         await rt.place_lighter_order(record)
 
@@ -994,7 +1018,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt.lighter_client_order_to_trade_key[7] = key
 
         await rt.handle_lighter_fill_update(
-            {"status": "filled", "client_order_id": 7, "filled_quote_amount": "40", "filled_base_amount": "0.01"}
+            {"kind": "fill", "client_order_index": 7, "price": "4000", "quantity": "0.01"}
         )
 
         self.assertEqual(rt._stat_lighter_latency.n, 1)
@@ -1054,15 +1078,32 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt._on_api_quote("BTC", "100", "101", None)  # 非活跃标的，忽略
         self.assertEqual(rt.quote_comparator.snapshot()["transitions"]["api"], 0)
 
-    def test_parse_lighter_positions_applies_sign(self):
-        parsed = VariationalToLighterRuntime._parse_lighter_positions(
-            {"positions": {"1": {"symbol": "BTC", "sign": -1, "position": "0.004"}}}
+    async def test_rust_position_event_updates_authoritative_position(self):
+        rt = self._runtime()
+        await rt._handle_lighter_rust_event(
+            {"type": "position", "symbol": "BTC", "market_id": 1, "quantity": "-0.004"}
         )
-        self.assertEqual(parsed["BTC"], Decimal("-0.004"))
+        self.assertEqual(rt._lighter_positions["BTC"], Decimal("-0.004"))
+
+    async def test_rust_gateway_disconnect_halts_auto_hedge_and_clears_book(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+        rt.stop_flag = False
+        rt.lighter_order_book_ready = True
+        rt.lighter_best_bid = Decimal("100")
+        rt.lighter_best_ask = Decimal("101")
+
+        await rt._handle_lighter_rust_event(
+            {"type": "health", "ready": False, "error": "gateway exited with code 1"}
+        )
+
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("Lighter Rust断开", rt._halt_reason)
+        self.assertFalse(rt.lighter_order_book_ready)
 
     def test_positions_balanced_requires_opposite_legs(self):
         rt = self._runtime()
-        rt.base_amount_multiplier = 1000  # 容差 0.001
+        rt.lighter_gateway.size_multiplier = 1000  # 容差 0.001
         rt.ticker = "BTC"
         rt._cached_position_qty = Decimal("0.01")  # Var 多
         rt._lighter_positions = {"BTC": Decimal("-0.01")}  # Lighter 空
@@ -1072,7 +1113,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
     def test_strategy_order_allowed_gate(self):
         rt = self._runtime()
-        rt.base_amount_multiplier = 1000
+        rt.lighter_gateway.size_multiplier = 1000
         rt.ticker = "BTC"
         rt.args.auto_hedge = True
         rt._cached_position_qty = Decimal("0.01")
@@ -1088,7 +1129,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         import main as main_mod
 
         rt = self._runtime()
-        rt.base_amount_multiplier = 1000
+        rt.lighter_gateway.size_multiplier = 1000
         rt.ticker = "BTC"
         rt.args.auto_hedge = True
         rt._lighter_position_ready.set()  # 跳过 REST 兜底
@@ -1108,23 +1149,29 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(rt._strategy_halted)
 
-    async def test_warm_lighter_skips_without_hedge(self):
+    async def test_warm_lighter_starts_readonly_gateway_without_hedge(self):
         rt = self._runtime()
         rt.args.auto_hedge = False
+        called = []
+
+        async def start():
+            called.append(True)
+
+        rt.lighter_gateway.start = start
         await rt.warm_lighter()
-        self.assertFalse(rt._lighter_ready)
+        self.assertTrue(rt._lighter_ready)
+        self.assertEqual(called, [True])
 
     async def test_warm_lighter_sets_ready_on_success(self):
         rt = self._runtime()
         rt.args.auto_hedge = True
-        rt.initialize_lighter_client = lambda: None
-        rt._rest_get_lighter_account = lambda: {}
+        rt.lighter_gateway.start = AsyncMock()
         await rt.warm_lighter()
         self.assertTrue(rt._lighter_ready)
 
     async def test_confirm_hedge_ok_when_balanced(self):
         rt = self._runtime()
-        rt.base_amount_multiplier = 1000
+        rt.lighter_gateway.size_multiplier = 1000
         rt.ticker = "BTC"
         rt.args.auto_hedge = True
         rt._lighter_position_ready.set()

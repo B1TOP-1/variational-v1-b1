@@ -19,11 +19,8 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-import requests
 import websockets
 from dotenv import load_dotenv
-from lighter.signer_client import SignerClient
-from sortedcontainers import SortedDict
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -42,6 +39,7 @@ from variational.listener import (
     VariationalMonitor,
     run_receiver_server,
 )
+from variational.lighter_rust import RustLighterGateway
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue, run_browser_order_broker
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 from variational.quote_comparator import QuoteComparator
@@ -103,9 +101,6 @@ CST_TZ = timezone(timedelta(hours=8))
 DASHBOARD_FIXED_OVERHEAD_LINES = 30
 ASSET_SWITCH_CONFIRM_TICKS = 3
 PENDING_TRIGGER_SPREAD_TTL_SECONDS = 30.0
-LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
-LIGHTER_WS_PING_INTERVAL_SECONDS = 30
-LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 BINANCE_USDCUSDT_WS_URL = "wss://data-stream.binance.vision/ws/usdcusdt@bookTicker"
 
 
@@ -156,36 +151,6 @@ def resolve_variational_ticker(ticker: str) -> str:
 def resolve_lighter_ticker(variational_asset: str) -> str:
     asset = variational_asset.upper()
     return VARIATIONAL_ASSET_TO_LIGHTER_TICKER.get(asset, asset)
-
-
-def required_env(name: str) -> str:
-    value = os.getenv(name, "").strip()
-    if not value:
-        raise RuntimeError(f"{name} is not set")
-    return value
-
-
-def required_int_env(name: str) -> int:
-    value = required_env(name)
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer, got: {value}") from exc
-
-
-def optional_int_env(name: str, default: int = 0) -> int:
-    value = os.getenv(name, "").strip()
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer, got: {value}") from exc
-
-
-def env_flag(name: str) -> bool:
-    value = os.getenv(name, "").strip().lower()
-    return value in {"1", "true", "yes", "on"}
 
 
 def spread_value(aggressive_buy_ask: Decimal | None, aggressive_sell_bid: Decimal | None) -> Decimal | None:
@@ -282,6 +247,8 @@ class OrderLifecycle:
     lighter_side: str | None = None
     lighter_client_order_id: int | None = None
     lighter_fill_price: Decimal | None = None
+    lighter_filled_qty: Decimal = Decimal("0")
+    lighter_filled_quote: Decimal = Decimal("0")
     lighter_fill_ts_iso: str | None = None
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
@@ -508,37 +475,19 @@ class VariationalToLighterRuntime:
 
         self.trade_event_cursor = 0
 
-        self.lighter_base_url = "https://mainnet.zklighter.elliot.ai"
-        if self.args.browser_smoke_test:
-            self.account_index = optional_int_env("LIGHTER_ACCOUNT_INDEX", 0)
-            self.api_key_index = optional_int_env("LIGHTER_API_KEY_INDEX", 0)
-        else:
-            self.account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
-            self.api_key_index = required_int_env("LIGHTER_API_KEY_INDEX")
-        self.lighter_client: SignerClient | None = None
-        self._lighter_signer_lock = asyncio.Lock()
-        # Lighter REST 连接复用 + 预热就绪标志。
-        self._lighter_http_session = requests.Session()
-        self._lighter_http_session.headers.update({"accept": "application/json"})
+        self.lighter_gateway = RustLighterGateway(
+            execution_enabled=self.args.auto_hedge,
+            event_handler=self._handle_lighter_rust_event,
+            log_handler=lambda message: self.logger.warning("Lighter Rust: %s", message),
+        )
         self._lighter_ready = False
-        self._lighter_warm_task: asyncio.Task[None] | None = None
 
         self.lighter_market_index = 0
-        self.base_amount_multiplier = 0
-        self.price_multiplier = 0
-
-        # Price-keyed SortedDict per side so best bid/ask is O(log n) instead of
-        # scanning every level on each book update.
-        self.lighter_order_book = {"bids": SortedDict(), "asks": SortedDict()}
         self.lighter_best_bid: Decimal | None = None
         self.lighter_best_ask: Decimal | None = None
-        self.lighter_order_book_offset = 0
+        self.lighter_vwap_bid: Decimal | None = None
+        self.lighter_vwap_ask: Decimal | None = None
         self.lighter_order_book_ready = False
-        self.lighter_snapshot_loaded = False
-        self.lighter_order_book_sequence_gap = False
-        self.lighter_order_book_lock = asyncio.Lock()
-
-        self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
         self.binance_usdc_task: asyncio.Task[None] | None = None
@@ -569,7 +518,6 @@ class VariationalToLighterRuntime:
         # Lighter 真实账户仓位（account_all 频道，按 symbol）+ 双腿平衡闸状态。
         self._lighter_positions: dict[str, Decimal] = {}
         self._lighter_position_ready = asyncio.Event()
-        self._lighter_account_task: asyncio.Task[None] | None = None
         self._strategy_halted = False
         self._halt_reason = ""
         self._last_block_log_sig: tuple[str, Any] | None = None
@@ -755,70 +703,28 @@ class VariationalToLighterRuntime:
                 await asyncio.sleep(retry_seconds)
                 retry_seconds = min(30.0, retry_seconds * 2)
 
-    def initialize_lighter_client(self) -> SignerClient:
-        if self.lighter_client is None:
-            api_key_private_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or required_env("LIGHTER_PRIVATE_KEY")
-            client = SignerClient(
-                url=self.lighter_base_url,
-                account_index=self.account_index,
-                api_private_keys={self.api_key_index: api_key_private_key},
-            )
-            err = client.check_client()
-            if err is not None:
-                # 校验不过不落地半初始化的 client，否则重试会跳过校验。
-                raise RuntimeError(f"CheckClient error: {err}")
-            self.lighter_client = client
-        return self.lighter_client
-
     async def warm_lighter(self) -> None:
-        """Lighter 预热（分步 + 重试）：建签名客户端 + 校验 + 暖一次 REST（复用连接）。"""
-        if not self.args.auto_hedge:
-            return
+        """Start the Rust-owned market-data and optional execution gateway."""
         has_pk = bool(os.getenv("API_KEY_PRIVATE_KEY", "").strip() or os.getenv("LIGHTER_PRIVATE_KEY", "").strip())
         self.logger.info(
-            "Lighter 预热开始: url=%s account_index=%s api_key_index=%s 私钥=%s",
-            self.lighter_base_url,
-            self.account_index,
-            self.api_key_index,
-            "已设置" if has_pk else "缺失(检查 LIGHTER_PRIVATE_KEY / API_KEY_PRIVATE_KEY)",
+            "Lighter Rust启动: execution=%s binary=%s 私钥=%s",
+            self.args.auto_hedge,
+            self.lighter_gateway.binary,
+            "已设置" if has_pk else "只读模式/缺失",
         )
         while not self.stop_flag and not self._lighter_ready:
-            step = "建签名客户端/check_client"
             try:
-                # SignerClient 内部依赖运行中的事件循环，必须在主循环里建，勿丢线程。
-                self.initialize_lighter_client()
-                step = "REST account 查询"
-                await asyncio.to_thread(self._rest_get_lighter_account)
+                await self.lighter_gateway.start()
                 self._lighter_ready = True
-                self.logger.info("Lighter 预热完成：签名客户端就绪 + REST 连接复用")
+                self.logger.info("Lighter Rust就绪：订单簿/签名/执行/私有账户由Rust持有")
                 return
             except Exception as exc:
                 self.logger.warning(
-                    "Lighter 预热失败[%s]，%.0fs 后重试: %r",
-                    step,
+                    "Lighter Rust启动失败，%.0fs 后重试: %r",
                     LIGHTER_WARM_RETRY_SECONDS,
                     exc,
                 )
                 await asyncio.sleep(LIGHTER_WARM_RETRY_SECONDS)
-
-    def get_lighter_market_config(self) -> tuple[int, int, int]:
-        if not self.ticker:
-            raise RuntimeError("Ticker is not resolved yet")
-        response = requests.get(
-            f"{self.lighter_base_url}/api/v1/orderBooks",
-            headers={"accept": "application/json"},
-            timeout=10,
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        for market in data.get("order_books", []):
-            if market.get("symbol") == self.ticker:
-                price_decimals = int(market["supported_price_decimals"])
-                size_decimals = int(market["supported_size_decimals"])
-                return int(market["market_id"]), pow(10, size_decimals), pow(10, price_decimals)
-
-        raise RuntimeError(f"Ticker {self.ticker} not found in Lighter order books")
 
     async def detect_current_variational_asset(self) -> str | None:
         async with self.runtime.monitor._lock:
@@ -884,16 +790,13 @@ class VariationalToLighterRuntime:
                 resolve_variational_ticker(next_ticker),
             }
 
-            self.lighter_market_index, self.base_amount_multiplier, self.price_multiplier = self.get_lighter_market_config()
             await self.reset_lighter_order_book()
             await self._reset_state_for_asset_switch()
-
-            if self.lighter_ws_task and not self.lighter_ws_task.done():
-                self.lighter_ws_task.cancel()
-                await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
-
-            self.lighter_ws_task = asyncio.create_task(self.handle_lighter_ws())
-            await self.wait_for_lighter_order_book_ready()
+            self.lighter_market_index = await self.lighter_gateway.set_market(
+                self.ticker,
+                Decimal(str(self.args.depth_notional)),
+                timeout=READY_TIMEOUT_SECONDS,
+            )
             self.logger.info(
                 "Switched market (%s): variational_asset=%s -> lighter_ticker=%s market_id=%s",
                 reason,
@@ -913,72 +816,80 @@ class VariationalToLighterRuntime:
         raise RuntimeError("Timed out waiting for Variational events stream heartbeat")
 
     async def wait_for_lighter_order_book_ready(self) -> None:
-        deadline = time.time() + READY_TIMEOUT_SECONDS
-        while not self.stop_flag and time.time() < deadline:
-            if self.lighter_order_book_ready:
-                return
-            await asyncio.sleep(0.2)
-        raise RuntimeError("Timed out waiting for Lighter order book")
+        await asyncio.wait_for(self.lighter_gateway.book_ready.wait(), timeout=READY_TIMEOUT_SECONDS)
 
     async def reset_lighter_order_book(self) -> None:
-        async with self.lighter_order_book_lock:
-            self.lighter_order_book["bids"].clear()
-            self.lighter_order_book["asks"].clear()
-            self.lighter_order_book_offset = 0
+        self.lighter_gateway.book_ready.clear()
+        self.lighter_order_book_ready = False
+        self.lighter_best_bid = None
+        self.lighter_best_ask = None
+        self.lighter_vwap_bid = None
+        self.lighter_vwap_ask = None
+
+    async def _handle_lighter_rust_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("type")
+        if event_type == "book":
+            if not event.get("ready"):
+                self.lighter_order_book_ready = False
+                self.lighter_best_bid = None
+                self.lighter_best_ask = None
+                self.lighter_vwap_bid = None
+                self.lighter_vwap_ask = None
+                return
+            self.lighter_market_index = int(event.get("market_id", 0) or 0)
+            self.lighter_best_bid = to_decimal(event.get("bid"))
+            self.lighter_best_ask = to_decimal(event.get("ask"))
+            self.lighter_vwap_bid = to_decimal(event.get("vwap_bid"))
+            self.lighter_vwap_ask = to_decimal(event.get("vwap_ask"))
+            self.lighter_order_book_ready = self.lighter_best_bid is not None and self.lighter_best_ask is not None
+            self._strategy_wake.set()
+            return
+        if event_type == "health" and not event.get("ready"):
+            self._lighter_ready = False
             self.lighter_order_book_ready = False
-            self.lighter_snapshot_loaded = False
-            self.lighter_order_book_sequence_gap = False
             self.lighter_best_bid = None
             self.lighter_best_ask = None
-
-    def update_lighter_order_book(self, side: str, levels: list[Any]) -> None:
-        for level in levels:
-            if isinstance(level, list) and len(level) >= 2:
-                price = Decimal(str(level[0]))
-                size = Decimal(str(level[1]))
-            elif isinstance(level, dict):
-                price = Decimal(str(level.get("price", 0)))
-                size = Decimal(str(level.get("size", 0)))
-            else:
-                continue
-
-            if size > 0:
-                self.lighter_order_book[side][price] = size
-            else:
-                self.lighter_order_book[side].pop(price, None)
-
-    def _refresh_lighter_best(self) -> None:
-        """Recompute best bid/ask from the SortedDict books. Caller holds the lock."""
-        bids = self.lighter_order_book["bids"]
-        asks = self.lighter_order_book["asks"]
-        self.lighter_best_bid = bids.peekitem(-1)[0] if bids else None
-        self.lighter_best_ask = asks.peekitem(0)[0] if asks else None
-        # 盘口变动 → 唤醒事件驱动的策略评估。
-        self._strategy_wake.set()
-
-    def validate_order_book_offset(self, new_offset: int) -> bool:
-        return new_offset > self.lighter_order_book_offset
-
-    async def request_fresh_snapshot(self, ws: Any) -> None:
-        await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
-
-    async def handle_lighter_fill_update(self, order: dict[str, Any]) -> None:
-        if order.get("status") != "filled":
+            self.lighter_vwap_bid = None
+            self.lighter_vwap_ask = None
+            if self.args.auto_hedge and not self.stop_flag:
+                self._strategy_halted = True
+                self._halt_reason = f"Lighter Rust断开: {event.get('error') or 'unknown error'}"
+                self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
             return
+        if event_type == "position":
+            symbol = str(event.get("symbol", "")).strip().upper()
+            quantity = to_decimal(event.get("quantity"))
+            if symbol and quantity is not None:
+                self._lighter_positions[symbol] = quantity
+                self._lighter_position_ready.set()
+            return
+        if event_type == "error":
+            self.logger.warning("Lighter Rust事件错误: source=%s error=%s", event.get("source"), event.get("error"))
+            return
+        if event_type != "execution":
+            return
+        kind = str(event.get("kind", ""))
+        if kind == "fill":
+            await self.handle_lighter_fill_update(event)
+        elif kind == "rejected":
+            self.logger.error("Lighter Rust订单拒绝: coid=%s reason=%s", event.get("client_order_index"), event.get("reason"))
 
-        client_order_id_raw = order.get("client_order_id")
+    async def handle_lighter_fill_update(self, event: dict[str, Any]) -> None:
+        client_order_id_raw = event.get("client_order_index") or event.get("client_order_id")
         try:
             client_order_id = int(client_order_id_raw)
         except Exception:
             return
-
-        fill_price: Decimal | None = None
-        filled_quote = to_decimal(order.get("filled_quote_amount"))
-        filled_base = to_decimal(order.get("filled_base_amount"))
-        if filled_quote is not None and filled_base is not None and filled_base != 0:
-            fill_price = filled_quote / filled_base
-
-        now_iso = utc_now()
+        fill_price = to_decimal(event.get("price"))
+        fill_qty = to_decimal(event.get("quantity"))
+        if fill_price is None or fill_qty is None or fill_qty <= 0:
+            return
+        ts_event_ms = event.get("ts_event_ms")
+        now_iso = (
+            datetime.fromtimestamp(float(ts_event_ms) / 1000, tz=timezone.utc).isoformat()
+            if ts_event_ms
+            else utc_now()
+        )
 
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
@@ -992,21 +903,29 @@ class VariationalToLighterRuntime:
             record = self.records.get(trade_key)
             if record is None:
                 return
-            if record.lighter_fill_ts_iso is not None:
+            if record.lighter_filled_qty >= record.qty:
                 return
-
-            record.lighter_fill_ts_iso = now_iso
-            record.lighter_fill_price = fill_price
+            remaining = record.qty - record.lighter_filled_qty
+            applied_qty = min(fill_qty, remaining)
+            record.lighter_filled_qty += applied_qty
+            record.lighter_filled_quote += applied_qty * fill_price
+            record.lighter_fill_price = record.lighter_filled_quote / record.lighter_filled_qty
+            if record.lighter_filled_qty < record.qty:
+                payload = record.to_payload()
+                completed = False
+            else:
+                record.lighter_fill_ts_iso = now_iso
+                completed = True
             self._maybe_record_slippage_stats(record)
             # Lighter 端到端延迟：信号触发 → 收到 Lighter WS 成交（仅策略单）。
             if record.signal_trigger_monotonic is not None and not record.lighter_latency_recorded:
                 self._stat_lighter_latency.add((time.monotonic() - record.signal_trigger_monotonic) * 1000)
                 record.lighter_latency_recorded = True
             payload = record.to_payload()
-            # 成交已回填，映射项不再需要，弹出以释放。
-            self.lighter_client_order_to_trade_key.pop(client_order_id, None)
+            if completed:
+                self.lighter_client_order_to_trade_key.pop(client_order_id, None)
 
-        await self.append_order_log("lighter_fill", payload)
+        await self.append_order_log("lighter_fill" if completed else "lighter_partial_fill", payload)
         logger = getattr(self, "logger", None)
         if logger is not None:
             logger.info(
@@ -1015,7 +934,7 @@ class VariationalToLighterRuntime:
                 client_order_id,
                 record.lighter_side,
                 decimal_to_str(record.qty),
-                decimal_to_str(fill_price),
+                decimal_to_str(record.lighter_fill_price),
                 now_iso,
             )
 
@@ -1197,141 +1116,16 @@ class VariationalToLighterRuntime:
             self.logger.warning("启动时已有仓位但没有可恢复成本账本，本轮保护暂停至仓位归零")
             self._round_ledger_sync_warning_logged = True
 
-    def build_lighter_ws_url(self) -> str:
-        params: list[str] = []
-        if not self.args.auto_hedge:
-            params.append("readonly=true")
-        if env_flag("LIGHTER_WS_SERVER_PINGS"):
-            params.append("server_pings=true")
-        if params:
-            return f"{LIGHTER_WS_URL}?{'&'.join(params)}"
-        return LIGHTER_WS_URL
-
-    async def handle_lighter_ws(self) -> None:
-        while not self.stop_flag:
-            try:
-                await self.reset_lighter_order_book()
-                url = self.build_lighter_ws_url()
-                async with websockets.connect(
-                    url,
-                    ping_interval=LIGHTER_WS_PING_INTERVAL_SECONDS,
-                    ping_timeout=LIGHTER_WS_PING_TIMEOUT_SECONDS,
-                ) as ws:
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
-
-                    if self.args.auto_hedge:
-                        account_orders_channel = f"account_orders/{self.lighter_market_index}/{self.account_index}"
-                        try:
-                            async with self._lighter_signer_lock:
-                                if not self.lighter_client:
-                                    self.initialize_lighter_client()
-                                auth_token, err = self.lighter_client.create_auth_token_with_expiry(
-                                    api_key_index=self.api_key_index
-                                )
-                            if err is None:
-                                await ws.send(
-                                    json.dumps(
-                                        {
-                                            "type": "subscribe",
-                                            "channel": account_orders_channel,
-                                            "auth": auth_token,
-                                        }
-                                    )
-                                )
-                            else:
-                                self.logger.warning("Failed to create Lighter WS auth token: %s", err)
-                        except Exception as exc:
-                            self.logger.warning("Error creating Lighter WS auth token: %s", exc)
-
-                    while not self.stop_flag:
-                        raw = await ws.recv()
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", errors="replace")
-                        data = json.loads(raw)
-                        msg_type = data.get("type")
-
-                        if msg_type == "subscribed/order_book":
-                            async with self.lighter_order_book_lock:
-                                self.lighter_order_book["bids"].clear()
-                                self.lighter_order_book["asks"].clear()
-                                order_book = data.get("order_book", {})
-                                self.lighter_order_book_offset = int(order_book.get("offset", 0) or 0)
-                                self.update_lighter_order_book("bids", order_book.get("bids", []))
-                                self.update_lighter_order_book("asks", order_book.get("asks", []))
-                                self.lighter_snapshot_loaded = True
-                                self.lighter_order_book_ready = True
-                                self._refresh_lighter_best()
-
-                        elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
-                            order_book = data.get("order_book", {})
-                            if "offset" not in order_book:
-                                continue
-                            new_offset = int(order_book["offset"])
-                            async with self.lighter_order_book_lock:
-                                if not self.validate_order_book_offset(new_offset):
-                                    self.lighter_order_book_sequence_gap = True
-                                else:
-                                    self.update_lighter_order_book("bids", order_book.get("bids", []))
-                                    self.update_lighter_order_book("asks", order_book.get("asks", []))
-                                    self.lighter_order_book_offset = new_offset
-                                    self._refresh_lighter_best()
-
-                        elif msg_type == "update/account_orders":
-                            orders = data.get("orders", {}).get(str(self.lighter_market_index), [])
-                            for order in orders:
-                                await self.handle_lighter_fill_update(order)
-
-                        if self.lighter_order_book_sequence_gap:
-                            await self.request_fresh_snapshot(ws)
-                            self.lighter_order_book_sequence_gap = False
-
-                        if msg_type == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                self.logger.warning(
-                    "Lighter websocket reconnect after error: %s (url=%s)",
-                    exc,
-                    self.build_lighter_ws_url(),
-                )
-                await asyncio.sleep(1)
-
     async def get_lighter_best_bid_ask(self) -> tuple[Decimal | None, Decimal | None]:
-        async with self.lighter_order_book_lock:
-            return self.lighter_best_bid, self.lighter_best_ask
+        return self.lighter_gateway.best_bid, self.lighter_gateway.best_ask
 
     async def get_lighter_depth_quote(self, notional: Decimal) -> tuple[Decimal | None, Decimal | None]:
-        """VWAP bid/ask to fill `notional` (USDT) along the Lighter book."""
-        async with self.lighter_order_book_lock:
-            return (
-                self._lighter_vwap_locked("bids", notional),
-                self._lighter_vwap_locked("asks", notional),
+        configured = Decimal(str(self.args.depth_notional))
+        if notional != configured:
+            raise RuntimeError(
+                f"Rust Lighter gateway depth is configured for {configured}, requested {notional}"
             )
-
-    def _lighter_vwap_locked(self, book_side: str, notional: Decimal) -> Decimal | None:
-        """Volume-weighted avg price to consume `notional` (USDT) on one book side.
-        bids walked high->low (we sell), asks low->high (we buy). Caller holds the
-        lock. If depth < notional, returns the VWAP of all available depth."""
-        book = self.lighter_order_book[book_side]
-        if not book or notional <= 0:
-            return None
-        prices = reversed(book) if book_side == "bids" else iter(book)
-        remaining = notional
-        total_base = Decimal("0")
-        total_quote = Decimal("0")
-        for price in prices:
-            level_notional = price * book[price]
-            take = level_notional if level_notional < remaining else remaining
-            total_quote += take
-            total_base += take / price
-            remaining -= take
-            if remaining <= 0:
-                break
-        if total_base <= 0:
-            return None
-        return total_quote / total_base
+        return self.lighter_gateway.vwap_bid, self.lighter_gateway.vwap_ask
 
     async def get_variational_best_bid_ask(self, preferred_asset: str | None):
         async with self.runtime.monitor._lock:
@@ -1396,16 +1190,6 @@ class VariationalToLighterRuntime:
             is_ask = True
             limit_price = best_bid * (Decimal("1") - slippage)
 
-        base_amount = int(record.qty * self.base_amount_multiplier)
-        if base_amount <= 0:
-            async with self._record_lock:
-                record.hedge_error = f"Hedge base amount rounds to zero ({record.qty})"
-                payload = record.to_payload()
-            self.logger.warning("Lighter 对冲失败(数量向下取整为0): key=%s qty=%s multiplier=%s", record.trade_key, decimal_to_str(record.qty), self.base_amount_multiplier)
-            await self.append_order_log("lighter_error", payload)
-            return
-
-        price_i = int(limit_price * self.price_multiplier)
         async with self._record_lock:
             client_order_id = int(time.time() * 1000)
             while client_order_id in self.lighter_client_order_to_trade_key:
@@ -1417,23 +1201,14 @@ class VariationalToLighterRuntime:
             self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
 
         try:
-            async with self._lighter_signer_lock:
-                if not self.lighter_client:
-                    self.initialize_lighter_client()
-                _, tx_hash, error = await self.lighter_client.create_order(
-                    market_index=self.lighter_market_index,
-                    client_order_index=client_order_id,
-                    base_amount=base_amount,
-                    price=price_i,
-                    is_ask=is_ask,
-                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
-                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
-                    reduce_only=False,
-                    trigger_price=0,
-                )
-
-            if error is not None:
-                raise RuntimeError(f"Sign error: {error}")
+            signed_quantity = -record.qty if is_ask else record.qty
+            tx_hash = await self.lighter_gateway.place_order(
+                symbol=self.ticker or "",
+                client_order_index=client_order_id,
+                signed_quantity=signed_quantity,
+                limit_price=limit_price,
+                reduce_only=False,
+            )
 
             async with self._record_lock:
                 record.lighter_tx_hash = tx_hash
@@ -1443,8 +1218,13 @@ class VariationalToLighterRuntime:
                     oldest = next(iter(self.lighter_client_order_to_trade_key))
                     self.lighter_client_order_to_trade_key.pop(oldest, None)
             self.logger.info(
-                "Lighter 对冲已下单: key=%s side=%s base_amount=%s price=%s coid=%s",
-                record.trade_key, side, base_amount, price_i, client_order_id,
+                "Lighter Rust对冲已下单: key=%s side=%s qty=%s limit_price=%s coid=%s tx=%s",
+                record.trade_key,
+                side,
+                decimal_to_str(record.qty),
+                decimal_to_str(limit_price),
+                client_order_id,
+                tx_hash,
             )
         except Exception as exc:
             async with self._record_lock:
@@ -1456,97 +1236,11 @@ class VariationalToLighterRuntime:
             self.logger.warning("Lighter 对冲失败(下单异常): key=%s side=%s error=%s", record.trade_key, side, exc)
             await self.append_order_log("lighter_error", payload)
 
-    @staticmethod
-    def _parse_lighter_positions(data: dict[str, Any]) -> dict[str, Decimal]:
-        """从 account_all 消息解析 {symbol: 带符号仓位}（position * sign）。"""
-        result: dict[str, Decimal] = {}
-        positions = data.get("positions", {})
-        if isinstance(positions, dict):
-            pos_iter: Any = positions.values()
-        elif isinstance(positions, list):
-            pos_iter = positions
-        else:
-            return result
-        for pos in pos_iter:
-            if not isinstance(pos, dict):
-                continue
-            symbol = str(pos.get("symbol", "")).strip().upper()
-            if not symbol:
-                continue
-            qty = to_decimal(pos.get("position"))
-            if qty is None:
-                continue
-            try:
-                sign = int(pos.get("sign", 1))
-            except (TypeError, ValueError):
-                sign = 1
-            result[symbol] = qty * sign
-        return result
-
-    async def lighter_account_ws(self) -> None:
-        """订阅 account_all/{account_index}（公开频道）实时追踪 Lighter 真实仓位。"""
-        while not self.stop_flag:
-            try:
-                async with websockets.connect(LIGHTER_WS_URL, ping_interval=20, ping_timeout=20) as ws:
-                    first = await asyncio.wait_for(ws.recv(), timeout=10)
-                    if json.loads(first).get("type") != "connected":
-                        self.logger.warning("Lighter account WS: 未收到 connected")
-                    await ws.send(json.dumps({"type": "subscribe", "channel": f"account_all/{self.account_index}"}))
-                    self.logger.info("已订阅 Lighter account_all/%s", self.account_index)
-                    while not self.stop_flag:
-                        raw = await ws.recv()
-                        if isinstance(raw, bytes):
-                            raw = raw.decode("utf-8", errors="replace")
-                        data = json.loads(raw)
-                        msg_type = data.get("type", "")
-                        if msg_type == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-                            continue
-                        if msg_type in ("subscribed/account_all", "update/account_all"):
-                            self._lighter_positions.update(self._parse_lighter_positions(data))
-                            self._lighter_position_ready.set()
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                self.logger.warning("Lighter account WS 重连: %s", exc)
-                await asyncio.sleep(1.0)
-
-    def _rest_get_lighter_account(self) -> dict[str, Any]:
-        response = self._lighter_http_session.get(
-            f"{self.lighter_base_url}/api/v1/account",
-            params={"by": "index", "value": self.account_index},
-            timeout=10,
-        )
-        response.raise_for_status()
-        return response.json() if response.text.strip() else {}
-
-    async def _fetch_lighter_position_rest(self) -> Decimal | None:
-        """REST 兜底：WS 未就绪时查询 Lighter 真实仓位。"""
-        try:
-            data = await asyncio.to_thread(self._rest_get_lighter_account)
-        except Exception as exc:
-            self.logger.warning("Lighter REST 仓位查询失败: %s", exc)
-            return None
-        accounts = data.get("accounts") if isinstance(data, dict) else None
-        if not accounts:
-            return None
-        for position in accounts[0].get("positions", []):
-            if str(position.get("symbol", "")).strip().upper() == (self.ticker or "").strip().upper():
-                qty = to_decimal(position.get("position"))
-                if qty is None:
-                    return None
-                try:
-                    sign = int(position.get("sign", 1))
-                except (TypeError, ValueError):
-                    sign = 1
-                return qty * sign
-        return Decimal("0")
-
     def _current_lighter_position(self) -> Decimal:
         return self._lighter_positions.get((self.ticker or "").strip().upper(), Decimal("0"))
 
     def _balance_tolerance(self) -> Decimal:
-        multiplier = self.base_amount_multiplier
+        multiplier = self.lighter_gateway.size_multiplier
         if not multiplier or multiplier <= 0:
             return Decimal("0")
         return Decimal("1") / Decimal(multiplier)  # 1 个最小步长
@@ -1581,10 +1275,6 @@ class VariationalToLighterRuntime:
         if not self.args.auto_hedge:
             await self._refresh_position_cache_after_fill(prev_var_qty)
             return
-        if not self._lighter_position_ready.is_set():
-            rest = await self._fetch_lighter_position_rest()
-            if rest is not None:
-                self._lighter_positions[(self.ticker or "").strip().upper()] = rest
         deadline = time.monotonic() + POSITION_BALANCE_TIMEOUT_SECONDS
         while time.monotonic() < deadline and not self.stop_flag:
             var_pos = await self._read_listener_position()
@@ -1696,7 +1386,7 @@ class VariationalToLighterRuntime:
 
     def _quantize_to_lighter_lot(self, qty: Decimal) -> Decimal:
         """把下单量向下对齐到 Lighter 最小步长，保证两腿数量完全一致、Lighter 侧不再截断。"""
-        multiplier = self.base_amount_multiplier
+        multiplier = self.lighter_gateway.size_multiplier
         if not multiplier or multiplier <= 0:
             return qty  # 未解析到 lot（Var 单边），保持原样
         units = int(qty * multiplier)  # floor 到整数 lot
@@ -3915,8 +3605,7 @@ class VariationalToLighterRuntime:
 
         await self.wait_for_variational_ready()
         self.logger.info("Variational heartbeat is live")
-        if self.args.auto_hedge:
-            self._lighter_warm_task = asyncio.create_task(self.warm_lighter())
+        await self.warm_lighter()
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
 
@@ -3926,9 +3615,6 @@ class VariationalToLighterRuntime:
         self.trade_task = asyncio.create_task(self.trade_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
         self._strategy_task = asyncio.create_task(self.strategy_loop())
-        if self.args.auto_hedge:
-            self._lighter_account_task = asyncio.create_task(self.lighter_account_ws())
-
         while not self.stop_flag:
             await asyncio.sleep(0.25)
 
@@ -3952,30 +3638,8 @@ class VariationalToLighterRuntime:
             self._strategy_task.cancel()
             await asyncio.gather(self._strategy_task, return_exceptions=True)
 
-        if self._lighter_account_task and not self._lighter_account_task.done():
-            self._lighter_account_task.cancel()
-            await asyncio.gather(self._lighter_account_task, return_exceptions=True)
-
-        if self._lighter_warm_task and not self._lighter_warm_task.done():
-            self._lighter_warm_task.cancel()
-            await asyncio.gather(self._lighter_warm_task, return_exceptions=True)
-
-        with contextlib.suppress(Exception):
-            self._lighter_http_session.close()
-
-        if self.lighter_ws_task and not self.lighter_ws_task.done():
-            self.lighter_ws_task.cancel()
-            await asyncio.gather(self.lighter_ws_task, return_exceptions=True)
-
         await self._browser_order_queue.stop()
-
-        if self.lighter_client is not None:
-            close_method = getattr(self.lighter_client, "close", None)
-            if callable(close_method):
-                with contextlib.suppress(Exception):
-                    close_result = close_method()
-                    if asyncio.iscoroutine(close_result):
-                        await close_result
+        await self.lighter_gateway.stop()
 
         if self.browser_order_server is not None:
             self.browser_order_server.close()
