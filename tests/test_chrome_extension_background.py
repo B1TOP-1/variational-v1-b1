@@ -169,6 +169,14 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("snapshots", monitor)
         self.assertIn("--sort=-rss", monitor)
 
+    def test_main_and_memory_monitor_have_a_combined_launcher(self):
+        launcher = (ROOT / "scripts" / "start-with-memory-monitor.sh").read_text()
+
+        self.assertIn('"$script_dir/monitor-memory.sh"', launcher)
+        self.assertIn('"$python_bin" main.py "$@"', launcher)
+        self.assertIn("trap cleanup EXIT INT TERM", launcher)
+        self.assertNotIn("start-variational-chrome.sh", launcher)
+
     def test_dom_quote_observer_only_watches_price_nodes(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()
         observer_start = background.index("function installDomQuoteObserverInPage()")
