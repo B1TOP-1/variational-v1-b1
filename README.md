@@ -97,17 +97,18 @@ VARIATIONAL_CHROME_URL="https://omni.variational.io/perpetual/BTC" \
 启动后可在 `chrome://version` 的“命令行”中确认存在
 `--silent-debugger-extension-api`。该模式仅建议用于专用交易 VPS/Profile。
 
-如果暂时继续使用原来的 Chrome，只需一个终端同时启动主程序和内存监督：
+继续使用原来的 Chrome 时，启动命令保持不变：
 
 ```bash
 cd ~/git/var/variational-v1
-./scripts/start-with-memory-monitor.sh
+source venv/bin/activate
+python main.py
 ```
 
-该脚本自动选择当前虚拟环境、`venv/` 或 `.venv/` 中的 Python，前台保持原来的
-`main.py` dashboard，后台运行内存监督；退出主程序时监督进程也会停止。它不会启动
-Chrome，浏览器仍按原来的方式手动打开。以后需要专用 Chrome 时，再单独运行
-`./scripts/start-variational-chrome.sh`。
+Linux/VPS 上 `main.py` 会自动在后台运行内存监督；主程序退出时监督进程也会停止。
+它不会启动 Chrome，浏览器仍按原来的方式手动打开。若临时不需要监督，可使用
+`VARIATIONAL_MEMORY_MONITOR=0 python main.py`。以后需要专用 Chrome 时，再单独运行
+`./scripts/start-variational-chrome.sh`，它不是启动主程序的必要条件。
 
 内存监督默认每 10 秒把系统内存和 RSS 最大的 40 个进程直接追加到
 `log/memory/<启动时间>/system.csv` 与 `processes.csv`，不会在内存中累计历史。
@@ -123,7 +124,7 @@ tail -f "$latest/system.csv" "$latest/alerts.log"
 # 示例：改为每 5 秒采样，单进程超过 350MB 时保存快照
 MEMORY_MONITOR_INTERVAL_SECONDS=5 \
 MEMORY_MONITOR_PROCESS_ALERT_MB=350 \
-./scripts/start-with-memory-monitor.sh
+python main.py
 ```
 
 插件会记住最后一次成功预填的下单方向和数量。Start/重连引起页面自动刷新后，

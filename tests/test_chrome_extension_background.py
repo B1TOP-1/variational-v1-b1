@@ -169,13 +169,15 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("snapshots", monitor)
         self.assertIn("--sort=-rss", monitor)
 
-    def test_main_and_memory_monitor_have_a_combined_launcher(self):
-        launcher = (ROOT / "scripts" / "start-with-memory-monitor.sh").read_text()
+    def test_main_automatically_manages_memory_monitor(self):
+        main_source = (ROOT / "main.py").read_text()
 
-        self.assertIn('"$script_dir/monitor-memory.sh"', launcher)
-        self.assertIn('"$python_bin" main.py "$@"', launcher)
-        self.assertIn("trap cleanup EXIT INT TERM", launcher)
-        self.assertNotIn("start-variational-chrome.sh", launcher)
+        self.assertIn("def start_memory_monitor()", main_source)
+        self.assertIn("def stop_memory_monitor(", main_source)
+        self.assertIn('MEMORY_MONITOR_ENABLED_ENV = "VARIATIONAL_MEMORY_MONITOR"', main_source)
+        self.assertIn('repo_dir / "scripts" / "monitor-memory.sh"', main_source)
+        self.assertIn("start_new_session=True", main_source)
+        self.assertIn("stop_memory_monitor(memory_monitor)", main_source)
 
     def test_dom_quote_observer_only_watches_price_nodes(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()

@@ -8,6 +8,7 @@ import math
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 from collections import deque
@@ -64,6 +65,7 @@ LOG_DIR = Path("./log")
 RUNS_DIR = LOG_DIR / "runs"
 SPREAD_HISTORY_DB_FILE = LOG_DIR / "spread_history.sqlite3"
 ROUND_EXIT_STATE_FILE = LOG_DIR / "round_exit_state.json"
+MEMORY_MONITOR_ENABLED_ENV = "VARIATIONAL_MEMORY_MONITOR"
 READY_TIMEOUT_SECONDS = 60.0
 # broker 层等待必须 >= 页面内 timeout_ms，否则会在页面返回前假超时。
 BROWSER_ORDER_BROKER_MARGIN_SECONDS = 8.0
@@ -4037,14 +4039,70 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 async def _amain() -> None:
     load_dotenv()
     args = parse_args()
-    runtime = VariationalToLighterRuntime(args)
+    memory_monitor = start_memory_monitor()
     try:
-        if args.browser_smoke_test:
-            await runtime.run_browser_smoke_test()
-        else:
-            await runtime.run()
+        runtime = VariationalToLighterRuntime(args)
+        try:
+            if args.browser_smoke_test:
+                await runtime.run_browser_smoke_test()
+            else:
+                await runtime.run()
+        finally:
+            await runtime.close()
     finally:
-        await runtime.close()
+        stop_memory_monitor(memory_monitor)
+
+
+def start_memory_monitor() -> tuple[subprocess.Popen[bytes], Any] | None:
+    enabled = os.environ.get(MEMORY_MONITOR_ENABLED_ENV, "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"} or sys.platform != "linux" or not Path("/proc/meminfo").is_file():
+        return None
+
+    repo_dir = Path(__file__).resolve().parent
+    monitor_script = repo_dir / "scripts" / "monitor-memory.sh"
+    if not monitor_script.is_file():
+        print(f"Memory monitor was not started: missing {monitor_script}", file=sys.stderr)
+        return None
+
+    started_at = cst_now().strftime("%Y-%m-%d_%H-%M-%S_%f_UTC+8")
+    output_dir = repo_dir / "log" / "memory" / started_at
+    output_dir.mkdir(parents=True, exist_ok=True)
+    monitor_log = (output_dir / "monitor.log").open("ab", buffering=0)
+    env = os.environ.copy()
+    env["MEMORY_MONITOR_OUTPUT_DIR"] = str(output_dir)
+    try:
+        process = subprocess.Popen(
+            [str(monitor_script)],
+            cwd=repo_dir,
+            env=env,
+            stdout=monitor_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        monitor_log.close()
+        print(f"Memory monitor was not started: {exc}", file=sys.stderr)
+        return None
+    print(f"Memory monitor: {output_dir}")
+    return process, monitor_log
+
+
+def stop_memory_monitor(monitor: tuple[subprocess.Popen[bytes], Any] | None) -> None:
+    if monitor is None:
+        return
+    process, monitor_log = monitor
+    try:
+        if process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=3)
+    finally:
+        monitor_log.close()
 
 
 def main() -> None:
