@@ -90,6 +90,8 @@ MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 0.2
+SPREAD_STATS_REFRESH_SECONDS = 1.0
+HISTORY_CACHE_REFRESH_SECONDS = 5.0
 # 价差走势 sparkline：滚动窗口 3 天，数据直接来自 SQLite。
 SPREAD_TREND_WINDOW_SECONDS = 3 * 86400.0
 DASHBOARD_ORDERS = 20
@@ -538,6 +540,12 @@ class VariationalToLighterRuntime:
         self._last_quote_wall: dict[str, float | None] = {"api": None, "dom": None}
         self._last_quote_delay: dict[str, float | None] = {"api": None, "dom": None}
         self._spread_stats_cache: dict[str, float | None] = {}
+        self._spread_stats_asset: str | None = None
+        self._spread_stats_refreshed_at = 0.0
+        self._history_cache_refreshed_at = 0.0
+        self._history_cache_key: tuple[str, int] | None = None
+        self._hourly_rows_cache: list[dict[str, Any]] = []
+        self._spread_trend_cache: tuple[list[float | None], float | None, float | None] = ([], None, None)
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
@@ -554,6 +562,7 @@ class VariationalToLighterRuntime:
         self._stat_short_fill_edge = RunningStat()
         self._last_gradient_signal_sig: tuple[str, str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
+        self._pending_prepare_sigs: set[tuple[str, str]] = set()
         self._prepared_order_side: str = "buy"
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
         self._browser_order_queue: BrowserOrderDispatchQueue[BrowserOrderCommand] = (
@@ -1750,9 +1759,15 @@ class VariationalToLighterRuntime:
             return None, None, None
         return self.spread_store.window_stats(asset, window_seconds, "long" if long_side else "short")
 
-    def _spread_trend_series(self, series_index: int, width: int, now: float) -> tuple[list[float | None], float | None, float | None]:
+    def _spread_trend_series(
+        self,
+        series_index: int,
+        width: int,
+        now: float,
+        asset: str | None = None,
+    ) -> tuple[list[float | None], float | None, float | None]:
         """近3天该序列按时间分桶(width格)取均值；返回 (每桶值, 最小, 最大)，空桶为 None。"""
-        asset = self.variational_ticker or self.ticker
+        asset = asset or self.variational_ticker or self.ticker
         buckets: list[list[float]] = [[] for _ in range(width)]
         if not asset:
             return [None] * width, None, None
@@ -1878,7 +1893,9 @@ class VariationalToLighterRuntime:
 
     def _render_spread_trend_panel(self, is_zh: bool) -> Panel:
         cols = max(20, min(200, self.dashboard_console.size.width - 14))
-        long_vals, _lo, _hi = self._spread_trend_series(0, cols, time.monotonic())
+        long_vals, _lo, _hi = self._spread_trend_cache
+        if len(long_vals) != cols:
+            long_vals = [None] * cols
         no_data = "无数据" if is_zh else "no data"
         long_label = "做多差价·近3天(整宽=3天)" if is_zh else "Long spread · 3d (full width = 3d)"
 
@@ -1892,16 +1909,67 @@ class VariationalToLighterRuntime:
             grid.add_row(f"[green]{line}[/]")
         return Panel(grid, title=long_label, border_style="blue")
 
-    def _refresh_spread_stats(self) -> None:
-        """1Hz 计算并缓存 18 个窗口统计，渲染(4Hz)只读缓存，避免重复排序。"""
+    def _calculate_spread_stats(self, asset: str) -> dict[str, float | None]:
         cache: dict[str, float | None] = {}
         for secs, tag in ((5 * 60, "5m"), (30 * 60, "30m"), (60 * 60, "1h")):
             for long_side, side_key in ((True, "long"), (False, "short")):
-                med, p90, p10 = self._window_stats(secs, long_side)
+                med, p90, p10 = self.spread_store.window_stats(
+                    asset,
+                    secs,
+                    "long" if long_side else "short",
+                )
                 cache[f"{side_key}_median_{tag}"] = med
                 cache[f"{side_key}_p90_{tag}"] = p90
                 cache[f"{side_key}_p10_{tag}"] = p10
+        return cache
+
+    def _refresh_spread_stats(self) -> None:
+        """Synchronously refresh stats for tests and non-async callers."""
+        asset = self.variational_ticker or self.ticker
+        if not asset:
+            return
+        self._spread_stats_cache = self._calculate_spread_stats(asset)
+        self._spread_stats_asset = asset
+        self._spread_stats_refreshed_at = time.monotonic()
+
+    async def _refresh_spread_stats_if_due(self, asset: str) -> None:
+        now = time.monotonic()
+        if (
+            self._spread_stats_asset == asset
+            and
+            self._spread_stats_refreshed_at > 0
+            and now - self._spread_stats_refreshed_at < SPREAD_STATS_REFRESH_SECONDS
+        ):
+            return
+        # Mark before awaiting so a slow query cannot be scheduled twice.
+        self._spread_stats_refreshed_at = now
+        cache = await asyncio.to_thread(self._calculate_spread_stats, asset)
         self._spread_stats_cache = cache
+        self._spread_stats_asset = asset
+
+    def _load_history_snapshot(
+        self,
+        asset: str,
+        width: int,
+    ) -> tuple[list[dict[str, Any]], tuple[list[float | None], float | None, float | None]]:
+        return (
+            self.spread_store.hourly_stats(asset, HOURLY_HISTORY_HOURS),
+            self._spread_trend_series(0, width, time.monotonic(), asset=asset),
+        )
+
+    async def _refresh_history_cache_if_due(self, asset: str, width: int) -> None:
+        now = time.monotonic()
+        key = (asset, width)
+        if (
+            self._history_cache_key == key
+            and now - self._history_cache_refreshed_at < HISTORY_CACHE_REFRESH_SECONDS
+        ):
+            return
+        self._history_cache_key = key
+        self._history_cache_refreshed_at = now
+        hourly, trend = await asyncio.to_thread(self._load_history_snapshot, asset, width)
+        self._hourly_rows_cache = hourly
+        self._spread_trend_cache = trend
 
     def _hourly_bucket_cells(self, values: tuple[float | None, float | None, float | None]) -> tuple[str, str, str]:
         return tuple(self._fmt_median_pct(value) for value in values)
@@ -2494,8 +2562,9 @@ class VariationalToLighterRuntime:
             return
         side = self._prepared_order_side
         prepare_sig = (side, format(qty, "f"))
-        if prepare_sig == self._last_prepared_order_sig:
+        if prepare_sig == self._last_prepared_order_sig or prepare_sig in self._pending_prepare_sigs:
             return
+        self._pending_prepare_sigs.add(prepare_sig)
         self._browser_order_queue.submit(BrowserOrderCommand(side=side, qty=qty, dry_run=True, prepare_only=True))
 
     async def _send_browser_order_task(self, command: BrowserOrderCommand) -> None:
@@ -2510,28 +2579,32 @@ class VariationalToLighterRuntime:
         return command.timeout_ms / 1000.0 + BROWSER_ORDER_BROKER_MARGIN_SECONDS
 
     async def _send_prepare_browser_order(self, command: BrowserOrderCommand) -> None:
+        side = "sell" if command.side.strip().lower() == "sell" else "buy"
+        prepare_sig = (side, format(command.qty, "f"))
         try:
-            result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
-        except Exception as exc:
-            self.logger.warning(
-                "Browser order prepare failed: side=%s qty=%s error=%s",
+            try:
+                result = await self.browser_order_broker.place_order(command, timeout=self._browser_order_timeout(command))
+            except Exception as exc:
+                self.logger.warning(
+                    "Browser order prepare failed: side=%s qty=%s error=%s",
+                    command.side,
+                    decimal_to_str(command.qty),
+                    exc,
+                )
+                return
+            self.logger.info(
+                "Browser order prepare result: side=%s qty=%s ok=%s blocked=%s error=%s",
                 command.side,
                 decimal_to_str(command.qty),
-                exc,
+                result.get("ok"),
+                result.get("blockedReason"),
+                result.get("error"),
             )
-            return
-        self.logger.info(
-            "Browser order prepare result: side=%s qty=%s ok=%s blocked=%s error=%s",
-            command.side,
-            decimal_to_str(command.qty),
-            result.get("ok"),
-            result.get("blockedReason"),
-            result.get("error"),
-        )
-        if result.get("ok"):
-            side = "sell" if command.side.strip().lower() == "sell" else "buy"
-            self._last_prepared_order_sig = (side, format(command.qty, "f"))
-            self._prepared_order_side = side
+            if result.get("ok"):
+                self._last_prepared_order_sig = prepare_sig
+                self._prepared_order_side = side
+        finally:
+            self._pending_prepare_sigs.discard(prepare_sig)
 
     async def run_browser_smoke_test(self) -> None:
         self._start_session_logging()
@@ -3063,8 +3136,10 @@ class VariationalToLighterRuntime:
             PRICE_MAPPING_RATIO,
         )
         # 每个 200ms UI 帧记录当前价差；窗口统计内部按 1Hz 节流，避免重复排序。
-        self._record_cross_spreads(
-            quote_asset or self.variational_ticker or self.ticker or "UNKNOWN",
+        active_asset = quote_asset or self.variational_ticker or self.ticker or "UNKNOWN"
+        await asyncio.to_thread(
+            self._record_cross_spreads,
+            active_asset,
             var_bid,
             var_ask,
             sig_bid,
@@ -3072,7 +3147,7 @@ class VariationalToLighterRuntime:
             long_var_short_lighter_pct,
             short_var_long_lighter_pct,
         )
-        self._refresh_spread_stats()
+        await self._refresh_spread_stats_if_due(active_asset)
 
         st = self._spread_stats_cache  # 1Hz 缓存，避免 4Hz 重复排序
         long_pct_median_5m = st.get("long_median_5m")
@@ -3375,10 +3450,12 @@ class VariationalToLighterRuntime:
         hourly_table.add_column(col_h_short_up, justify="right")
         hourly_table.add_column(col_h_short_dn, justify="right")
 
-        hourly_rows = self.spread_store.hourly_stats(
-            quote_asset or self.variational_ticker or self.ticker or "UNKNOWN",
-            HOURLY_HISTORY_HOURS,
-        )[:hourly_row_limit]
+        if self.current_page == 2:
+            history_width = max(20, min(200, self.dashboard_console.size.width - 14))
+            await self._refresh_history_cache_if_due(active_asset, history_width)
+            hourly_rows = self._hourly_rows_cache[:hourly_row_limit]
+        else:
+            hourly_rows = []
         if not hourly_rows:
             hourly_table.add_row(no_hourly_text, "-", "-", "-", "-", "-", "-")
         else:

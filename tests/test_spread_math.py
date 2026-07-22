@@ -210,6 +210,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime._prepared_order_side = "buy"
         runtime._last_prepared_order_sig = None
+        runtime._pending_prepare_sigs = set()
         runtime._browser_order_queue = Queue()
 
         runtime._schedule_prepare_browser_order()
@@ -236,6 +237,7 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy.cursor_section = StrategySection.CLOSE
         runtime._prepared_order_side = "buy"
         runtime._last_prepared_order_sig = None
+        runtime._pending_prepare_sigs = set()
         runtime._browser_order_queue = Queue()
 
         runtime._schedule_prepare_browser_order()
@@ -243,7 +245,7 @@ class SpreadMathTest(unittest.TestCase):
         command = runtime._browser_order_queue.items[0]
         self.assertEqual(command.side, "buy")
 
-    def test_prepare_browser_order_dedupes_only_after_success(self):
+    def test_prepare_browser_order_dedupes_while_request_is_pending(self):
         class Queue:
             def __init__(self):
                 self.items = []
@@ -255,17 +257,18 @@ class SpreadMathTest(unittest.TestCase):
         runtime.gradient_strategy = GradientStrategyState.default()
         runtime._prepared_order_side = "buy"
         runtime._last_prepared_order_sig = None
+        runtime._pending_prepare_sigs = set()
         runtime._browser_order_queue = Queue()
 
         runtime._schedule_prepare_browser_order()
         runtime._schedule_prepare_browser_order()
 
-        self.assertEqual(len(runtime._browser_order_queue.items), 2)
+        self.assertEqual(len(runtime._browser_order_queue.items), 1)
 
         runtime._last_prepared_order_sig = ("buy", "0.001")
         runtime._schedule_prepare_browser_order()
 
-        self.assertEqual(len(runtime._browser_order_queue.items), 2)
+        self.assertEqual(len(runtime._browser_order_queue.items), 1)
 
     def test_gradient_signal_creates_strategy_record_and_live_browser_order(self):
         class Queue:

@@ -805,6 +805,68 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rt._spread_stats_cache["long_median_5m"], 0.07)
         self.assertEqual(rt._spread_stats_cache["short_median_1h"], 0.03)
 
+    async def test_spread_stats_refresh_is_throttled_even_when_cache_is_empty(self):
+        rt = self._runtime()
+        calls = []
+
+        def calculate(asset):
+            calls.append(asset)
+            return {}
+
+        rt._calculate_spread_stats = calculate
+        await rt._refresh_spread_stats_if_due("BTC")
+        await rt._refresh_spread_stats_if_due("BTC")
+
+        self.assertEqual(calls, ["BTC"])
+
+    async def test_spread_stats_refreshes_immediately_after_market_switch(self):
+        rt = self._runtime()
+        calls = []
+
+        def calculate(asset):
+            calls.append(asset)
+            return {"asset": asset}
+
+        rt._calculate_spread_stats = calculate
+        await rt._refresh_spread_stats_if_due("BTC")
+        await rt._refresh_spread_stats_if_due("CL")
+
+        self.assertEqual(calls, ["BTC", "CL"])
+        self.assertEqual(rt._spread_stats_cache, {"asset": "CL"})
+
+    async def test_slow_spread_stats_query_does_not_block_event_loop(self):
+        rt = self._runtime()
+        heartbeat_ran = asyncio.Event()
+
+        def calculate(_asset):
+            time.sleep(0.05)
+            return {}
+
+        async def heartbeat():
+            await asyncio.sleep(0.005)
+            heartbeat_ran.set()
+
+        rt._calculate_spread_stats = calculate
+        heartbeat_task = asyncio.create_task(heartbeat())
+        await rt._refresh_spread_stats_if_due("BTC")
+        await heartbeat_task
+
+        self.assertTrue(heartbeat_ran.is_set())
+
+    async def test_history_snapshot_is_cached_for_same_asset_and_width(self):
+        rt = self._runtime()
+        calls = []
+
+        def load(asset, width):
+            calls.append((asset, width))
+            return [], ([None] * width, None, None)
+
+        rt._load_history_snapshot = load
+        await rt._refresh_history_cache_if_due("BTC", 80)
+        await rt._refresh_history_cache_if_due("BTC", 80)
+
+        self.assertEqual(calls, [("BTC", 80)])
+
     def test_spread_trend_series_and_line_chart(self):
         rt = self._runtime()
         rt.variational_ticker = "BTC"
