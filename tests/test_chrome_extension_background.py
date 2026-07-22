@@ -159,6 +159,16 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("--silent-debugger-extension-api", launcher)
         self.assertIn("chrome://version", launcher)
 
+    def test_repository_includes_long_running_memory_monitor(self):
+        monitor = (ROOT / "scripts" / "monitor-memory.sh").read_text()
+
+        self.assertIn("MEMORY_MONITOR_INTERVAL_SECONDS", monitor)
+        self.assertIn("/proc/meminfo", monitor)
+        self.assertIn("chrome-renderer", monitor)
+        self.assertIn("variational-main", monitor)
+        self.assertIn("snapshots", monitor)
+        self.assertIn("--sort=-rss", monitor)
+
     def test_dom_quote_observer_only_watches_price_nodes(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()
         observer_start = background.index("function installDomQuoteObserverInPage()")

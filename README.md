@@ -97,6 +97,40 @@ VARIATIONAL_CHROME_URL="https://omni.variational.io/perpetual/BTC" \
 启动后可在 `chrome://version` 的“命令行”中确认存在
 `--silent-debugger-extension-api`。该模式仅建议用于专用交易 VPS/Profile。
 
+VPS 推荐分别在三个终端运行主程序、专用 Chrome 和内存监督：
+
+```bash
+# 终端 1
+cd ~/git/var/variational-v1
+source venv/bin/activate
+python main.py
+
+# 终端 2
+cd ~/git/var/variational-v1
+./scripts/start-variational-chrome.sh
+
+# 终端 3
+cd ~/git/var/variational-v1
+./scripts/monitor-memory.sh
+```
+
+内存监督默认每 10 秒把系统内存和 RSS 最大的 40 个进程直接追加到
+`log/memory/<启动时间>/system.csv` 与 `processes.csv`，不会在内存中累计历史。
+它会区分 Chrome browser、renderer、GPU、network、storage、extension 以及
+`python main.py`。可用内存低于 250MB 或单进程超过 500MB 时，完整 `ps` 快照写入
+同目录的 `snapshots/`，触发时间与原因写入 `alerts.log`。
+
+```bash
+# 实时观察系统内存和告警
+latest="$(ls -dt log/memory/* | head -1)"
+tail -f "$latest/system.csv" "$latest/alerts.log"
+
+# 示例：改为每 5 秒采样，单进程超过 350MB 时保存快照
+MEMORY_MONITOR_INTERVAL_SECONDS=5 \
+MEMORY_MONITOR_PROCESS_ALERT_MB=350 \
+./scripts/monitor-memory.sh
+```
+
 插件会记住最后一次成功预填的下单方向和数量。Start/重连引起页面自动刷新后，
 插件会等待交易表单重新挂载并恢复数量，避免输入框为空导致策略无法触发下单。
 
