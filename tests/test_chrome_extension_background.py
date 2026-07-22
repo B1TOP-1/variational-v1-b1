@@ -159,6 +159,18 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("--silent-debugger-extension-api", launcher)
         self.assertIn("chrome://version", launcher)
 
+    def test_dom_quote_observer_only_watches_price_nodes(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+        observer_start = background.index("function installDomQuoteObserverInPage()")
+        observer_end = background.index("async function installDomQuoteObserver(tabId)")
+        observer_source = background[observer_start:observer_end]
+
+        self.assertIn("observer.observe(element", observer_source)
+        self.assertNotIn("observer.observe(document.body", observer_source)
+        self.assertIn("setInterval(bindPriceNodes, 1000)", observer_source)
+        self.assertIn("disconnectPriceObservers", observer_source)
+        self.assertIn("stopDomQuoteObserverInPage", background)
+
     def test_popup_exposes_active_quote_controls(self):
         popup = (ROOT / "chrome_extension" / "popup.html").read_text()
         popup_script = (ROOT / "chrome_extension" / "popup.js").read_text()

@@ -68,7 +68,32 @@ Debugger 提示条，同时保留报价、成交事件和可信点击所需的 C
 ./scripts/start-variational-chrome.sh
 ```
 
-启动前必须完全关闭现有 Chrome；脚本检测到已有进程时会拒绝启动，避免参数被旧进程忽略。
+脚本使用独立的 `~/.config/variational-chrome` profile，只检测并拒绝重复启动自己的
+Variational 实例，不影响系统中其他项目的 Chrome。它会自动加载本仓库扩展并打开 BTC 页面。
+不同项目必须使用不同的 `--user-data-dir`，不能共享该 profile。
+
+默认启用适合交易 VPS 的参数：`--process-per-site`、关闭 Chrome 后台服务、关闭同步和
+组件更新，并禁止后台标签定时器降频，保证窗口失焦后 200ms 报价仍能工作。VPS 常见的
+小容量 `/dev/shm` 默认使用 `--disable-dev-shm-usage`；若主机 `/dev/shm` 足够大可关闭：
+
+```bash
+VARIATIONAL_DISABLE_DEV_SHM=0 ./scripts/start-variational-chrome.sh
+```
+
+`--disable-gpu` 默认不启用，因为可能增加 CPU 和软件渲染压力；确认 VPS GPU 进程无用时可选：
+
+```bash
+VARIATIONAL_DISABLE_GPU=1 ./scripts/start-variational-chrome.sh
+```
+
+也可以覆盖专用 profile 和初始标的：
+
+```bash
+VARIATIONAL_CHROME_PROFILE="$HOME/.config/var-btc" \
+VARIATIONAL_CHROME_URL="https://omni.variational.io/perpetual/BTC" \
+./scripts/start-variational-chrome.sh
+```
+
 启动后可在 `chrome://version` 的“命令行”中确认存在
 `--silent-debugger-extension-api`。该模式仅建议用于专用交易 VPS/Profile。
 

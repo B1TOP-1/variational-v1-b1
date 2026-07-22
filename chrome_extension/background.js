@@ -1156,15 +1156,18 @@ async function stopActiveQuotePoller(tabId) {
 // 注入页面：MutationObserver 盯 bid/ask 显示，变动即通过 chrome.runtime 推给 background。
 // 用 ISOLATED world（可用 chrome.runtime），只读 DOM 不下单。
 function installDomQuoteObserverInPage() {
-  const KEY = "__varDomQuoteObserver__";
+  const KEY = "__varDomQuoteObserverV2__";
+  const legacy = window.__varDomQuoteObserver__;
+  if (legacy) {
+    legacy.active = false;
+    legacy.observer?.disconnect?.();
+  }
   function parsePrice(text) {
     const cleaned = String(text == null ? "" : text).replace(/[$,\s]/g, "");
     const numeric = Number(cleaned);
     return Number.isFinite(numeric) ? numeric : null;
   }
-  function read() {
-    const askEl = document.querySelector("[data-testid='ask-price-display']");
-    const bidEl = document.querySelector("[data-testid='bid-price-display']");
+  function read(askEl, bidEl) {
     return {
       ask: parsePrice(askEl && (askEl.innerText || askEl.textContent)),
       bid: parsePrice(bidEl && (bidEl.innerText || bidEl.textContent))
@@ -1174,10 +1177,17 @@ function installDomQuoteObserverInPage() {
   if (st && st.active) {
     return { reused: true };
   }
-  st = { active: true, last: null, observer: null };
+  st = {
+    active: true,
+    last: null,
+    askEl: null,
+    bidEl: null,
+    observers: [],
+    locatorTimer: null
+  };
   window[KEY] = st;
   const emit = () => {
-    const snapshot = read();
+    const snapshot = read(st.askEl, st.bidEl);
     if (snapshot.ask == null && snapshot.bid == null) {
       return;
     }
@@ -1194,13 +1204,51 @@ function installDomQuoteObserverInPage() {
       // 忽略瞬时投递失败
     }
   };
-  st.observer = new MutationObserver(emit);
-  st.observer.observe(document.body || document.documentElement, {
-    childList: true,
-    characterData: true,
-    subtree: true
-  });
-  emit();
+
+  const disconnectPriceObservers = () => {
+    for (const observer of st.observers) observer.disconnect();
+    st.observers = [];
+  };
+
+  const bindPriceNodes = () => {
+    if (!st.active) return;
+    const askEl = document.querySelector("[data-testid='ask-price-display']");
+    const bidEl = document.querySelector("[data-testid='bid-price-display']");
+    if (askEl === st.askEl && bidEl === st.bidEl) return;
+    disconnectPriceObservers();
+    st.askEl = askEl;
+    st.bidEl = bidEl;
+    for (const element of [askEl, bidEl]) {
+      if (!element) continue;
+      const observer = new MutationObserver(emit);
+      observer.observe(element, { childList: true, characterData: true, subtree: true });
+      st.observers.push(observer);
+    }
+    emit();
+  };
+
+  st.stop = () => {
+    st.active = false;
+    disconnectPriceObservers();
+    if (st.locatorTimer != null) clearInterval(st.locatorTimer);
+    st.locatorTimer = null;
+    st.askEl = null;
+    st.bidEl = null;
+  };
+
+  bindPriceNodes();
+  st.locatorTimer = setInterval(bindPriceNodes, 1000);
+  return { ok: true };
+}
+
+function stopDomQuoteObserverInPage() {
+  const st = window.__varDomQuoteObserverV2__;
+  if (st && typeof st.stop === "function") st.stop();
+  const legacy = window.__varDomQuoteObserver__;
+  if (legacy) {
+    legacy.active = false;
+    legacy.observer?.disconnect?.();
+  }
   return { ok: true };
 }
 
@@ -1216,6 +1264,19 @@ async function installDomQuoteObserver(tabId) {
     });
   } catch (e) {
     // 页面未就绪/无权限时忽略，reload 完成或下次 attach 会重试。
+  }
+}
+
+async function stopDomQuoteObserver(tabId) {
+  if (tabId == null) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: stopDomQuoteObserverInPage
+    });
+  } catch {
+    // Tab may already be navigating or closed.
   }
 }
 
@@ -1937,6 +1998,7 @@ async function handleReadPosition(payload) {
 async function stopForwarding() {
   const attachedTabId = state.attachedTabId;
   await stopActiveQuotePoller(attachedTabId);
+  await stopDomQuoteObserver(attachedTabId);
   cleanupForwardingState();
   await persistRuntimeState();
   if (attachedTabId != null) {
