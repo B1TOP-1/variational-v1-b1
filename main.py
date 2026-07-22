@@ -503,6 +503,7 @@ class VariationalToLighterRuntime:
         self._stdin_fd: int | None = None
         self._stdin_old_settings: Any = None
         self._keyboard_active = False
+        self._dashboard_wake = asyncio.Event()
 
         self.gradient_strategy = GradientStrategyState.default()
         self.round_exit_state_file: Path | None = None if self.args.browser_smoke_test else ROUND_EXIT_STATE_FILE
@@ -638,16 +639,21 @@ class VariationalToLighterRuntime:
         if not data:
             return
         key = data.decode("utf-8", errors="ignore")
+        dashboard_changed = False
         if key in ("q", "Q", "\x03"):  # q / Ctrl-C
             self.shutdown()
         elif key == "\t":
             self.current_page = 2 if self.current_page == 1 else 1
             if self.current_page == 2:
                 self._schedule_prepare_browser_order()
+            dashboard_changed = True
         elif self.current_page == 2:
             was_enabled = self.gradient_strategy.enabled
+            previous_order_qty = self.gradient_strategy.single_order_qty
             if self.gradient_strategy.handle_key(key):
-                self._schedule_prepare_browser_order()
+                dashboard_changed = True
+                if self.gradient_strategy.single_order_qty != previous_order_qty:
+                    self._schedule_prepare_browser_order()
             # 由禁用切到启用 → 视为手动确认，解除硬停。
             if self.gradient_strategy.enabled and not was_enabled and self._strategy_halted:
                 self._strategy_halted = False
@@ -655,9 +661,13 @@ class VariationalToLighterRuntime:
                 self.logger.info("策略硬停已由手动重新启用解除")
         elif key == "1":
             self.current_page = 1
+            dashboard_changed = True
         elif key == "2":
             self.current_page = 2
             self._schedule_prepare_browser_order()
+            dashboard_changed = True
+        if dashboard_changed:
+            self._dashboard_wake.set()
 
     def restore_keyboard(self) -> None:
         if self._stdin_fd is None:
@@ -3644,8 +3654,15 @@ class VariationalToLighterRuntime:
             screen=True,
         ) as live:
             while not self.stop_flag:
-                await asyncio.sleep(refresh_interval)
-                live.update(await self.render_dashboard())
+                keyboard_wake = False
+                try:
+                    await asyncio.wait_for(self._dashboard_wake.wait(), timeout=refresh_interval)
+                    keyboard_wake = True
+                except asyncio.TimeoutError:
+                    pass
+                if keyboard_wake:
+                    self._dashboard_wake.clear()
+                live.update(await self.render_dashboard(), refresh=keyboard_wake)
                 await self.export_trade_records_csv()
 
     async def run(self) -> None:

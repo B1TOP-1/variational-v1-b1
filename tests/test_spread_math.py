@@ -2,6 +2,7 @@ import unittest
 import time
 import asyncio
 import argparse
+from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +26,41 @@ from variational.gradient_strategy import StrategySection
 
 
 class SpreadMathTest(unittest.TestCase):
+    def test_gradient_digit_wakes_dashboard_without_preparing_browser_order(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime._stdin_fd = 1
+        runtime.current_page = 2
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime.gradient_strategy.move_cursor(1)
+        runtime.gradient_strategy.move_cursor(1)
+        runtime._dashboard_wake = asyncio.Event()
+        prepare_calls = []
+        runtime._schedule_prepare_browser_order = lambda: prepare_calls.append(True)
+
+        with patch("main.os.read", return_value=b"7"):
+            runtime._on_keypress()
+
+        self.assertEqual(runtime.gradient_strategy.edit_buffer, "7")
+        self.assertTrue(runtime._dashboard_wake.is_set())
+        self.assertEqual(prepare_calls, [])
+
+    def test_order_qty_prepares_only_after_changed_value_is_committed(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime._stdin_fd = 1
+        runtime.current_page = 2
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime.gradient_strategy.move_cursor(1)
+        runtime._dashboard_wake = asyncio.Event()
+        prepare_calls = []
+        runtime._schedule_prepare_browser_order = lambda: prepare_calls.append(True)
+
+        with patch("main.os.read", side_effect=(b"2", b"\r")):
+            runtime._on_keypress()
+            runtime._on_keypress()
+
+        self.assertEqual(runtime.gradient_strategy.single_order_qty, Decimal("2"))
+        self.assertEqual(prepare_calls, [True])
+
     def test_cl_uses_lighter_wti_market(self):
         self.assertEqual(resolve_lighter_ticker("CL"), "WTI")
         self.assertEqual(resolve_variational_ticker("WTI"), "CL")
