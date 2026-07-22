@@ -90,6 +90,7 @@ MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 0.2
+DASHBOARD_RESIZE_SETTLE_SECONDS = 0.25
 SPREAD_STATS_REFRESH_SECONDS = 1.0
 HISTORY_CACHE_REFRESH_SECONDS = 5.0
 # 价差走势 sparkline：滚动窗口 3 天，数据直接来自 SQLite。
@@ -504,6 +505,8 @@ class VariationalToLighterRuntime:
         self._stdin_old_settings: Any = None
         self._keyboard_active = False
         self._dashboard_wake = asyncio.Event()
+        self._dashboard_size: tuple[int, int] | None = None
+        self._dashboard_resize_deadline = 0.0
 
         self.gradient_strategy = GradientStrategyState.default()
         self.round_exit_state_file: Path | None = None if self.args.browser_smoke_test else ROUND_EXIT_STATE_FILE
@@ -3642,15 +3645,27 @@ class VariationalToLighterRuntime:
             writer.writerows(rows)
         os.replace(tmp_path, path)
 
+    def _dashboard_resize_in_progress(self, now: float) -> bool:
+        size = self.dashboard_console.size
+        current = (size.width, size.height)
+        if self._dashboard_size is None:
+            self._dashboard_size = current
+            return False
+        if current != self._dashboard_size:
+            self._dashboard_size = current
+            self._dashboard_resize_deadline = now + DASHBOARD_RESIZE_SETTLE_SECONDS
+            return True
+        return now < self._dashboard_resize_deadline
+
     async def dashboard_loop(self) -> None:
         refresh_interval = DASHBOARD_REFRESH_SECONDS
-        refresh_per_second = max(1, int(round(1.0 / refresh_interval)))
         initial_render = await self.render_dashboard()
+        self._dashboard_resize_in_progress(time.monotonic())
         await self.export_trade_records_csv()
         with Live(
             initial_render,
             console=self.dashboard_console,
-            refresh_per_second=refresh_per_second,
+            auto_refresh=False,
             screen=True,
         ) as live:
             while not self.stop_flag:
@@ -3662,7 +3677,9 @@ class VariationalToLighterRuntime:
                     pass
                 if keyboard_wake:
                     self._dashboard_wake.clear()
-                live.update(await self.render_dashboard(), refresh=keyboard_wake)
+                if self._dashboard_resize_in_progress(time.monotonic()):
+                    continue
+                live.update(await self.render_dashboard(), refresh=True)
                 await self.export_trade_records_csv()
 
     async def run(self) -> None:

@@ -61,6 +61,18 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(runtime.gradient_strategy.single_order_qty, Decimal("2"))
         self.assertEqual(prepare_calls, [True])
 
+    def test_dashboard_resize_waits_until_terminal_size_is_stable(self):
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.dashboard_console = SimpleNamespace(size=SimpleNamespace(width=120, height=40))
+        runtime._dashboard_size = None
+        runtime._dashboard_resize_deadline = 0.0
+
+        self.assertFalse(runtime._dashboard_resize_in_progress(10.0))
+        runtime.dashboard_console.size.width = 121
+        self.assertTrue(runtime._dashboard_resize_in_progress(10.1))
+        self.assertTrue(runtime._dashboard_resize_in_progress(10.2))
+        self.assertFalse(runtime._dashboard_resize_in_progress(10.36))
+
     def test_cl_uses_lighter_wti_market(self):
         self.assertEqual(resolve_lighter_ticker("CL"), "WTI")
         self.assertEqual(resolve_variational_ticker("WTI"), "CL")
