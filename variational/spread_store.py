@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -10,6 +11,9 @@ from typing import Any
 
 class SpreadStore:
     """SQLite-backed long-term spread history and window statistics."""
+
+    _DAY_MS = 86_400_000
+    _UTC8_OFFSET_MS = 8 * 3_600_000
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -185,6 +189,73 @@ class SpreadStore:
                 "timestampMs": int(row["bucket_ms"]),
                 "longEdge": row["long_edge_pct"],
                 "shortEdge": row["short_edge_pct"],
+            }
+            for row in rows
+        ]
+
+    def extrema(self, asset: str, start_ms: int, end_ms: int) -> dict[str, Any]:
+        """Return exact raw-sample extrema for a visible chart window."""
+        result: dict[str, Any] = {}
+        with self._read_lock:
+            row = self._reader.execute(
+                """
+                SELECT MIN(long_edge_pct) AS long_min, MAX(long_edge_pct) AS long_max,
+                       MIN(short_edge_pct) AS short_min, MAX(short_edge_pct) AS short_max
+                FROM spread_samples
+                WHERE asset = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+                """,
+                (asset.upper(), int(start_ms), int(end_ms)),
+            ).fetchone()
+            for side, column in (("long", "long_edge_pct"), ("short", "short_edge_pct")):
+                side_result: dict[str, Any] = {}
+                for kind in ("min", "max"):
+                    value = row[f"{side}_{kind}"]
+                    if value is None:
+                        side_result[kind] = None
+                        side_result[f"{kind}TimestampMs"] = None
+                        continue
+                    timestamp = self._reader.execute(
+                        f"""
+                        SELECT MIN(timestamp_ms) AS timestamp_ms
+                        FROM spread_samples
+                        WHERE asset = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+                          AND {column} = ?
+                        """,
+                        (asset.upper(), int(start_ms), int(end_ms), value),
+                    ).fetchone()["timestamp_ms"]
+                    side_result[kind] = float(value)
+                    side_result[f"{kind}TimestampMs"] = int(timestamp)
+                result[side] = side_result
+        return result
+
+    def daily_extrema(self, asset: str, days: int = 7, *, end_ms: int | None = None) -> list[dict[str, Any]]:
+        """Return exact extrema by UTC+8 calendar day, newest first."""
+        end_ms = int(time.time() * 1000) if end_ms is None else int(end_ms)
+        days = max(1, int(days))
+        end_day = (end_ms + self._UTC8_OFFSET_MS) // self._DAY_MS
+        start_day = end_day - days + 1
+        start_ms = start_day * self._DAY_MS - self._UTC8_OFFSET_MS
+        with self._read_lock:
+            rows = self._reader.execute(
+                """
+                SELECT ((timestamp_ms + ?) / ?) AS day_key,
+                       MIN(long_edge_pct) AS long_min, MAX(long_edge_pct) AS long_max,
+                       MIN(short_edge_pct) AS short_min, MAX(short_edge_pct) AS short_max
+                FROM spread_samples
+                WHERE asset = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+                GROUP BY day_key
+                ORDER BY day_key DESC
+                """,
+                (self._UTC8_OFFSET_MS, self._DAY_MS, asset.upper(), start_ms, end_ms),
+            ).fetchall()
+        return [
+            {
+                "day": datetime.fromtimestamp(
+                    int(row["day_key"]) * self._DAY_MS / 1000,
+                    tz=timezone.utc,
+                ).date().isoformat(),
+                "long": {"min": row["long_min"], "max": row["long_max"]},
+                "short": {"min": row["short_min"], "max": row["short_max"]},
             }
             for row in rows
         ]

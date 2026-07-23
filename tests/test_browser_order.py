@@ -245,7 +245,11 @@ class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
 class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _runtime():
-        return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime.ticker = "BTC"
+        runtime._lighter_positions["BTC"] = Decimal("0")
+        runtime._lighter_position_ready.set()
+        return runtime
 
     def test_binance_usdc_book_is_observation_only(self):
         rt = self._runtime()
@@ -787,7 +791,11 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
 class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _runtime():
-        return VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime.ticker = "BTC"
+        runtime._lighter_positions["BTC"] = Decimal("0")
+        runtime._lighter_position_ready.set()
+        return runtime
 
     def test_window_stats_single_pass(self):
         rt = self._runtime()
@@ -1107,6 +1115,44 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(record.lighter_fill_ts_iso)
         self.assertNotIn(record.lighter_client_order_id, rt.lighter_client_order_to_trade_key)
 
+    async def test_lighter_submit_failure_hard_stops_strategy(self):
+        rt = self._runtime()
+        rt.args.auto_hedge = True
+
+        async def best_prices():
+            return Decimal("66000"), Decimal("66001")
+
+        class FailingGateway:
+            async def place_order(self, **_kwargs):
+                raise RuntimeError("sendtx rejected")
+
+        rt.get_lighter_best_bid_ask = best_prices
+        rt.lighter_gateway = FailingGateway()
+        record = OrderLifecycle(
+            trade_key="strategy:lighter-failed", trade_id="", side="buy",
+            qty=Decimal("0.001"), asset="BTC", auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+
+        await rt.place_lighter_order(record)
+
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("Lighter 对冲提交失败", rt._halt_reason)
+
+    async def test_variational_submit_failure_hard_stops_strategy(self):
+        rt = self._runtime()
+        rt.browser_order_broker.place_order = AsyncMock(return_value={"ok": False, "error": "rejected"})
+        rt._strategy_order_in_flight = True
+
+        await rt._send_browser_order(BrowserOrderCommand(
+            side="buy", qty=Decimal("0.001"), dry_run=False,
+            trade_key="strategy:var-failed",
+        ))
+
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("Variational 提交失败", rt._halt_reason)
+        self.assertFalse(rt._strategy_order_in_flight)
+
     async def test_lighter_latency_recorded_from_signal_trigger(self):
         rt = self._runtime()
         key = "strategy:lat"
@@ -1213,8 +1259,19 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         rt.ticker = "BTC"
         rt._cached_position_qty = Decimal("0.01")  # Var 多
         rt._lighter_positions = {"BTC": Decimal("-0.01")}  # Lighter 空
+        rt._lighter_position_ready.set()
         self.assertTrue(rt._positions_balanced())
         rt._lighter_positions = {"BTC": Decimal("0")}  # 裸腿
+        self.assertFalse(rt._positions_balanced())
+
+    def test_unknown_lighter_position_is_never_treated_as_zero(self):
+        rt = self._runtime()
+        rt.ticker = "BTC"
+        rt._cached_position_qty = Decimal("0")
+        rt._lighter_positions.clear()
+        rt._lighter_position_ready.clear()
+
+        self.assertFalse(rt._current_lighter_position_known())
         self.assertFalse(rt._positions_balanced())
 
     def test_strategy_order_allowed_gate(self):

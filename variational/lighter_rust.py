@@ -116,7 +116,14 @@ class RustLighterGateway:
         self.min_base_amount = _decimal(data.get("min_base_amount"))
         self.size_multiplier = int(data["size_multiplier"])
         self.price_multiplier = int(data["price_multiplier"])
-        await asyncio.wait_for(self.book_ready.wait(), timeout=timeout)
+        position_quantity = _decimal(data.get("position_quantity"))
+        if self.execution_enabled and position_quantity is not None:
+            self.positions[self.symbol] = position_quantity
+            self.position_ready.set()
+        waits = [self.book_ready.wait()]
+        if self.execution_enabled:
+            waits.append(self.position_ready.wait())
+        await asyncio.wait_for(asyncio.gather(*waits), timeout=timeout)
         return self.market_id
 
     async def place_order(
@@ -188,6 +195,7 @@ class RustLighterGateway:
         self.health_ready.clear()
         self.book_ready.clear()
         self.position_ready.clear()
+        self.positions.clear()
 
     async def _read_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
@@ -205,6 +213,7 @@ class RustLighterGateway:
             self.health_ready.clear()
             self.book_ready.clear()
             self.position_ready.clear()
+            self.positions.clear()
             self.best_bid = None
             self.best_ask = None
             self.vwap_bid = None
@@ -255,7 +264,8 @@ class RustLighterGateway:
             quantity = _decimal(event.get("quantity"))
             if symbol and quantity is not None:
                 self.positions[symbol] = quantity
-                self.position_ready.set()
+                if self.symbol is None or symbol == self.symbol:
+                    self.position_ready.set()
             await self.event_handler(event)
             return
         await self.event_handler(event)

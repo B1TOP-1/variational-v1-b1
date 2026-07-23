@@ -59,6 +59,8 @@ class SpreadDashboardServer:
                         "latest": store.latest(asset),
                         "sampleCount": store.sample_count(asset, window_seconds, end_ms=end_ms),
                         "points": store.history(asset, window_seconds, max_points, end_ms=end_ms),
+                        "viewExtrema": store.extrema(asset, start_ms, end_ms),
+                        "dailyExtrema": store.daily_extrema(asset, 7, end_ms=end_ms),
                         "stats": stats,
                     })
                     return

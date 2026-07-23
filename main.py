@@ -795,6 +795,8 @@ class VariationalToLighterRuntime:
         self._round_position_mismatch_since = None
         self._last_gradient_signal_sig = None
         self._reset_pending_signal_confirmation()
+        self._lighter_positions.clear()
+        self._lighter_position_ready.clear()
         async with self._trade_csv_write_lock:
             self._trade_records_snapshot_sig = None
 
@@ -872,6 +874,8 @@ class VariationalToLighterRuntime:
             return
         if event_type == "health" and not event.get("ready"):
             self._lighter_ready = False
+            self._lighter_positions.clear()
+            self._lighter_position_ready.clear()
             self.lighter_order_book_ready = False
             self.lighter_best_bid = None
             self.lighter_best_ask = None
@@ -887,7 +891,8 @@ class VariationalToLighterRuntime:
             quantity = to_decimal(event.get("quantity"))
             if symbol and quantity is not None:
                 self._lighter_positions[symbol] = quantity
-                self._lighter_position_ready.set()
+                if symbol == (self.ticker or "").strip().upper():
+                    self._lighter_position_ready.set()
             return
         if event_type == "error":
             self.logger.warning("Lighter Rust事件错误: source=%s error=%s", event.get("source"), event.get("error"))
@@ -1206,6 +1211,7 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             self.logger.warning("Lighter 对冲失败(盘口未就绪): key=%s side=%s qty=%s", record.trade_key, side, decimal_to_str(record.qty))
             await self.append_order_log("lighter_error", payload)
+            self._halt_strategy(f"Lighter 对冲未提交: 盘口未就绪 ({record.trade_key})")
             return
 
         slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
@@ -1261,9 +1267,14 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             self.logger.warning("Lighter 对冲失败(下单异常): key=%s side=%s error=%s", record.trade_key, side, exc)
             await self.append_order_log("lighter_error", payload)
+            self._halt_strategy(f"Lighter 对冲提交失败: {exc}")
 
     def _current_lighter_position(self) -> Decimal:
         return self._lighter_positions.get((self.ticker or "").strip().upper(), Decimal("0"))
+
+    def _current_lighter_position_known(self) -> bool:
+        symbol = (self.ticker or "").strip().upper()
+        return bool(symbol and self._lighter_position_ready.is_set() and symbol in self._lighter_positions)
 
     def _balance_tolerance(self) -> Decimal:
         multiplier = self.lighter_gateway.size_multiplier
@@ -1274,7 +1285,7 @@ class VariationalToLighterRuntime:
     def _positions_balanced(self) -> bool:
         """对冲两腿方向相反，净仓位应约为 0。Var 仓位未知则视为不平衡。"""
         var_pos = self._cached_position_qty
-        if var_pos is None:
+        if var_pos is None or not self._current_lighter_position_known():
             return False
         net = var_pos + self._current_lighter_position()
         return abs(net) <= self._balance_tolerance()
@@ -1295,6 +1306,11 @@ class VariationalToLighterRuntime:
         if self.args.auto_hedge and not self._positions_balanced():
             return False
         return True
+
+    def _halt_strategy(self, reason: str) -> None:
+        self._strategy_halted = True
+        self._halt_reason = reason
+        self.logger.error("策略已停止（需手动检查）：%s", reason)
 
     async def _confirm_hedge_or_halt(self, prev_var_qty: Decimal | None) -> None:
         """下单后 10s 内确认两腿都到位并重新平衡；超时未平则硬停策略。"""
@@ -2894,6 +2910,8 @@ class VariationalToLighterRuntime:
                     command.dry_run,
                     exc,
                 )
+                if is_live_strategy_order:
+                    self._halt_strategy(f"Variational 提交失败: {exc}")
                 return
             self.logger.info(
                 "Browser order result: side=%s qty=%s dry_run=%s ok=%s blocked=%s error=%s",
@@ -2907,6 +2925,9 @@ class VariationalToLighterRuntime:
             if not result.get("ok"):
                 self.logger.warning("Browser order diagnostic: %s", self._browser_order_result_summary(result))
                 await self._record_var_order_error(command.trade_key, str(result.get("error") or result.get("blockedReason") or "browser_order_failed"))
+                if is_live_strategy_order:
+                    reason = str(result.get("error") or result.get("blockedReason") or "browser_order_failed")
+                    self._halt_strategy(f"Variational 提交失败: {reason}")
             if result.get("ok"):
                 await self._record_var_submit_result(command.trade_key, result)
                 self._prepared_order_side = side
@@ -3248,6 +3269,7 @@ class VariationalToLighterRuntime:
             pnl_text = f"PnL: [{r_color}]{realized_u}[/] ([{u_color}]{unrealized_u}[/])"
 
         pos_label = "持仓" if is_zh else "pos"
+        lighter_position_known = self._current_lighter_position_known()
         if display_position_qty == 0:
             pos_text = f"{pos_label} 0"
         elif actual_entry_edge_pct is None:
@@ -3273,7 +3295,8 @@ class VariationalToLighterRuntime:
         lit_pos_text = ""
         if self.args.auto_hedge:
             lit_label = "Lit仓" if is_zh else "Litpos"
-            lit_pos_text = f"{lit_label}{self._current_lighter_position():+.3f} | "
+            lit_position = f"{self._current_lighter_position():+.3f}" if lighter_position_known else "--"
+            lit_pos_text = f"{lit_label}{lit_position} | "
         halt_text = ""
         if self._strategy_halted:
             stop_label = "停止" if is_zh else "HALT"
@@ -3281,7 +3304,12 @@ class VariationalToLighterRuntime:
         # 两腿不平衡会静默拦住策略下单，显式标出来免得找不到原因。
         imbalance_text = ""
         imbalanced = False
-        if self.args.auto_hedge and not self._strategy_halted and self._cached_position_qty is not None:
+        if (
+            self.args.auto_hedge
+            and not self._strategy_halted
+            and self._cached_position_qty is not None
+            and lighter_position_known
+        ):
             net = self._cached_position_qty + self._current_lighter_position()
             if abs(net) > self._balance_tolerance():
                 imbalanced = True
@@ -3297,11 +3325,12 @@ class VariationalToLighterRuntime:
             disconnect_text = f"[bold red]⛔{dc_label}[/] | "
         lit_ready_text = ""
         if self.args.auto_hedge:
-            if self._lighter_ready:
+            fully_ready = self._lighter_ready and self.lighter_order_book_ready and lighter_position_known
+            if fully_ready:
                 ready_label = "Lighter就绪" if is_zh else "Lighter ready"
                 lit_ready_text = f" | [bold green]✅{ready_label}[/]"
             else:
-                warming_label = "Lighter预热中" if is_zh else "Lighter warming"
+                warming_label = "Lighter仓位/盘口同步中" if is_zh else "Lighter position/book syncing"
                 lit_ready_text = f" | [yellow]…{warming_label}[/]"
         usdc_mid = None
         usdc_basis_pct = None

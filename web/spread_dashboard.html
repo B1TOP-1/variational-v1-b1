@@ -37,7 +37,12 @@
     .chart-tools button { width: 30px; height: 26px; padding: 0; background: white; color: #33404c; font-size: 16px; }
     h2 { margin: 0; font-size: 14px; }
     .chart-meta { color: #75808b; font-size: 11px; overflow-wrap: anywhere; }
-    .canvas-wrap { position: relative; width: 100%; height: clamp(360px, calc(100vh - 280px), 720px); border: 1px solid #d5dce2; background: white; cursor: grab; user-select: none; overflow: hidden; }
+    .view-extrema { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 8px; border: 1px solid #d5dce2; background: #f8fafb; }
+    .extrema-metric { min-width: 0; padding: 8px 12px; }
+    .extrema-metric + .extrema-metric { border-left: 1px solid #e1e6ea; }
+    .extrema-metric span { display: block; color: #75808b; font-size: 9px; font-weight: 700; }
+    .extrema-metric strong { display: block; margin-top: 2px; font: 700 12px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .canvas-wrap { position: relative; width: 100%; height: clamp(340px, calc(100vh - 350px), 680px); border: 1px solid #d5dce2; background: white; cursor: grab; user-select: none; overflow: hidden; }
     .canvas-wrap.dragging { cursor: grabbing; }
     canvas { display: block; width: 100%; height: 100%; }
     .tooltip { position: absolute; display: none; min-width: 176px; padding: 8px 10px; border: 1px solid #bbc5ce; border-radius: 4px; background: rgb(255 255 255 / 96%); box-shadow: 0 4px 16px rgb(23 32 42 / 12%); pointer-events: none; font-size: 11px; line-height: 1.55; }
@@ -46,8 +51,18 @@
     .legend span::before { content: ""; display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }
     .legend .long-key::before { background: #2589c9; } .legend .short-key::before { background: #8257d9; }
     .empty { position: absolute; inset: 0; display: grid; place-items: center; color: #75808b; font-size: 13px; }
+    .daily-section { margin-top: 20px; border-top: 1px solid #cbd3da; }
+    .daily-section h2 { padding: 14px 0 10px; }
+    .daily-grid { border-top: 1px solid #d5dce2; }
+    .daily-row { display: grid; grid-template-columns: minmax(100px, .8fr) repeat(4, minmax(110px, 1fr)); border-bottom: 1px solid #d5dce2; background: white; }
+    .daily-cell { min-width: 0; padding: 8px 10px; font: 650 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+    .daily-cell + .daily-cell { border-left: 1px solid #e5e9ed; }
+    .daily-cell small { display: block; margin-bottom: 2px; color: #75808b; font: 700 9px/1.2 Inter, "Segoe UI", system-ui, sans-serif; }
+    .daily-day { font-family: Inter, "Segoe UI", system-ui, sans-serif; }
+    .daily-day strong { display: block; }
+    .daily-day span { color: #75808b; font-size: 9px; }
     @media (max-width: 1180px) { .summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } .metric:nth-child(4) { border-left: 0; } }
-    @media (max-width: 720px) { header, .toolbar, .chart-section { padding-left: 12px; padding-right: 12px; } .toolbar { align-items: stretch; flex-direction: column; } select { width: 100%; } .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric:nth-child(odd) { border-left: 0; } .metric:nth-child(4) { border-left: 1px solid #e1e6ea; } .chart-head-right { width: 100%; justify-content: space-between; } .canvas-wrap { height: 430px; } }
+    @media (max-width: 720px) { header, .toolbar, .chart-section { padding-left: 12px; padding-right: 12px; } .toolbar { align-items: stretch; flex-direction: column; } select { width: 100%; } .summary, .view-extrema { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric:nth-child(odd), .extrema-metric:nth-child(odd) { border-left: 0; } .metric:nth-child(4) { border-left: 1px solid #e1e6ea; } .extrema-metric:nth-child(n + 3) { border-top: 1px solid #e1e6ea; } .chart-head-right { width: 100%; justify-content: space-between; } .canvas-wrap { height: 400px; } .daily-row { grid-template-columns: repeat(2, minmax(0, 1fr)); } .daily-day { grid-column: 1 / -1; border-bottom: 1px solid #e5e9ed; } .daily-cell:nth-child(2), .daily-cell:nth-child(4) { border-left: 0; } .daily-cell:nth-child(n + 4) { border-top: 1px solid #e5e9ed; } }
   </style>
 </head>
 <body>
@@ -68,8 +83,10 @@
     </section>
     <section class="chart-section">
       <div class="chart-head"><h2 id="chartTitle">价差历史（UTC+8）</h2><div class="chart-head-right"><span id="chartMeta" class="chart-meta">--</span><div class="chart-tools"><button id="zoomOut" type="button" title="缩小">−</button><button id="resetZoom" type="button" title="返回实时窗口">↔</button><button id="zoomIn" type="button" title="放大">+</button></div></div></div>
+      <div class="view-extrema"><div class="extrema-metric"><span>当前窗口 LONG 最低</span><strong id="viewLongMin" class="long">--</strong></div><div class="extrema-metric"><span>当前窗口 LONG 最高</span><strong id="viewLongMax" class="long">--</strong></div><div class="extrema-metric"><span>当前窗口 SHORT 最低</span><strong id="viewShortMin" class="short">--</strong></div><div class="extrema-metric"><span>当前窗口 SHORT 最高</span><strong id="viewShortMax" class="short">--</strong></div></div>
       <div id="canvasWrap" class="canvas-wrap"><canvas id="chart"></canvas><div id="tooltip" class="tooltip"></div><div id="empty" class="empty">运行 main 后开始记录价差</div></div>
       <div class="legend"><span id="legendLong" class="long-key">做多价差（Long Edge）</span><span id="legendShort" class="short-key">做空价差（Short Edge）</span></div>
+      <section class="daily-section"><h2>最近 7 日高低点（原始样本）</h2><div id="dailyExtrema" class="daily-grid"></div></section>
     </section>
   </main>
   <script>
@@ -113,6 +130,15 @@
       $("chartTitle").textContent = `${payload.asset} Long / Short Edge（UTC+8）`;
       const start = payload?.windowStartMs, end = payload?.windowEndMs;
       $("chartMeta").textContent = start && end ? `${dateTime(start)} — ${dateTime(end)}` : "--";
+      const extrema = payload?.viewExtrema || {};
+      $("viewLongMin").textContent = edge(extrema.long?.min); $("viewLongMax").textContent = edge(extrema.long?.max);
+      $("viewShortMin").textContent = edge(extrema.short?.min); $("viewShortMax").textContent = edge(extrema.short?.max);
+      renderDailyExtrema();
+    }
+    function renderDailyExtrema() {
+      const rows = payload?.dailyExtrema || [];
+      const today = new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+      $("dailyExtrema").innerHTML = rows.length ? rows.map((row) => `<div class="daily-row"><div class="daily-cell daily-day"><strong>${row.day}</strong><span>${row.day === today ? "今天" : "历史"}</span></div><div class="daily-cell long"><small>LONG 最低</small>${edge(row.long?.min)}</div><div class="daily-cell long"><small>LONG 最高</small>${edge(row.long?.max)}</div><div class="daily-cell short"><small>SHORT 最低</small>${edge(row.short?.min)}</div><div class="daily-cell short"><small>SHORT 最高</small>${edge(row.short?.max)}</div></div>`).join("") : '<div class="daily-cell">暂无历史</div>';
     }
     function draw() {
       const canvas = $("chart"), wrap = $("canvasWrap"), dpr = window.devicePixelRatio || 1;
@@ -130,7 +156,11 @@
         if (seriesMode === "short") return [Number(point.shortEdge)];
         return [Number(point.longEdge), Number(point.shortEdge)];
       }).filter(Number.isFinite);
-      let lo = Math.min(...values), hi = Math.max(...values), pad = Math.max((hi - lo) * .12, 0.00015); lo -= pad; hi += pad;
+      const visibleExtrema = payload?.viewExtrema || {};
+      if (seriesMode !== "short") values.push(Number(visibleExtrema.long?.min), Number(visibleExtrema.long?.max));
+      if (seriesMode !== "long") values.push(Number(visibleExtrema.short?.min), Number(visibleExtrema.short?.max));
+      const finiteValues = values.filter(Number.isFinite);
+      let lo = Math.min(...finiteValues), hi = Math.max(...finiteValues), pad = Math.max((hi - lo) * .12, 0.00015); lo -= pad; hi += pad;
       const magnitude = Math.max(Math.abs(lo), Math.abs(hi));
       const decimals = magnitude < 0.001 ? 5 : magnitude < 0.01 ? 4 : magnitude < 0.1 ? 3 : 2;
       const area = { l: 82, r: width - 24, t: 18, b: height - 48 }, first = viewStart, last = viewEnd, span = Math.max(1, last - first);
@@ -146,6 +176,7 @@
       const line = (key, color) => { const coordinates = points.map((point) => ({ point, value: Number(point[key]) })).filter((row) => Number.isFinite(row.value)).map((row) => ({ point: row.point, x: x(row.point.timestampMs), y: y(row.value) })); if (!coordinates.length) return; coordinates.forEach((row) => hoverPoints.push({ x: row.x, point: row.point })); ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(coordinates[0].x, coordinates[0].y); for (let index = 1; index < coordinates.length - 1; index++) { const current = coordinates[index], next = coordinates[index + 1]; ctx.quadraticCurveTo(current.x, current.y, (current.x + next.x) / 2, (current.y + next.y) / 2); } if (coordinates.length > 1) ctx.lineTo(coordinates.at(-1).x, coordinates.at(-1).y); ctx.stroke(); };
       if (seriesMode !== "short") line("longEdge", "#2589c9");
       if (seriesMode !== "long") line("shortEdge", "#8257d9");
+      drawExtrema(ctx, x, y, area);
       if (hover && hover.x >= area.l && hover.x <= area.r && hover.y >= area.t && hover.y <= area.b) {
         const hoverEdge = edgeAtY(hover.y), label = edge(hoverEdge);
         ctx.save();
@@ -157,6 +188,26 @@
         ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.fillText(label, area.l - labelWidth / 2 - 4, hover.y + 4);
         ctx.restore();
       }
+    }
+    function drawExtrema(ctx, x, y, area) {
+      const extrema = payload?.viewExtrema || {};
+      const entries = [];
+      if (seriesMode !== "short") entries.push([extrema.long?.minTimestampMs, extrema.long?.min, "多低", "#2589c9"], [extrema.long?.maxTimestampMs, extrema.long?.max, "多高", "#2589c9"]);
+      if (seriesMode !== "long") entries.push([extrema.short?.minTimestampMs, extrema.short?.min, "空低", "#8257d9"], [extrema.short?.maxTimestampMs, extrema.short?.max, "空高", "#8257d9"]);
+      ctx.save(); ctx.font = "700 10px system-ui";
+      entries.forEach(([timestamp, value, name, color], index) => {
+        if (!Number.isFinite(Number(timestamp)) || !Number.isFinite(Number(value))) return;
+        const px = x(Number(timestamp)), py = y(Number(value));
+        if (px < area.l || px > area.r || py < area.t || py > area.b) return;
+        ctx.fillStyle = "#fff"; ctx.beginPath(); ctx.arc(px, py, 4.5, 0, Math.PI * 2); ctx.fill();
+        ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.stroke();
+        const label = `${name} ${edge(value)}`, width = ctx.measureText(label).width + 10;
+        const left = Math.max(area.l, Math.min(area.r - width, px - width / 2));
+        const top = Math.max(area.t, Math.min(area.b - 18, py + (index % 2 === 0 ? 7 : -25)));
+        ctx.fillStyle = color; ctx.fillRect(left, top, width, 18);
+        ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.fillText(label, left + width / 2, top + 12.5);
+      });
+      ctx.restore();
     }
     function syncRangeButtons() {
       document.querySelectorAll("[data-range]").forEach((button) => {

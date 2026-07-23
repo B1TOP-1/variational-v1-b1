@@ -121,6 +121,29 @@ class SpreadStoreTest(unittest.TestCase):
             self.assertEqual(store.sample_count("BTC", 2, end_ms=3_000), 3)
             store.close()
 
+    def test_extrema_use_raw_samples_and_utc8_calendar_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpreadStore(Path(directory) / "spreads.sqlite3")
+            # 2026-07-22 23:00, 2026-07-23 00:00 and 01:00 in UTC+8.
+            timestamps = (1784732400000, 1784736000000, 1784739600000)
+            values = ((0.04, 0.07), (0.01, 0.09), (0.06, 0.03))
+            for timestamp_ms, (long_edge, short_edge) in zip(timestamps, values):
+                store.record(
+                    asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                    long_edge_pct=long_edge, short_edge_pct=short_edge,
+                    timestamp_ms=timestamp_ms,
+                )
+
+            visible = store.extrema("BTC", timestamps[0], timestamps[-1])
+            daily = store.daily_extrema("BTC", 2, end_ms=timestamps[-1])
+
+            self.assertEqual(visible["long"]["min"], 0.01)
+            self.assertEqual(visible["long"]["minTimestampMs"], timestamps[1])
+            self.assertEqual(visible["short"]["max"], 0.09)
+            self.assertEqual([row["day"] for row in daily], ["2026-07-23", "2026-07-22"])
+            self.assertEqual(daily[0]["long"], {"min": 0.01, "max": 0.06})
+            store.close()
+
 
 class SpreadDashboardTest(unittest.TestCase):
     def test_production_dashboard_has_chart_controls(self):
@@ -136,6 +159,9 @@ class SpreadDashboardTest(unittest.TestCase):
         self.assertIn('data-series="both"', html)
         self.assertIn('data-series="long"', html)
         self.assertIn('data-series="short"', html)
+        self.assertIn('id="dailyExtrema"', html)
+        self.assertIn("viewExtrema", html)
+        self.assertIn("drawExtrema", html)
         self.assertIn('addEventListener("wheel"', html)
         self.assertIn('addEventListener("dblclick"', html)
         self.assertIn('addEventListener("mousedown"', html)
@@ -173,6 +199,8 @@ class SpreadDashboardTest(unittest.TestCase):
                 self.assertEqual(history["asset"], "BTC")
                 self.assertEqual(history["sampleCount"], 1)
                 self.assertEqual(history["latest"]["varAsk"], 101.0)
+                self.assertEqual(history["viewExtrema"]["long"]["max"], 1.0)
+                self.assertEqual(len(history["dailyExtrema"]), 1)
             finally:
                 server.stop()
                 store.close()

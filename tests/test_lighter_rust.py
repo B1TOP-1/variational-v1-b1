@@ -53,6 +53,39 @@ class RustLighterGatewayTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.gateway.positions["BTC"], Decimal("-0.015"))
         self.assertTrue(self.gateway.position_ready.is_set())
 
+    async def test_position_from_an_inactive_symbol_does_not_mark_market_ready(self):
+        self.gateway.symbol = "BTC"
+
+        await self.gateway._handle_event(
+            {"type": "position", "symbol": "ETH", "market_id": 0, "quantity": "1.25"}
+        )
+
+        self.assertEqual(self.gateway.positions["ETH"], Decimal("1.25"))
+        self.assertFalse(self.gateway.position_ready.is_set())
+
+    async def test_set_market_requires_and_seeds_authoritative_position(self):
+        async def command(command_type, **fields):
+            self.assertEqual(command_type, "set_market")
+            self.assertEqual(fields["symbol"], "BTC")
+            self.gateway.book_ready.set()
+            return {
+                "data": {
+                    "market_id": 1,
+                    "min_base_amount": "0.001",
+                    "size_multiplier": 1000,
+                    "price_multiplier": 10,
+                    "position_quantity": "0.011",
+                }
+            }
+
+        self.gateway.command = command
+
+        market_id = await self.gateway.set_market("BTC", Decimal("1000"))
+
+        self.assertEqual(market_id, 1)
+        self.assertEqual(self.gateway.positions["BTC"], Decimal("0.011"))
+        self.assertTrue(self.gateway.position_ready.is_set())
+
     async def test_command_result_resolves_matching_request_only(self):
         pending = asyncio.get_running_loop().create_future()
         self.gateway._pending["py-7"] = pending
