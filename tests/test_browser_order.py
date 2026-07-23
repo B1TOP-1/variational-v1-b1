@@ -27,6 +27,32 @@ from variational.listener import VariationalMonitor
 
 
 class BrowserOrderCommandTest(unittest.TestCase):
+    def test_order_payload_keeps_details_removed_from_compact_runtime_log(self):
+        record = OrderLifecycle(
+            trade_key="strategy:test",
+            trade_id="order-1",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            lighter_limit_price=Decimal("65000.5"),
+            lighter_tx_hash="abc123",
+            strategy_section="open",
+            strategy_threshold_pct=Decimal("0.055"),
+            signal_long_edge_pct=Decimal("0.056"),
+            signal_short_edge_pct=Decimal("0.044"),
+        )
+
+        payload = record.to_payload()
+
+        self.assertEqual(payload["lighter_limit_price"], "65000.5")
+        self.assertEqual(payload["lighter_tx_hash"], "abc123")
+        self.assertEqual(payload["strategy_section"], "open")
+        self.assertEqual(payload["strategy_threshold_pct"], "0.055")
+        self.assertEqual(payload["signal_long_edge_pct"], "0.056")
+        self.assertEqual(payload["signal_short_edge_pct"], "0.044")
+
     def test_order_table_uses_compact_chinese_direction_and_cst_time(self):
         record = OrderLifecycle(
             trade_key="strategy:test",
@@ -1165,6 +1191,12 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         )
         rt.records[record.trade_key] = record
         rt.record_order.append(record.trade_key)
+        logged_events = []
+
+        async def append_order_log(event_type, payload):
+            logged_events.append((event_type, payload))
+
+        rt.append_order_log = append_order_log
 
         class ImmediateFillGateway:
             async def place_order(self, **kwargs):
@@ -1183,6 +1215,9 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.lighter_fill_price, Decimal("66200"))
         self.assertIsNotNone(record.lighter_fill_ts_iso)
         self.assertNotIn(record.lighter_client_order_id, rt.lighter_client_order_to_trade_key)
+        submitted = next(payload for event, payload in logged_events if event == "lighter_submitted")
+        self.assertEqual(submitted["lighter_limit_price"], "65340.00")
+        self.assertEqual(submitted["lighter_tx_hash"], "tx-test")
 
     async def test_lighter_submit_failure_hard_stops_strategy(self):
         rt = self._runtime()

@@ -360,6 +360,8 @@ class SpreadMathTest(unittest.TestCase):
         self.assertEqual(record.trigger_spread_pct, Decimal("0.0200"))
         self.assertEqual(record.strategy_action, "open")
         self.assertEqual(record.strategy_signal_source, "gradient")
+        self.assertEqual(record.strategy_section, "open")
+        self.assertEqual(record.strategy_threshold_pct, Decimal("0.0100"))
         self.assertEqual(record.strategy_target_qty, Decimal("0.003"))
         self.assertEqual(record.strategy_current_qty, Decimal("0.001"))
         self.assertEqual(runtime.records[record.trade_key], record)
