@@ -1754,14 +1754,21 @@ class VariationalToLighterRuntime:
             return "-"
         return f"{value:.4f}%"
 
+    @staticmethod
+    def _style_fill_value_by_direction(text: str, side: str | None) -> str:
+        if str(side or "").strip().lower() == "sell":
+            return f"[yellow]{text}[/yellow]"
+        return text
+
     def _fmt_fill_pct_with_leg_slippage(
         self,
         fill_pct: Decimal | None,
         v_slippage_pct: Decimal | None,
         l_slippage_pct: Decimal | None,
+        side: str | None = None,
     ) -> str:
         """成交价差% + 括号分腿滑点：V/L 各自正=有利(绿)/负=不利(红)。"""
-        fill_text = self._fmt_pct(fill_pct)
+        fill_text = self._style_fill_value_by_direction(self._fmt_pct(fill_pct), side)
         parts: list[str] = []
         for label, slip in (("V", v_slippage_pct), ("L", l_slippage_pct)):
             if slip is None:
@@ -3577,9 +3584,14 @@ class VariationalToLighterRuntime:
                     self._fmt_price(row.qty),
                     payload["variational_filled_price"] or "-",
                     payload["lighter_filled_price"] or "-",
-                    self._fmt_price(fill_diff),
+                    self._style_fill_value_by_direction(
+                        self._fmt_price(fill_diff), row.side
+                    ),
                     self._fmt_fill_pct_with_leg_slippage(
-                        fill_diff_pct, row.var_slippage_pct(), row.lighter_slippage_pct()
+                        fill_diff_pct,
+                        row.var_slippage_pct(),
+                        row.lighter_slippage_pct(),
+                        row.side,
                     ),
                 )
 

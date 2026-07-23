@@ -69,6 +69,27 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(VariationalToLighterRuntime._compact_direction_label("buy"), "做多V/做空L")
         self.assertEqual(VariationalToLighterRuntime._order_time_label(record), "7/21 15.42")
 
+    def test_sell_direction_highlights_fill_spread_but_keeps_leg_colors(self):
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+
+        self.assertEqual(
+            runtime._style_fill_value_by_direction("32.26", "sell"),
+            "[yellow]32.26[/yellow]",
+        )
+        self.assertEqual(runtime._style_fill_value_by_direction("32.26", "buy"), "32.26")
+
+        sell_text = runtime._fmt_fill_pct_with_leg_slippage(
+            Decimal("0.0491"), Decimal("0.001"), Decimal("-0.006"), "sell"
+        )
+        self.assertIn("[yellow]0.0491%[/yellow]", sell_text)
+        self.assertIn("V[green]+0.001%[/green]", sell_text)
+        self.assertIn("L[red]-0.006%[/red]", sell_text)
+
+        buy_text = runtime._fmt_fill_pct_with_leg_slippage(
+            Decimal("0.0491"), None, None, "buy"
+        )
+        self.assertEqual(buy_text, "0.0491%")
+
     def test_terminal_dashboard_refreshes_at_active_quote_frequency(self):
         self.assertEqual(DASHBOARD_REFRESH_SECONDS, 0.2)
         self.assertEqual(SPREAD_SAMPLE_INTERVAL_SECONDS, 1.0)
