@@ -807,6 +807,29 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p90, rt._percentile([0.05, 0.06, 0.07, 0.08, 0.09], 90))
         self.assertEqual(p10, rt._percentile([0.05, 0.06, 0.07, 0.08, 0.09], 10))
 
+    async def test_header_places_both_positions_on_binance_line_only(self):
+        rt = self._runtime()
+        rt.current_page = 2
+        rt.variational_ticker = "BTC"
+        rt.ticker = "BTC"
+        rt._cached_position_qty = Decimal("-0.011")
+        rt._lighter_positions = {"BTC": Decimal("0.011")}
+        rt._lighter_position_ready.set()
+        rt.binance_usdc_bid = Decimal("1.00050")
+        rt.binance_usdc_ask = Decimal("1.00051")
+        rt.binance_usdc_updated_at = time.monotonic()
+        console = Console(record=True, width=220, height=50)
+
+        console.print(await rt.render_dashboard())
+        lines = console.export_text().splitlines()
+        binance_line = next(line for line in lines if "Binance USDC/USDT" in line)
+        var_line = next(line for line in lines if "Var↔Lit" in line)
+
+        self.assertIn("持仓-0.011BTC", binance_line)
+        self.assertIn("Lit仓+0.011", binance_line)
+        self.assertNotIn("持仓", var_line)
+        self.assertNotIn("Lit仓", var_line)
+
     def test_refresh_spread_stats_populates_cache(self):
         rt = self._runtime()
         rt.variational_ticker = "BTC"

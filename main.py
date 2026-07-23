@@ -3271,32 +3271,31 @@ class VariationalToLighterRuntime:
         pos_label = "持仓" if is_zh else "pos"
         lighter_position_known = self._current_lighter_position_known()
         if display_position_qty == 0:
-            pos_text = f"{pos_label} 0"
+            position_summary = f"{pos_label}0{self.ticker or ''}"
+            position_detail = ""
         elif actual_entry_edge_pct is None:
             close_market_text = self._fmt_pct(executable_close_edge_pct)
-            pos_text = (
-                f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
-                f"入场Edge -- | 实际平仓Edge -- | 可执行平仓Edge {close_market_text}"
-            )
+            position_summary = f"{pos_label}{display_position_qty:+.3f}{self.ticker}"
+            position_detail = f"入场Edge -- | 实际平仓Edge -- | 可执行平仓Edge {close_market_text}"
         else:
             edge_color = "green" if position_edge_pnl_pct is not None and position_edge_pnl_pct >= 0 else "red"
             actual_close_text = "--" if actual_close_edge_pct is None else f"{actual_close_edge_pct:+.4f}%"
             edge_pnl_text = "--" if position_edge_pnl_pct is None else f"{position_edge_pnl_pct:+.4f}%"
             close_market_text = self._fmt_pct(executable_close_edge_pct)
-            pos_text = (
-                f"{pos_label}{display_position_qty:+.3f}{self.ticker} "
+            position_summary = f"{pos_label}{display_position_qty:+.3f}{self.ticker}"
+            position_detail = (
                 f"入场Edge {actual_entry_edge_pct:+.4f}% | 实际平仓Edge {actual_close_text} | "
                 f"可执行平仓Edge {close_market_text} | "
                 f"[{edge_color}]已平Edge收益 {edge_pnl_text}[/]"
             )
         active_signal = self._latest_gradient_signal
         if active_signal is not None and active_signal.source == "round_exit_guard":
-            pos_text += f" | [bold yellow]万一Edge→{active_signal.target_qty:+.3f}[/]"
-        lit_pos_text = ""
+            position_detail += f" | [bold yellow]万一Edge→{active_signal.target_qty:+.3f}[/]"
+        lighter_position_summary = ""
         if self.args.auto_hedge:
             lit_label = "Lit仓" if is_zh else "Litpos"
             lit_position = f"{self._current_lighter_position():+.3f}" if lighter_position_known else "--"
-            lit_pos_text = f"{lit_label}{lit_position} | "
+            lighter_position_summary = f"  {lit_label}{lit_position}"
         halt_text = ""
         if self._strategy_halted:
             stop_label = "停止" if is_zh else "HALT"
@@ -3352,11 +3351,12 @@ class VariationalToLighterRuntime:
                 f"Mid {usdc_mid:.5f}  基差 {usdc_basis_pct:+.4f}%  盘口 {usdc_book_bps:.2f}bp  "
                 f"Age {age_text} | 仅观察"
             )
+        detail_text = f" | {position_detail}" if position_detail else ""
         header = Panel(
-            f"[bold cyan]{usdc_line}[/]\n"
+            f"[bold cyan]{usdc_line}[/]  [bold]{position_summary}{lighter_position_summary}[/]\n"
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text} | {pos_text} | {lit_pos_text}{now_cst_display()}{lit_ready_text}",
+            f"{halt_text}{disconnect_text}{imbalance_text}{pnl_text}{detail_text} | {now_cst_display()}{lit_ready_text}",
             border_style="red" if (self._strategy_halted or disconnected) else ("yellow" if imbalanced else "cyan"),
         )
 
