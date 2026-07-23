@@ -398,6 +398,7 @@ async function restoreRuntimeState() {
     restForwarder.connect();
     brokerSocket.connect();
     void installDomQuoteObserver(tabId);
+    void installDomNoticeObserver(tabId);
     if (state.activeQuoteTemplate) {
       void installActiveQuotePoller(tabId, state.activeQuoteTemplate);
     }
@@ -1249,6 +1250,70 @@ function stopDomQuoteObserverInPage() {
   return { ok: true };
 }
 
+// 只观察新增节点，采集右下角 Toast；不扫描或修改订单表单。
+function installDomNoticeObserverInPage() {
+  const KEY = "__varDomNoticeObserverV1__";
+  const existing = window[KEY];
+  if (existing && existing.active) return { ok: true, reused: true };
+  if (!document.body) return { ok: false, error: "body_missing" };
+
+  const state = { active: true, seen: new Map(), observer: null };
+  window[KEY] = state;
+
+  const emit = (candidate) => {
+    if (!(candidate instanceof Element) || !candidate.classList.contains("max-h-[180px]")) return;
+    const spans = Array.from(candidate.querySelectorAll("span.text-2xs"));
+    if (spans.length < 1) return;
+    const title = String(spans[0].innerText || spans[0].textContent || "").replace(/\s+/g, " ").trim();
+    const message = String(spans[1]?.innerText || spans[1]?.textContent || "").replace(/\s+/g, " ").trim();
+    if (!title && !message) return;
+    const key = `${title}\n${message}`;
+    const now = Date.now();
+    if (now - (state.seen.get(key) || 0) < 5000) return;
+    state.seen.set(key, now);
+    if (state.seen.size > 100) {
+      const oldest = state.seen.keys().next().value;
+      state.seen.delete(oldest);
+    }
+    try {
+      chrome.runtime.sendMessage({
+        action: "dom_notice_event",
+        payload: { title, message, ts: now, capturedAt: new Date(now).toISOString() }
+      });
+    } catch {
+      // Ignore transient delivery failures while the extension worker resumes.
+    }
+  };
+
+  const scan = (root) => {
+    if (!(root instanceof Element) && root !== document) return;
+    if (root instanceof Element) emit(root);
+    for (const candidate of root.querySelectorAll?.('[class~="max-h-[180px]"]') || []) emit(candidate);
+  };
+
+  state.observer = new MutationObserver((mutations) => {
+    for (const mutation of mutations) {
+      for (const node of mutation.addedNodes) {
+        if (!(node instanceof Element)) continue;
+        setTimeout(() => scan(node), 0);
+      }
+    }
+  });
+  state.observer.observe(document.body, { childList: true, subtree: true });
+  state.stop = () => {
+    state.active = false;
+    state.observer?.disconnect();
+  };
+  scan(document);
+  return { ok: true };
+}
+
+function stopDomNoticeObserverInPage() {
+  const state = window.__varDomNoticeObserverV1__;
+  if (state && typeof state.stop === "function") state.stop();
+  return { ok: true };
+}
+
 async function installDomQuoteObserver(tabId) {
   if (tabId == null) {
     return;
@@ -1264,6 +1329,19 @@ async function installDomQuoteObserver(tabId) {
   }
 }
 
+async function installDomNoticeObserver(tabId) {
+  if (tabId == null) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: installDomNoticeObserverInPage
+    });
+  } catch {
+    // Navigation races are retried after the tab finishes loading.
+  }
+}
+
 async function stopDomQuoteObserver(tabId) {
   if (tabId == null) return;
   try {
@@ -1271,6 +1349,19 @@ async function stopDomQuoteObserver(tabId) {
       target: { tabId },
       world: "ISOLATED",
       func: stopDomQuoteObserverInPage
+    });
+  } catch {
+    // Tab may already be navigating or closed.
+  }
+}
+
+async function stopDomNoticeObserver(tabId) {
+  if (tabId == null) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "ISOLATED",
+      func: stopDomNoticeObserverInPage
     });
   } catch {
     // Tab may already be navigating or closed.
@@ -1311,6 +1402,7 @@ async function startForwarding(tabId = null) {
   restForwarder.connect();
   brokerSocket.connect();
   void installDomQuoteObserver(targetTabId);
+  void installDomNoticeObserver(targetTabId);
   autoReloadAttachedTab("forwarder started");
   notifyStatus();
   return getStatus();
@@ -1996,6 +2088,7 @@ async function stopForwarding() {
   const attachedTabId = state.attachedTabId;
   await stopActiveQuotePoller(attachedTabId);
   await stopDomQuoteObserver(attachedTabId);
+  await stopDomNoticeObserver(attachedTabId);
   cleanupForwardingState();
   await persistRuntimeState();
   if (attachedTabId != null) {
@@ -2282,6 +2375,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
 
+    if (message.action === "dom_notice_event") {
+      brokerSocket.send({
+        event: "dom_notice",
+        title: message.payload && message.payload.title,
+        message: message.payload && message.payload.message,
+        ts: message.payload && message.payload.ts,
+        capturedAt: message.payload && message.payload.capturedAt
+      });
+      return { ok: true };
+    }
+
     if (message.action === "getStatus") {
       return { ok: true, status: getStatus() };
     }
@@ -2328,6 +2432,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (state.active && tabId === state.attachedTabId && changeInfo.status === "complete") {
     void installDomQuoteObserver(tabId);
+    void installDomNoticeObserver(tabId);
     void restorePreparedOrder(tabId);
     if (state.activeQuoteTemplate) {
       void installActiveQuotePoller(tabId, state.activeQuoteTemplate);

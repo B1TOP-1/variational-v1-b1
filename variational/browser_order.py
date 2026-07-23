@@ -61,6 +61,7 @@ class BrowserOrderBroker:
         self._pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         # 可选：扩展推送的 DOM 报价事件回调（仅观测记录用）。
         self.on_dom_quote: Any = None
+        self.on_dom_notice: Any = None
 
     def is_connected(self) -> bool:
         return self._websocket is not None
@@ -94,6 +95,13 @@ class BrowserOrderBroker:
             if self.on_dom_quote is not None:
                 try:
                     self.on_dom_quote(payload)
+                except Exception:
+                    pass
+            return
+        if payload.get("event") == "dom_notice":
+            if self.on_dom_notice is not None:
+                try:
+                    self.on_dom_notice(payload)
                 except Exception:
                     pass
             return

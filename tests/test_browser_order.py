@@ -274,6 +274,21 @@ class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["valueText"], "0.003 XAU")
         self.assertEqual(broker.pending_count(), 0)
 
+    async def test_dom_notice_is_forwarded_to_observer(self):
+        broker = BrowserOrderBroker()
+        notices = []
+        broker.on_dom_notice = notices.append
+
+        await broker.handle_raw_message(json.dumps({
+            "event": "dom_notice",
+            "title": "连接已断开",
+            "message": "正在尝试重新连接。",
+            "ts": 123,
+        }))
+
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(notices[0]["title"], "连接已断开")
+
     async def test_dispatch_queue_runs_submitted_items_in_order(self):
         handled: list[str] = []
 

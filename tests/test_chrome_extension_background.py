@@ -198,7 +198,7 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
     def test_dom_quote_observer_only_watches_price_nodes(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()
         observer_start = background.index("function installDomQuoteObserverInPage()")
-        observer_end = background.index("async function installDomQuoteObserver(tabId)")
+        observer_end = background.index("// 只观察新增节点，采集右下角 Toast")
         observer_source = background[observer_start:observer_end]
 
         self.assertIn("observer.observe(element", observer_source)
@@ -206,6 +206,19 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("setInterval(bindPriceNodes, 1000)", observer_source)
         self.assertIn("disconnectPriceObservers", observer_source)
         self.assertIn("stopDomQuoteObserverInPage", background)
+
+    def test_dom_notice_observer_forwards_to_broker_without_form_interaction(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+        observer_start = background.index("function installDomNoticeObserverInPage()")
+        observer_end = background.index("function stopDomNoticeObserverInPage()")
+        observer_source = background[observer_start:observer_end]
+
+        self.assertIn('classList.contains("max-h-[180px]")', observer_source)
+        self.assertIn('querySelectorAll("span.text-2xs")', observer_source)
+        self.assertIn("state.observer.observe(document.body, { childList: true, subtree: true })", observer_source)
+        self.assertIn('action: "dom_notice_event"', observer_source)
+        self.assertNotIn("submit-button", observer_source)
+        self.assertIn('event: "dom_notice"', background)
 
     def test_popup_exposes_active_quote_controls(self):
         popup = (ROOT / "chrome_extension" / "popup.html").read_text()

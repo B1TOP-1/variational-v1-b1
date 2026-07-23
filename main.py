@@ -568,6 +568,7 @@ class VariationalToLighterRuntime:
         self._hourly_rows_cache: list[dict[str, Any]] = []
         self._spread_trend_cache: tuple[list[float | None], float | None, float | None] = ([], None, None)
         self.browser_order_broker.on_dom_quote = self._on_dom_quote
+        self.browser_order_broker.on_dom_notice = self._on_dom_notice
         self.runtime.monitor.on_quote_update = self._on_api_quote
         # 统计面板（第2页）：延迟/分腿滑点/信号确认时长/下单成交数。
         self._stat_fired = 0
@@ -2554,6 +2555,35 @@ class VariationalToLighterRuntime:
         self._last_dom_bid = to_decimal(payload.get("bid"))
         self._last_dom_ask = to_decimal(payload.get("ask"))
         self._last_dom_at = time.monotonic()
+
+    def _on_dom_notice(self, payload: dict[str, Any]) -> None:
+        self._schedule_background_task(self._log_dom_notice(payload))
+
+    async def _log_dom_notice(self, payload: dict[str, Any]) -> None:
+        title = re.sub(r"\s+", " ", str(payload.get("title") or "")).strip() or "页面通知"
+        message = re.sub(r"\s+", " ", str(payload.get("message") or "")).strip()
+        try:
+            state = await self.runtime.monitor.get_trading_state()
+        except Exception:
+            state = {}
+        heartbeat_age = state.get("heartbeat_age")
+        quote_age_ms = self.quote_comparator.freshness_ms("api", time.monotonic() * 1000.0)
+        heartbeat_text = "-" if heartbeat_age is None else f"{float(heartbeat_age):.1f}s"
+        quote_text = "-" if quote_age_ms is None else f"{float(quote_age_ms) / 1000.0:.1f}s"
+        var_position = self._cached_position_qty
+        lighter_position = (
+            self._current_lighter_position() if self._current_lighter_position_known() else None
+        )
+        detail = f" | {message}" if message else ""
+        self.logger.warning(
+            "Var页面通知: %s%s | 心跳Age=%s 报价Age=%s Var仓=%s Lit仓=%s",
+            title,
+            detail,
+            heartbeat_text,
+            quote_text,
+            decimal_to_str(var_position),
+            decimal_to_str(lighter_position),
+        )
 
     async def _compute_signal_spreads(self) -> tuple[Decimal | None, Decimal | None]:
         """实时算两侧触发价差（Var 报价 × Lighter 深度 VWAP），不读仓位。"""
