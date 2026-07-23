@@ -138,12 +138,46 @@ class RoundExitLedgerTest(unittest.TestCase):
 
     def test_full_close_archives_and_clears_live_edges(self):
         ledger = self.ledger()
-        ledger.apply_fill("sell", D("0.002"), D("0.042"), normal_close_threshold=D("0.06"))
-        completed = ledger.apply_fill("buy", D("0.002"), D("0.052"))
+        ledger.apply_fill(
+            "sell", D("0.002"), D("0.042"),
+            normal_close_threshold=D("0.06"), reference_price=D("65000"),
+        )
+        completed = ledger.apply_fill(
+            "buy", D("0.002"), D("0.052"), reference_price=D("65000")
+        )
         self.assertEqual(completed[0].edge_pnl, D("0.010"))
+        self.assertEqual(completed[0].estimated_quote_pnl, D("0.013000"))
         self.assertIsNone(ledger.entry_edge_actual)
         self.assertIsNone(ledger.close_edge_actual)
         self.assertEqual(len(ledger.completed_rounds), 1)
+
+        restored = RoundExitLedger.from_state(ledger.config, ledger.to_state())
+        self.assertEqual(restored.completed_rounds, completed)
+
+    def test_version_two_state_remains_loadable_without_completed_rounds(self):
+        ledger = self.ledger()
+        ledger.apply_fill("sell", D("0.002"), D("0.042"))
+        state = ledger.to_state()
+        state["version"] = 2
+        state.pop("estimated_quote_pnl")
+        state.pop("estimated_quote_pnl_qty")
+        state.pop("completed_rounds")
+
+        restored = RoundExitLedger.from_state(ledger.config, state)
+
+        self.assertEqual(restored.position_qty, D("-0.002"))
+        self.assertEqual(restored.entry_edge_actual, D("0.042"))
+        self.assertEqual(restored.completed_rounds, [])
+
+    def test_quote_pnl_estimate_uses_each_close_fill_reference_price(self):
+        ledger = self.ledger()
+        ledger.apply_fill("sell", D("0.002"), D("0.050"))
+        ledger.apply_fill("buy", D("0.001"), D("0.060"), reference_price=D("65000"))
+        completed = ledger.apply_fill(
+            "buy", D("0.001"), D("0.070"), reference_price=D("66000")
+        )
+
+        self.assertEqual(completed[0].estimated_quote_pnl, D("0.0197"))
 
     def test_cross_zero_fill_splits_completed_and_new_round(self):
         ledger = self.ledger()

@@ -299,6 +299,7 @@ class OrderLifecycle:
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
+            "lighter_filled_qty": decimal_to_str(self.lighter_filled_qty),
             "lighter_filled_at": self.lighter_fill_ts_iso,
             "trigger_spread_pct": decimal_to_str(self.trigger_spread_pct),
             "first_hit_spread_pct": decimal_to_str(self.first_hit_spread_pct),
@@ -947,7 +948,8 @@ class VariationalToLighterRuntime:
             else:
                 record.lighter_fill_ts_iso = now_iso
                 completed = True
-            self._maybe_record_slippage_stats(record)
+            if completed:
+                self._maybe_record_slippage_stats(record)
             # Lighter 端到端延迟：信号触发 → 收到 Lighter WS 成交（仅策略单）。
             if record.signal_trigger_monotonic is not None and not record.lighter_latency_recorded:
                 self._stat_lighter_latency.add((time.monotonic() - record.signal_trigger_monotonic) * 1000)
@@ -960,10 +962,13 @@ class VariationalToLighterRuntime:
         logger = getattr(self, "logger", None)
         if logger is not None:
             logger.info(
-                "Lighter WS成交回填: key=%s coid=%s side=%s qty=%s price=%s fill_time=%s",
+                "Lighter WS成交回填: key=%s coid=%s side=%s fill_qty=%s cumulative=%s/%s "
+                "price_vwap=%s fill_time=%s",
                 record.trade_key,
                 client_order_id,
                 record.lighter_side,
+                decimal_to_str(applied_qty),
+                decimal_to_str(record.lighter_filled_qty),
                 decimal_to_str(record.qty),
                 decimal_to_str(record.lighter_fill_price),
                 now_iso,
@@ -974,6 +979,8 @@ class VariationalToLighterRuntime:
         if record.slippage_recorded:
             return
         if record.var_fill_price is None or record.lighter_fill_price is None:
+            return
+        if record.lighter_filled_qty < record.qty:
             return
         self._stat_both_filled += 1
         v = record.var_slippage_pct()
@@ -1054,12 +1061,16 @@ class VariationalToLighterRuntime:
         existing_round_id = ledger.round_id
         normal_threshold = self._normal_close_threshold_for_entry_side(side)
         try:
+            reference_price = None
+            if record.var_fill_price is not None and record.lighter_fill_price is not None:
+                reference_price = (record.var_fill_price + record.lighter_fill_price) / Decimal("2")
             completed = ledger.apply_fill(
                 side,
                 record.qty,
                 fill_edge,
                 normal_close_threshold=normal_threshold,
                 next_normal_close_threshold=normal_threshold,
+                reference_price=reference_price,
             )
         except RoundStateError as exc:
             record.round_accounted = True
@@ -1074,12 +1085,14 @@ class VariationalToLighterRuntime:
         self._persist_round_exit_ledger()
         for item in completed:
             self.logger.info(
-                "本轮归零: round=%s side=%s entry_edge=%s close_edge=%s edge_pnl=%s",
+                "本轮归零: round=%s side=%s entry_edge=%s close_edge=%s edge_pnl=%s "
+                "estimated_quote_pnl=%s",
                 item.round_id,
                 item.side,
                 decimal_to_str(item.entry_edge_actual),
                 decimal_to_str(item.close_edge_actual),
                 decimal_to_str(item.edge_pnl),
+                decimal_to_str(item.estimated_quote_pnl),
             )
 
     def _load_round_exit_ledger(self) -> RoundExitLedger:
@@ -2034,6 +2047,26 @@ class VariationalToLighterRuntime:
             return record.var_fill_price - lighter
         return None
 
+    def _session_execution_summary(self) -> tuple[Decimal, Decimal, int]:
+        """Completed two-leg cashflow, quantity, and count for this process.
+
+        The cashflow includes fills belonging to a still-open hedged position,
+        so it is an execution difference rather than realized PnL.
+        """
+        cashflow = Decimal("0")
+        quantity = Decimal("0")
+        count = 0
+        for record in self.records.values():
+            if record.lighter_filled_qty < record.qty:
+                continue
+            unit_spread = self._record_unit_spread(record)
+            if unit_spread is None:
+                continue
+            cashflow += unit_spread * record.qty
+            quantity += record.qty
+            count += 1
+        return cashflow, quantity, count
+
     def compute_pnl(self) -> tuple[Decimal, Decimal, int, Decimal, Decimal | None]:
         """FIFO-offset PnL (USDC) over fully-filled rounds. Caller holds _record_lock.
 
@@ -2053,7 +2086,7 @@ class VariationalToLighterRuntime:
             if record is None:
                 continue
             unit = self._record_unit_spread(record)
-            if unit is None:
+            if unit is None or record.lighter_filled_qty < record.qty:
                 pending += 1
                 continue
             _, pct = fill_diff_by_direction(
@@ -3033,8 +3066,32 @@ class VariationalToLighterRuntime:
 
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1)
+        session_cashflow, session_qty, session_count = self._session_execution_summary()
+        latest_round = (
+            self.round_exit_ledger.completed_rounds[-1]
+            if self.round_exit_ledger.completed_rounds
+            else None
+        )
         if is_zh:
             grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
+            grid.add_row(
+                f"本次成交净额: {session_cashflow:+.4f}u | {session_qty:g} "
+                f"{self.ticker or ''} / {session_count}笔 (含未平仓·未扣费)"
+            )
+            if latest_round is None:
+                grid.add_row("最近完整轮次收益: -")
+            else:
+                quote_text = (
+                    f"约 {latest_round.estimated_quote_pnl:+.4f}u"
+                    if latest_round.estimated_quote_pnl is not None
+                    else "金额不可用"
+                )
+                grid.add_row(
+                    f"最近完整轮次 #{latest_round.round_id}: "
+                    f"入 {latest_round.entry_edge_actual:+.4f}% → "
+                    f"平 {latest_round.close_edge_actual:+.4f}% | "
+                    f"收益 {latest_round.edge_pnl:+.4f}% ({quote_text}·未扣费)"
+                )
             grid.add_row(f"Long 实际成交Edge: {fmt_fill_edge(self._stat_long_fill_edge)}")
             grid.add_row(f"Short 实际成交Edge: {fmt_fill_edge(self._stat_short_fill_edge)}")
             grid.add_row(f"信号确认时长: {fmt_ms(self._stat_signal_confirm)}")
@@ -3047,6 +3104,25 @@ class VariationalToLighterRuntime:
             title = "统计（本地会话）"
         else:
             grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
+            grid.add_row(
+                f"session fill cashflow: {session_cashflow:+.4f}u | "
+                f"{session_qty:g} {self.ticker or ''} / {session_count} fills "
+                "(includes open inventory; before fees)"
+            )
+            if latest_round is None:
+                grid.add_row("latest completed round PnL: -")
+            else:
+                quote_text = (
+                    f"est. {latest_round.estimated_quote_pnl:+.4f}u"
+                    if latest_round.estimated_quote_pnl is not None
+                    else "quote unavailable"
+                )
+                grid.add_row(
+                    f"latest completed round #{latest_round.round_id}: "
+                    f"entry {latest_round.entry_edge_actual:+.4f}% → "
+                    f"close {latest_round.close_edge_actual:+.4f}% | "
+                    f"PnL {latest_round.edge_pnl:+.4f}% ({quote_text}; before fees)"
+                )
             grid.add_row(f"Long actual fill edge: {fmt_fill_edge(self._stat_long_fill_edge)}")
             grid.add_row(f"Short actual fill edge: {fmt_fill_edge(self._stat_short_fill_edge)}")
             grid.add_row(f"signal confirm: {fmt_ms(self._stat_signal_confirm)}")
@@ -3201,7 +3277,8 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             recent_keys = list(self.record_order)[-order_row_limit:]
             rows = [self.records[key] for key in reversed(recent_keys) if key in self.records]
-            realized_pnl, unrealized_pnl, _pnl_pending, position_qty, _avg_open_pct = self.compute_pnl()
+            _realized_pnl, _unrealized_pnl, _pnl_pending, position_qty, _avg_open_pct = self.compute_pnl()
+            session_cashflow, _session_qty, session_count = self._session_execution_summary()
 
         # 廉价兜底刷新缓存仓位（仅 listener，无 DOM 往返），防外部手动改仓。
         await self._refresh_position_cache(allow_dom=False)
@@ -3259,14 +3336,36 @@ class VariationalToLighterRuntime:
         hedge_color = "green" if self.args.auto_hedge else "red"
         hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
 
-        r_color = "green" if realized_pnl >= 0 else "red"
-        u_color = "green" if unrealized_pnl >= 0 else "red"
-        realized_u = "0" if realized_pnl == 0 else f"{realized_pnl:.2f}u"
-        unrealized_u = "0" if unrealized_pnl == 0 else f"{unrealized_pnl:.2f}u"
-        if is_zh:
-            pnl_text = f"收益：[{r_color}]{realized_u}[/]（[{u_color}]{unrealized_u}[/]）"
+        session_color = "green" if session_cashflow >= 0 else "red"
+        session_value = "0" if session_cashflow == 0 else f"{session_cashflow:+.4f}u"
+        latest_round = ledger.completed_rounds[-1] if ledger.completed_rounds else None
+        if latest_round is None:
+            latest_round_text = "最近完整轮次 -" if is_zh else "latest round -"
         else:
-            pnl_text = f"PnL: [{r_color}]{realized_u}[/] ([{u_color}]{unrealized_u}[/])"
+            round_color = "green" if latest_round.edge_pnl >= 0 else "red"
+            quote_text = (
+                f"≈{latest_round.estimated_quote_pnl:+.4f}u"
+                if latest_round.estimated_quote_pnl is not None
+                else "金额--"
+            )
+            if is_zh:
+                latest_round_text = (
+                    f"最近完整轮次 [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
+                )
+            else:
+                latest_round_text = (
+                    f"latest round [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
+                )
+        if is_zh:
+            pnl_text = (
+                f"本次成交净额 [{session_color}]{session_value}[/]/{session_count}笔(含未平单) | "
+                f"{latest_round_text}"
+            )
+        else:
+            pnl_text = (
+                f"session cashflow [{session_color}]{session_value}[/]/{session_count} fills(open included) | "
+                f"{latest_round_text}"
+            )
 
         pos_label = "持仓" if is_zh else "pos"
         lighter_position_known = self._current_lighter_position_known()

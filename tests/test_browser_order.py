@@ -827,6 +827,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("持仓-0.011BTC", binance_line)
         self.assertIn("Lit仓+0.011", binance_line)
+        self.assertIn("本次成交净额", var_line)
         self.assertNotIn("持仓", var_line)
         self.assertNotIn("Lit仓", var_line)
 
@@ -991,6 +992,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
             dom_trigger_price=Decimal("99"),
             lighter_trigger_price=Decimal("100"),
             lighter_fill_price=Decimal("98"),
+            lighter_filled_qty=Decimal("0.001"),
         )
         rt._maybe_record_slippage_stats(rec)
         rt._maybe_record_slippage_stats(rec)  # 去重：只记一次
@@ -1014,6 +1016,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
             last_variational_status="filled",
             var_fill_price=Decimal("100"),
             lighter_fill_price=Decimal("99"),
+            lighter_filled_qty=Decimal("0.001"),
         )
         rt._maybe_record_slippage_stats(short)
         self.assertEqual(rt._stat_short_fill_edge.n, 1)
@@ -1081,7 +1084,10 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
             asset="BTC",
             auto_hedge_enabled=True,
             last_variational_status="strategy_submitted",
+            var_fill_price=Decimal("99"),
+            lighter_side="SELL",
         )
+        rt._round_ledger_synced = True
         rt.lighter_client_order_to_trade_key[88] = key
 
         await rt.handle_lighter_fill_update(
@@ -1089,6 +1095,9 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(88, rt.lighter_client_order_to_trade_key)
         self.assertIsNone(rt.records[key].lighter_fill_ts_iso)
+        self.assertEqual(rt._stat_both_filled, 0)
+        self.assertFalse(rt.records[key].slippage_recorded)
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0"))
 
         await rt.handle_lighter_fill_update(
             {"kind": "fill", "client_order_index": 88, "price": "110", "quantity": "0.006"}
@@ -1096,6 +1105,43 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(88, rt.lighter_client_order_to_trade_key)
         self.assertEqual(rt.records[key].lighter_fill_price, Decimal("106"))
         self.assertIsNotNone(rt.records[key].lighter_fill_ts_iso)
+        self.assertEqual(rt._stat_both_filled, 1)
+        self.assertTrue(rt.records[key].slippage_recorded)
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.01"))
+
+    def test_session_execution_summary_only_counts_complete_two_leg_orders(self):
+        rt = self._runtime()
+        complete = OrderLifecycle(
+            trade_key="strategy:complete",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.002"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal("100"),
+            lighter_fill_price=Decimal("101"),
+            lighter_filled_qty=Decimal("0.002"),
+        )
+        partial = OrderLifecycle(
+            trade_key="strategy:partial-summary",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal("102"),
+            lighter_fill_price=Decimal("100"),
+            lighter_filled_qty=Decimal("0.0005"),
+        )
+        rt.records = {complete.trade_key: complete, partial.trade_key: partial}
+        rt.record_order.extend((complete.trade_key, partial.trade_key))
+
+        self.assertEqual(
+            rt._session_execution_summary(),
+            (Decimal("0.002"), Decimal("0.002"), 1),
+        )
 
     async def test_immediate_lighter_fill_is_mapped_before_create_order_returns(self):
         rt = self._runtime()
