@@ -188,6 +188,150 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertIsNone(parse(""))
         self.assertIsNone(parse(None))
 
+    def test_derive_position_fill_price_from_weighted_entry(self):
+        derive = VariationalToLighterRuntime._derive_position_fill_price
+
+        price = derive(
+            side="buy",
+            qty=Decimal("0.001"),
+            before_qty=Decimal("0.005"),
+            before_avg_price=Decimal("65000"),
+            before_rpnl=Decimal("0"),
+            after_qty=Decimal("0.006"),
+            after_avg_price=Decimal("65100"),
+            after_rpnl=Decimal("0"),
+            tolerance=Decimal("0.00001"),
+        )
+        self.assertEqual(price, Decimal("65600"))
+
+    def test_derive_position_close_price_uses_realized_pnl_delta(self):
+        derive = VariationalToLighterRuntime._derive_position_fill_price
+
+        price = derive(
+            side="sell",
+            qty=Decimal("0.001"),
+            before_qty=Decimal("0.005"),
+            before_avg_price=Decimal("65000"),
+            before_rpnl=Decimal("0"),
+            after_qty=Decimal("0.004"),
+            after_avg_price=Decimal("65000"),
+            after_rpnl=Decimal("0.5"),
+            tolerance=Decimal("0.00001"),
+        )
+        self.assertEqual(price, Decimal("65500"))
+        self.assertIsNone(
+            derive(
+                side="sell",
+                qty=Decimal("0.001"),
+                before_qty=Decimal("0.005"),
+                before_avg_price=Decimal("65000"),
+                before_rpnl=None,
+                after_qty=Decimal("0.004"),
+                after_avg_price=Decimal("65000"),
+                after_rpnl=None,
+                tolerance=Decimal("0.00001"),
+            )
+        )
+
+
+class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _runtime():
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime.ticker = "BTC"
+        runtime._lighter_positions["BTC"] = Decimal("-0.004")
+        runtime._lighter_position_ready.set()
+        runtime.lighter_gateway.size_multiplier = 1000
+        return runtime
+
+    async def test_missing_var_fill_is_recovered_from_position_snapshots(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        entry = OrderLifecycle(
+            trade_key="strategy:entry",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.005"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65000"),
+            lighter_fill_price=Decimal("65010"),
+            lighter_filled_qty=Decimal("0.005"),
+            last_variational_status="filled",
+        )
+        rt.records[entry.trade_key] = entry
+        rt.record_order.append(entry.trade_key)
+        rt._account_round_fill(entry, Decimal("0.05"))
+
+        missing = OrderLifecycle(
+            trade_key="strategy:missing",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            lighter_fill_price=Decimal("65510"),
+            lighter_filled_qty=Decimal("0.001"),
+            var_position_before_qty=Decimal("0.005"),
+            var_position_before_avg_price=Decimal("65000"),
+            var_position_before_rpnl=Decimal("0"),
+            signal_trigger_monotonic=time.monotonic() - 3.0,
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[missing.trade_key] = missing
+        rt.record_order.append(missing.trade_key)
+        rt._cached_position_qty = Decimal("0.004")
+        rt._cached_position_avg_price = Decimal("65000")
+        rt._cached_position_rpnl = Decimal("0.5")
+
+        recovered = await rt._recover_missing_var_fill_from_position(Decimal("0.004"))
+
+        self.assertTrue(recovered)
+        self.assertEqual(missing.var_fill_price, Decimal("65500"))
+        self.assertTrue(missing.var_fill_price_estimated)
+        self.assertEqual(missing.var_fill_price_source, "position_snapshot")
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.004"))
+
+    async def test_manual_missing_var_fill_uses_price_and_marks_source(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        entry = OrderLifecycle(
+            trade_key="strategy:entry",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.005"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65000"),
+            lighter_fill_price=Decimal("65010"),
+            lighter_filled_qty=Decimal("0.005"),
+            last_variational_status="filled",
+        )
+        rt.records[entry.trade_key] = entry
+        rt.record_order.append(entry.trade_key)
+        rt._account_round_fill(entry, Decimal("0.05"))
+        missing = OrderLifecycle(
+            trade_key="strategy:manual",
+            trade_id="",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            lighter_fill_price=Decimal("65510"),
+            lighter_filled_qty=Decimal("0.001"),
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[missing.trade_key] = missing
+        rt.record_order.append(missing.trade_key)
+        rt._cached_position_qty = Decimal("0.004")
+
+        await rt._manual_recover_missing_var_fill(Decimal("65500"))
+
+        self.assertEqual(missing.var_fill_price, Decimal("65500"))
+        self.assertEqual(missing.var_fill_price_source, "manual_input")
+        self.assertTrue(missing.var_fill_price_estimated)
+        self.assertIn("手动补记成功", rt._manual_fill_recovery_status)
+
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
     async def test_listener_only_accepts_active_sequenced_quotes(self):

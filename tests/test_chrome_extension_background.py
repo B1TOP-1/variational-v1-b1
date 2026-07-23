@@ -215,6 +215,8 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
 
         self.assertIn('classList.contains("max-h-[180px]")', observer_source)
         self.assertIn('querySelectorAll("span.text-2xs")', observer_source)
+        self.assertIn('querySelectorAll("button")', observer_source)
+        self.assertIn('"关闭(X)"', observer_source)
         self.assertIn("state.observer.observe(document.body, { childList: true, subtree: true })", observer_source)
         self.assertIn('action: "dom_notice_event"', observer_source)
         self.assertNotIn("submit-button", observer_source)

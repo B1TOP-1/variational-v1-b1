@@ -1267,6 +1267,18 @@ function installDomNoticeObserverInPage() {
     const title = String(spans[0].innerText || spans[0].textContent || "").replace(/\s+/g, " ").trim();
     const message = String(spans[1]?.innerText || spans[1]?.textContent || "").replace(/\s+/g, " ").trim();
     if (!title && !message) return;
+    const controls = Array.from(candidate.querySelectorAll("button")).map((button) => {
+      const label = String(
+        button.getAttribute("title")
+        || button.getAttribute("aria-label")
+        || button.innerText
+        || button.textContent
+        || ""
+      ).replace(/\s+/g, " ").trim();
+      if (label) return label;
+      const path = button.querySelector("path")?.getAttribute("d") || "";
+      return /^M[^ ]+\s*[^ ]+.*M/.test(path) ? "关闭(X)" : "未命名按钮";
+    });
     const key = `${title}\n${message}`;
     const now = Date.now();
     if (now - (state.seen.get(key) || 0) < 5000) return;
@@ -1278,7 +1290,7 @@ function installDomNoticeObserverInPage() {
     try {
       chrome.runtime.sendMessage({
         action: "dom_notice_event",
-        payload: { title, message, ts: now, capturedAt: new Date(now).toISOString() }
+        payload: { title, message, controls, ts: now, capturedAt: new Date(now).toISOString() }
       });
     } catch {
       // Ignore transient delivery failures while the extension worker resumes.
@@ -2067,10 +2079,18 @@ function readPositionInPage() {
       valueText = String(label.parentElement.innerText || label.parentElement.textContent || "")
         .replace("当前仓位", "")
         .replace(/\s+/g, " ")
-        .trim();
+      .trim();
     }
   }
-  return { found: Boolean(label), valueText };
+  const row = document.querySelector("tr[data-testid='positions-table-row']");
+  const cells = row ? Array.from(row.querySelectorAll("td")) : [];
+  const quantityCell = row?.querySelector("[data-testid='position-quantity']");
+  return {
+    found: Boolean(label || quantityCell),
+    valueText: valueText || String(quantityCell?.innerText || quantityCell?.textContent || "").replace(/\s+/g, " ").trim(),
+    // Positions table column 3 is the average entry price for the active instrument.
+    avgEntryPriceText: String(cells[2]?.innerText || cells[2]?.textContent || "").replace(/\s+/g, " ").trim()
+  };
 }
 
 async function handleReadPosition(payload) {
@@ -2080,6 +2100,7 @@ async function handleReadPosition(payload) {
     ok: true,
     found: Boolean(result && result.found),
     valueText: String((result && result.valueText) || ""),
+    avgEntryPriceText: String((result && result.avgEntryPriceText) || ""),
     attachedTabId: tabId
   };
 }
@@ -2380,6 +2401,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         event: "dom_notice",
         title: message.payload && message.payload.title,
         message: message.payload && message.payload.message,
+        controls: message.payload && message.payload.controls,
         ts: message.payload && message.payload.ts,
         capturedAt: message.payload && message.payload.capturedAt
       });

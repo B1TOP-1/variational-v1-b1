@@ -72,6 +72,7 @@ DOM_POSITION_TIMEOUT_SECONDS = 5.0
 STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
 POSITION_FILL_REFRESH_TIMEOUT_SECONDS = 2.0
 POSITION_FILL_REFRESH_POLL_SECONDS = 0.1
+POSITION_DERIVED_FILL_DELAY_SECONDS = 2.5
 POSITION_BALANCE_TIMEOUT_SECONDS = 10.0
 ROUND_POSITION_MISMATCH_CONFIRM_SECONDS = 5.0
 LIGHTER_WARM_RETRY_SECONDS = 15.0
@@ -289,6 +290,11 @@ class OrderLifecycle:
     round_fill_role: str | None = None
     round_accounted: bool = False
     slippage_recorded: bool = False
+    var_fill_price_source: str | None = None
+    var_fill_price_estimated: bool = False
+    var_position_before_qty: Decimal | None = None
+    var_position_before_avg_price: Decimal | None = None
+    var_position_before_rpnl: Decimal | None = None
     # 信号触发时刻(monotonic秒)，用于端到端延迟；两腿延迟只记一次。
     signal_trigger_monotonic: float | None = None
     var_latency_recorded: bool = False
@@ -302,7 +308,12 @@ class OrderLifecycle:
             "qty": decimal_to_str(self.qty),
             "asset": self.asset,
             "variational_filled_price": decimal_to_str(self.var_fill_price),
+            "variational_fill_price_source": self.var_fill_price_source,
+            "variational_fill_price_estimated": self.var_fill_price_estimated,
             "variational_filled_at": self.var_fill_ts_iso,
+            "var_position_before_qty": decimal_to_str(self.var_position_before_qty),
+            "var_position_before_avg_price": decimal_to_str(self.var_position_before_avg_price),
+            "var_position_before_rpnl": decimal_to_str(self.var_position_before_rpnl),
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
@@ -532,8 +543,13 @@ class VariationalToLighterRuntime:
         self._round_ledger_sync_warning_logged = False
         self._round_position_mismatch_sig: tuple[str, str] | None = None
         self._round_position_mismatch_since: float | None = None
+        self._manual_fill_price_buffer: str | None = None
+        self._manual_fill_recovery_status = ""
+        self._manual_fill_recovery_busy = False
         self._last_dom_position_qty: Decimal | None = None
         self._cached_position_qty: Decimal | None = None
+        self._cached_position_avg_price: Decimal | None = None
+        self._cached_position_rpnl: Decimal | None = None
         self._latest_gradient_signal: GradientSignal | None = None
         self._strategy_wake = asyncio.Event()
         self._strategy_task: asyncio.Task[None] | None = None
@@ -672,17 +688,20 @@ class VariationalToLighterRuntime:
                 self._schedule_prepare_browser_order()
             dashboard_changed = True
         elif self.current_page == 2:
-            was_enabled = self.gradient_strategy.enabled
-            previous_order_qty = self.gradient_strategy.single_order_qty
-            if self.gradient_strategy.handle_key(key):
+            if self._handle_manual_fill_recovery_key(key):
                 dashboard_changed = True
-                if self.gradient_strategy.single_order_qty != previous_order_qty:
-                    self._schedule_prepare_browser_order()
-            # 由禁用切到启用 → 视为手动确认，解除硬停。
-            if self.gradient_strategy.enabled and not was_enabled and self._strategy_halted:
-                self._strategy_halted = False
-                self._halt_reason = ""
-                self.logger.info("策略硬停已由手动重新启用解除")
+            else:
+                was_enabled = self.gradient_strategy.enabled
+                previous_order_qty = self.gradient_strategy.single_order_qty
+                if self.gradient_strategy.handle_key(key):
+                    dashboard_changed = True
+                    if self.gradient_strategy.single_order_qty != previous_order_qty:
+                        self._schedule_prepare_browser_order()
+                # 由禁用切到启用 → 视为手动确认，解除硬停。
+                if self.gradient_strategy.enabled and not was_enabled and self._strategy_halted:
+                    self._strategy_halted = False
+                    self._halt_reason = ""
+                    self.logger.info("策略硬停已由手动重新启用解除")
         elif key == "1":
             self.current_page = 1
             dashboard_changed = True
@@ -695,6 +714,61 @@ class VariationalToLighterRuntime:
             dashboard_changed = True
         if dashboard_changed:
             self._dashboard_wake.set()
+
+    def _handle_manual_fill_recovery_key(self, key: str) -> bool:
+        buffer = getattr(self, "_manual_fill_price_buffer", None)
+        if buffer is not None:
+            if key in ("\x1b",):
+                self._manual_fill_price_buffer = None
+                self._manual_fill_recovery_status = "手动补记已取消"
+                return True
+            if key in ("\x7f", "\x08"):
+                self._manual_fill_price_buffer = buffer[:-1]
+                return True
+            if key.isdigit() or (key == "." and "." not in buffer):
+                self._manual_fill_price_buffer += key
+                return True
+            if key in ("\r", "\n"):
+                try:
+                    value = Decimal(self._manual_fill_price_buffer)
+                except Exception:
+                    value = Decimal("0")
+                self._manual_fill_price_buffer = None
+                if value <= 0:
+                    self._manual_fill_recovery_status = "手动补记失败：价格必须大于 0"
+                    return True
+                if self._manual_fill_recovery_busy:
+                    return True
+                self._manual_fill_recovery_busy = True
+
+                async def recover() -> None:
+                    try:
+                        await self._manual_recover_missing_var_fill(value)
+                    finally:
+                        self._manual_fill_recovery_busy = False
+                        self._dashboard_wake.set()
+
+                self._schedule_background_task(recover())
+                self._manual_fill_recovery_status = "手动补记处理中..."
+                return True
+            return True
+
+        halted = getattr(self, "_strategy_halted", False)
+        if key.lower() == "r" and halted:
+            self._manual_fill_price_buffer = ""
+            self._manual_fill_recovery_status = "请输入漏记的 Var 成交价，Enter确认，Esc取消"
+            return True
+        if (
+            key in ("\r", "\n")
+            and halted
+            and getattr(self, "_manual_fill_recovery_status", "").startswith("手动补记成功")
+        ):
+            self._strategy_halted = False
+            self._halt_reason = ""
+            self._manual_fill_recovery_status = "策略已重新启动"
+            self.logger.info("策略已在程序内手动重新启动")
+            return True
+        return False
 
     def restore_keyboard(self) -> None:
         if self._stdin_fd is None:
@@ -811,6 +885,8 @@ class VariationalToLighterRuntime:
         # 历史价差按资产持久化，切换标的不删除数据库记录。
         # 换标的：清缓存仓位与在途/停止状态，避免用旧标的仓位误判平衡。
         self._cached_position_qty = None
+        self._cached_position_avg_price = None
+        self._cached_position_rpnl = None
         self._strategy_order_in_flight = False
         self._strategy_halted = False
         self._halt_reason = ""
@@ -1045,9 +1121,14 @@ class VariationalToLighterRuntime:
                 total_slip_text = "-" if total_slip is None else f"{total_slip:+.4f}%"
                 var_slip_text = "-" if v is None else f"{v:+.4f}%"
                 lighter_slip_text = "-" if l is None else f"{l:+.4f}%"
+                fill_source = {
+                    "position_snapshot": "仓位推导",
+                    "manual_input": "手动补记",
+                }.get(record.var_fill_price_source, "成交WS")
                 logger.info(
-                    "成交 #%s %s %s | V=%s L均价=%s Edge=%+.4f%% | "
+                    "成交[%s] #%s %s %s | V=%s L均价=%s Edge=%+.4f%% | "
                     "滑点(有利+) 总=%s V=%s L=%s | %s 仓=%s",
+                    fill_source,
                     short_id,
                     direction,
                     decimal_to_str(record.qty),
@@ -1489,6 +1570,9 @@ class VariationalToLighterRuntime:
             signal_short_edge_pct=getattr(self, "_latest_short_edge_pct", None),
             strategy_target_qty=signal.target_qty,
             strategy_current_qty=signal.current_qty,
+            var_position_before_qty=getattr(self, "_cached_position_qty", None),
+            var_position_before_avg_price=getattr(self, "_cached_position_avg_price", None),
+            var_position_before_rpnl=getattr(self, "_cached_position_rpnl", None),
             signal_trigger_monotonic=time.monotonic(),
         )
         self.records[trade_key] = record
@@ -1645,6 +1729,8 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                record.var_fill_price_source = "trade_ws"
+                record.var_fill_price_estimated = False
                 self._maybe_record_slippage_stats(record)
                 # Var 端到端延迟：信号触发 → 收到 Var 成交（仅策略单有触发时刻）。
                 if record.signal_trigger_monotonic is not None and not record.var_latency_recorded:
@@ -2206,6 +2292,14 @@ class VariationalToLighterRuntime:
             return Decimal("0") if cleaned.replace(" ", "") in {"-", "--", "—"} else None
         return to_decimal(match.group(0))
 
+    @staticmethod
+    def _parse_dom_price_text(text: Any) -> Decimal | None:
+        if text is None:
+            return None
+        cleaned = re.sub(r"[$,\s]", "", str(text))
+        match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+        return to_decimal(match.group(0)) if match else None
+
     async def _read_dom_position_qty(self) -> Decimal | None:
         """通过扩展抓取页面"当前仓位"DOM 作为后备仓位源。"""
         broker = self.browser_order_broker
@@ -2221,6 +2315,9 @@ class VariationalToLighterRuntime:
         qty = self._parse_dom_position_text(result.get("valueText"))
         if qty is not None:
             self._last_dom_position_qty = qty
+        avg_price = self._parse_dom_price_text(result.get("avgEntryPriceText"))
+        if avg_price is not None:
+            self._cached_position_avg_price = avg_price
         return qty
 
     async def _read_listener_position(self) -> Decimal | None:
@@ -2235,8 +2332,12 @@ class VariationalToLighterRuntime:
         if isinstance(row, dict):
             live = to_decimal(row.get("qty"))
             if live is not None:
+                self._cached_position_avg_price = to_decimal(row.get("avg_entry_price"))
+                self._cached_position_rpnl = to_decimal(row.get("rpnl"))
                 return live
         # 有组合数据但当前资产无仓位 = 平仓(0)。
+        self._cached_position_avg_price = None
+        self._cached_position_rpnl = None
         return Decimal("0")
 
     async def _refresh_position_cache(self, *, allow_dom: bool = True) -> None:
@@ -2264,6 +2365,146 @@ class VariationalToLighterRuntime:
         # 超时：用最后读到的真实值兜底（即便未变化），避免缓存长期失真。
         if pos is not None:
             self._cached_position_qty = pos
+
+    @staticmethod
+    def _derive_position_fill_price(
+        *,
+        side: str,
+        qty: Decimal,
+        before_qty: Decimal | None,
+        before_avg_price: Decimal | None,
+        before_rpnl: Decimal | None,
+        after_qty: Decimal | None,
+        after_avg_price: Decimal | None,
+        after_rpnl: Decimal | None,
+        tolerance: Decimal,
+    ) -> Decimal | None:
+        """Infer a missing Var fill from two portfolio snapshots; never call it a WS fill."""
+        if qty <= 0 or before_qty is None or after_qty is None:
+            return None
+        direction = Decimal("1") if side.strip().lower() == "buy" else Decimal("-1")
+        if abs((after_qty - before_qty) - direction * qty) > tolerance:
+            return None
+        same_sign = (before_qty > 0 and after_qty > 0) or (before_qty < 0 and after_qty < 0)
+        if before_qty != 0 and after_qty != 0 and same_sign:
+            before_abs = abs(before_qty)
+            after_abs = abs(after_qty)
+            # Same-direction increase: weighted entry prices identify the fill.
+            if after_abs > before_abs and before_avg_price is not None and after_avg_price is not None:
+                return (after_abs * after_avg_price - before_abs * before_avg_price) / qty
+            # Same-direction reduction: average entry stays unchanged, so use the
+            # realized-PnL delta if the portfolio feed exposes it.
+            if after_abs < before_abs and before_avg_price is not None and before_rpnl is not None and after_rpnl is not None:
+                rpnl_delta = after_rpnl - before_rpnl
+                if before_qty > 0 and side.strip().lower() == "sell":
+                    return before_avg_price + rpnl_delta / qty
+                if before_qty < 0 and side.strip().lower() == "buy":
+                    return before_avg_price - rpnl_delta / qty
+        return None
+
+    def _missing_var_fill_candidates(self, position_qty: Decimal) -> list[OrderLifecycle]:
+        if not self._round_ledger_synced:
+            return []
+        delta = position_qty - self.round_exit_ledger.position_qty
+        tolerance = self._balance_tolerance()
+        return [
+            record
+            for record in self.records.values()
+            if record.trade_key.startswith("strategy:")
+            and record.var_fill_price is None
+            and record.lighter_fill_price is not None
+            and record.lighter_filled_qty >= record.qty
+            and abs(delta - (record.qty if record.side == "buy" else -record.qty)) <= tolerance
+        ]
+
+    async def _recover_missing_var_fill_from_position(self, position_qty: Decimal) -> bool:
+        """Recover one missed Var fill only when snapshots identify it unambiguously."""
+        if not self._round_ledger_synced:
+            return False
+        ledger_position = self.round_exit_ledger.position_qty
+        if ledger_position == position_qty:
+            return False
+        tolerance = self._balance_tolerance()
+        delta = position_qty - ledger_position
+        async with self._record_lock:
+            candidates = self._missing_var_fill_candidates(position_qty)
+            if len(candidates) != 1:
+                return False
+            record = candidates[0]
+            if (
+                record.signal_trigger_monotonic is not None
+                and time.monotonic() - record.signal_trigger_monotonic < POSITION_DERIVED_FILL_DELAY_SECONDS
+            ):
+                return False
+            derived_price = self._derive_position_fill_price(
+                side=record.side,
+                qty=record.qty,
+                before_qty=record.var_position_before_qty,
+                before_avg_price=record.var_position_before_avg_price,
+                before_rpnl=record.var_position_before_rpnl,
+                after_qty=position_qty,
+                after_avg_price=self._cached_position_avg_price,
+                after_rpnl=self._cached_position_rpnl,
+                tolerance=tolerance,
+            )
+            if derived_price is None or derived_price <= 0:
+                return False
+            record.var_fill_ts_iso = utc_now()
+            record.var_fill_price = derived_price
+            record.var_fill_price_source = "position_snapshot"
+            record.var_fill_price_estimated = True
+            self._maybe_record_slippage_stats(record)
+            payload = record.to_payload()
+        await self.append_order_log("variational_fill_derived", payload)
+        timeout_reason = f"两腿已平衡但本轮成交记账超时: {record.trade_key}"
+        if self._strategy_halted and self._halt_reason == timeout_reason:
+            self._strategy_halted = False
+            self._halt_reason = ""
+            self.logger.warning("本轮成交已由仓位快照补记，解除记账超时硬停")
+        self.logger.warning(
+            "Var成交价由仓位快照推导: key=%s 方向=%s 数量=%s 价格=%s "
+            "前仓=%s@%s 后仓=%s@%s（非成交WS）",
+            record.trade_key,
+            record.side,
+            decimal_to_str(record.qty),
+            decimal_to_str(derived_price),
+            decimal_to_str(record.var_position_before_qty),
+            decimal_to_str(record.var_position_before_avg_price),
+            decimal_to_str(position_qty),
+            decimal_to_str(self._cached_position_avg_price),
+        )
+        return True
+
+    async def _manual_recover_missing_var_fill(self, fill_price: Decimal) -> None:
+        position_qty = self._cached_position_qty
+        if position_qty is None or not self._round_ledger_synced:
+            self._manual_fill_recovery_status = "手动补记失败：当前仓位或本轮账本未知"
+            return
+        async with self._record_lock:
+            candidates = self._missing_var_fill_candidates(position_qty)
+            if len(candidates) != 1:
+                self._manual_fill_recovery_status = (
+                    f"手动补记失败：匹配到 {len(candidates)} 笔候选，需保留唯一漏记订单"
+                )
+                return
+            record = candidates[0]
+            record.var_fill_ts_iso = utc_now()
+            record.var_fill_price = fill_price
+            record.var_fill_price_source = "manual_input"
+            record.var_fill_price_estimated = True
+            self._maybe_record_slippage_stats(record)
+            payload = record.to_payload()
+        await self.append_order_log("variational_fill_manual", payload)
+        self._manual_fill_recovery_status = (
+            f"手动补记成功：{record.side} {record.qty} @ {fill_price}，请按 Enter 重新启动策略"
+        )
+        self.logger.warning(
+            "Var成交价手动补记: key=%s 方向=%s 数量=%s 价格=%s（非成交WS）",
+            record.trade_key,
+            record.side,
+            decimal_to_str(record.qty),
+            decimal_to_str(fill_price),
+        )
 
     @staticmethod
     def _make_round_exit_signal(
@@ -2562,6 +2803,15 @@ class VariationalToLighterRuntime:
     async def _log_dom_notice(self, payload: dict[str, Any]) -> None:
         title = re.sub(r"\s+", " ", str(payload.get("title") or "")).strip() or "页面通知"
         message = re.sub(r"\s+", " ", str(payload.get("message") or "")).strip()
+        controls = payload.get("controls")
+        if isinstance(controls, list):
+            controls_text = ",".join(
+                re.sub(r"\s+", " ", str(item)).strip()
+                for item in controls
+                if str(item).strip()
+            ) or "-"
+        else:
+            controls_text = "-"
         try:
             state = await self.runtime.monitor.get_trading_state()
         except Exception:
@@ -2576,9 +2826,10 @@ class VariationalToLighterRuntime:
         )
         detail = f" | {message}" if message else ""
         self.logger.warning(
-            "Var页面通知: %s%s | 心跳Age=%s 报价Age=%s Var仓=%s Lit仓=%s",
+            "Var页面通知: %s%s | 控件=%s | 心跳Age=%s 报价Age=%s Var仓=%s Lit仓=%s",
             title,
             detail,
+            controls_text,
             heartbeat_text,
             quote_text,
             decimal_to_str(var_position),
@@ -2622,6 +2873,7 @@ class VariationalToLighterRuntime:
         if pos is None:
             self._latest_gradient_signal = None
             return
+        await self._recover_missing_var_fill_from_position(pos)
         self._sync_round_ledger_with_live_position(pos)
         long_edge_pct, short_edge_pct = await self._compute_signal_spreads()
         signal = self._evaluate_gradient_signal(
@@ -3220,6 +3472,14 @@ class VariationalToLighterRuntime:
                 f"剩余 {signal.delta_qty:f} | 触发 {signal.threshold_pct:f}%"
             )
         strategy_table.add_row(self._strategy_enabled_row_text())
+        if self._strategy_halted:
+            if self._manual_fill_price_buffer is not None:
+                recovery_text = f"[bold yellow]手动补记 Var 成交价: {self._manual_fill_price_buffer or '_'}[/]"
+            elif self._manual_fill_recovery_status:
+                recovery_text = f"[yellow]{self._manual_fill_recovery_status}[/]"
+            else:
+                recovery_text = "[yellow]按 r 手动补记漏记的 Var 成交价[/]"
+            strategy_table.add_row(recovery_text)
         validation_errors = self.gradient_strategy.validation_errors()
         for validation_error in validation_errors:
             strategy_table.add_row(f"[bold red]配置错误：{validation_error}[/]")
@@ -3240,7 +3500,7 @@ class VariationalToLighterRuntime:
         for index, _row in enumerate(self.gradient_strategy.close_rows):
             strategy_table.add_row(self._strategy_row_text(StrategySection.CLOSE, index))
         strategy_table.add_row("")
-        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认/启动  Esc取消  Tab切页  q退出")
+        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认/启动  r补记成交价  Esc取消  Tab切页  q退出")
         return Panel(strategy_table, title="触发策略", border_style="magenta")
 
     def _strategy_enabled_row_text(self) -> str:
@@ -3610,11 +3870,18 @@ class VariationalToLighterRuntime:
                     )
                 else:
                     side_display = side_en
+                var_fill_display = payload["variational_filled_price"] or "-"
+                if row.var_fill_price_estimated and var_fill_display != "-":
+                    source_label = {
+                        "position_snapshot": "仓位推导",
+                        "manual_input": "手动补记",
+                    }.get(row.var_fill_price_source, "计算")
+                    var_fill_display = f"{var_fill_display} [yellow]({source_label})[/]"
                 orders_table.add_row(
                     trade_display,
                     side_display,
                     self._fmt_price(row.qty),
-                    payload["variational_filled_price"] or "-",
+                    var_fill_display,
                     payload["lighter_filled_price"] or "-",
                     self._style_fill_value_by_direction(
                         self._fmt_price(fill_diff), row.side
@@ -3737,7 +4004,12 @@ class VariationalToLighterRuntime:
                         "direction_en": side_en,
                         "qty": decimal_to_str(record.qty),
                         "variational_filled_price": payload["variational_filled_price"],
+                        "variational_fill_price_source": payload["variational_fill_price_source"],
+                        "variational_fill_price_estimated": payload["variational_fill_price_estimated"],
                         "variational_filled_at": payload["variational_filled_at"],
+                        "var_position_before_qty": payload["var_position_before_qty"],
+                        "var_position_before_avg_price": payload["var_position_before_avg_price"],
+                        "var_position_before_rpnl": payload["var_position_before_rpnl"],
                         "lighter_order_side": payload["lighter_order_side"],
                         "lighter_client_order_id": payload["lighter_client_order_id"],
                         "lighter_filled_price": payload["lighter_filled_price"],
@@ -3796,7 +4068,12 @@ class VariationalToLighterRuntime:
             "direction_en",
             "qty",
             "variational_filled_price",
+            "variational_fill_price_source",
+            "variational_fill_price_estimated",
             "variational_filled_at",
+            "var_position_before_qty",
+            "var_position_before_avg_price",
+            "var_position_before_rpnl",
             "lighter_order_side",
             "lighter_client_order_id",
             "lighter_filled_price",
