@@ -133,6 +133,15 @@ class ChromeExtensionBackgroundTest(unittest.TestCase):
         self.assertIn("chrome.tabs.onRemoved", background)
         self.assertIn("extension_keepalive", background)
 
+    def test_forward_socket_reconnect_does_not_reload_trading_tab(self):
+        background = (ROOT / "chrome_extension" / "background.js").read_text()
+        socket_start = background.index("class ForwardSocket")
+        socket_end = background.index("const wsForwarder")
+        forward_socket = background[socket_start:socket_end]
+
+        self.assertNotIn("autoReloadAttachedTab", forward_socket)
+        self.assertIn('autoReloadAttachedTab("forwarder started")', background)
+
     def test_order_quantity_is_restored_after_page_reload(self):
         background = (ROOT / "chrome_extension" / "background.js").read_text()
 

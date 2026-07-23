@@ -2315,7 +2315,9 @@ class VariationalToLighterRuntime:
                 f"本轮账本与真实仓位持续不一致: ledger={decimal_to_str(ledger.position_qty)} "
                 f"live={decimal_to_str(position_qty)} confirm={ROUND_POSITION_MISMATCH_CONFIRM_SECONDS:.1f}s"
             )
-            if not self._strategy_halted or self._halt_reason != halt_reason:
+            # Keep the first hard-stop reason. A missing fill event can first trip
+            # the more precise round-accounting timeout before this position check.
+            if not self._strategy_halted:
                 self._strategy_halted = True
                 self._halt_reason = halt_reason
                 self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)

@@ -491,6 +491,27 @@ class StrategyLoopTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rt._strategy_halted)
         self.assertIn("持续不一致", rt._halt_reason)
 
+    def test_round_position_mismatch_keeps_existing_halt_reason(self):
+        import main as main_mod
+
+        rt = self._runtime()
+        self._configure_round_exit_gradients(rt)
+        rt._round_ledger_synced = True
+        self._account_round_fill(rt, "sell", "0.044", qty="0.002")
+        rt._strategy_halted = True
+        rt._halt_reason = "两腿已平衡但本轮成交记账超时: strategy:missing-fill"
+
+        rt._select_strategy_signal(Decimal("0.03"), Decimal("0.06"), Decimal("-0.001"))
+        rt._round_position_mismatch_since = (
+            time.monotonic() - main_mod.ROUND_POSITION_MISMATCH_CONFIRM_SECONDS - 0.1
+        )
+        rt._select_strategy_signal(Decimal("0.03"), Decimal("0.06"), Decimal("-0.001"))
+
+        self.assertEqual(
+            rt._halt_reason,
+            "两腿已平衡但本轮成交记账超时: strategy:missing-fill",
+        )
+
     async def test_round_accounting_waits_for_actual_fill_record(self):
         rt = self._runtime()
         rt.args.auto_hedge = True

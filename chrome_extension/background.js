@@ -99,9 +99,6 @@ class ForwardSocket {
         this.status = "connected";
         this.startKeepalive();
         this.flush();
-        if (this.configKey === "wsEndpoint") {
-          autoReloadAttachedTab("forward receiver connected");
-        }
         notifyStatus();
       };
 
