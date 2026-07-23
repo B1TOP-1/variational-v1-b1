@@ -25,6 +25,14 @@ class LighterLiveScriptTest(unittest.TestCase):
     def test_live_mode_requires_explicit_confirmation_phrase(self):
         self.assertEqual(MODULE.LIVE_CONFIRMATION, "I_UNDERSTAND_THIS_SENDS_REAL_ORDERS")
 
+    def test_competing_process_check_is_a_noop_off_linux(self):
+        original = MODULE.sys.platform
+        MODULE.sys.platform = "darwin"
+        try:
+            self.assertIsNone(MODULE.assert_no_competing_gateway())
+        finally:
+            MODULE.sys.platform = original
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from decimal import Decimal, ROUND_DOWN
@@ -61,6 +62,24 @@ def quantize_quantity(quantity: Decimal, size_multiplier: int) -> Decimal:
 def aggressive_limit(side: str, bid: Decimal, ask: Decimal, slippage_bps: Decimal) -> Decimal:
     slippage = slippage_bps / Decimal("10000")
     return ask * (Decimal(1) + slippage) if side == "buy" else bid * (Decimal(1) - slippage)
+
+
+def assert_no_competing_gateway() -> None:
+    """Avoid sharing an API-key nonce stream with the production strategy."""
+    if sys.platform != "linux":
+        return
+    matches: list[str] = []
+    for pattern in ("variational_lighter_gateway", "python(3)? .*main[.]py"):
+        result = subprocess.run(
+            ["pgrep", "-af", pattern],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        matches.extend(line for line in result.stdout.splitlines() if line.strip())
+    if matches:
+        details = " | ".join(dict.fromkeys(matches))
+        raise RuntimeError(f"stop main.py and the existing Lighter gateway before this test: {details}")
 
 
 class Probe:
@@ -219,6 +238,7 @@ async def run(args: argparse.Namespace) -> None:
         raise RuntimeError(f"missing environment variables: {','.join(missing)}")
     if args.live and args.confirm != LIVE_CONFIRMATION:
         raise RuntimeError(f"--live requires --confirm {LIVE_CONFIRMATION}")
+    assert_no_competing_gateway()
 
     symbol = args.symbol.strip().upper()
     probe = Probe()
