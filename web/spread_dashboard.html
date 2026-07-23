@@ -7,7 +7,7 @@
   <style>
     :root { color-scheme: light; font-family: Inter, "Segoe UI", system-ui, sans-serif; color: #17202a; background: #eef1f4; }
     * { box-sizing: border-box; }
-    body { margin: 0; min-width: 320px; letter-spacing: 0; }
+    body { margin: 0; min-width: 320px; overflow-x: hidden; letter-spacing: 0; }
     header { min-height: 58px; padding: 10px 22px; display: flex; align-items: center; justify-content: space-between; gap: 18px; background: #17202a; color: white; }
     .brand { display: flex; align-items: center; gap: 10px; }
     .mark { width: 27px; height: 27px; display: grid; place-items: center; border: 1px solid #4c9af8; border-radius: 5px; color: #4c9af8; font-size: 12px; font-weight: 800; }
@@ -15,8 +15,8 @@
     .status { display: flex; align-items: center; gap: 7px; color: #b8c1ca; font-size: 11px; }
     .dot { width: 8px; height: 8px; border-radius: 50%; background: #75808b; }
     .dot.live { background: #38b76a; box-shadow: 0 0 0 3px rgb(56 183 106 / 18%); }
-    main { min-height: calc(100vh - 58px); }
-    .toolbar { padding: 14px 22px; display: flex; align-items: end; gap: 14px; border-bottom: 1px solid #d5dce2; background: #f8fafb; }
+    main { min-width: 0; min-height: calc(100vh - 58px); }
+    .toolbar { padding: 14px 22px; display: flex; flex-wrap: wrap; align-items: end; gap: 14px; border-bottom: 1px solid #d5dce2; background: #f8fafb; }
     label { display: block; margin-bottom: 4px; color: #6b7681; font-size: 10px; font-weight: 700; text-transform: uppercase; }
     select { width: 150px; height: 34px; padding: 0 9px; border: 1px solid #c6ced5; border-radius: 4px; background: white; color: #17202a; font-weight: 650; }
     .ranges, .series-modes { display: grid; gap: 2px; padding: 2px; border: 1px solid #c6ced5; border-radius: 5px; background: #e2e7eb; }
@@ -24,19 +24,19 @@
     .series-modes { grid-template-columns: repeat(3, minmax(58px, 1fr)); }
     button { height: 29px; padding: 0 12px; border: 0; border-radius: 3px; background: transparent; color: #56616c; font-weight: 700; cursor: pointer; }
     button.active { background: white; color: #17202a; box-shadow: 0 1px 2px rgb(23 32 42 / 12%); }
-    .summary { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); border-bottom: 1px solid #d5dce2; background: white; overflow-x: auto; }
+    .summary { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-bottom: 1px solid #d5dce2; background: white; overflow: hidden; }
     .metric { min-width: 0; padding: 13px 18px; }
     .metric + .metric { border-left: 1px solid #e1e6ea; }
     .metric span { display: block; color: #75808b; font-size: 10px; font-weight: 700; text-transform: uppercase; }
-    .metric strong { display: block; margin-top: 4px; font: 700 16px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }
+    .metric strong { display: block; margin-top: 4px; font: 700 14px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
     .long { color: #2589c9; } .short { color: #8257d9; }
     .chart-section { padding: 18px 22px 24px; }
-    .chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
-    .chart-head-right { display: flex; align-items: center; gap: 10px; }
+    .chart-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 10px 12px; margin-bottom: 10px; }
+    .chart-head-right { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px 10px; }
     .chart-tools { display: flex; gap: 2px; padding: 2px; border: 1px solid #c6ced5; border-radius: 4px; background: #e2e7eb; }
     .chart-tools button { width: 30px; height: 26px; padding: 0; background: white; color: #33404c; font-size: 16px; }
     h2 { margin: 0; font-size: 14px; }
-    .chart-meta { color: #75808b; font-size: 11px; }
+    .chart-meta { color: #75808b; font-size: 11px; overflow-wrap: anywhere; }
     .canvas-wrap { position: relative; width: 100%; height: clamp(360px, calc(100vh - 280px), 720px); border: 1px solid #d5dce2; background: white; cursor: grab; user-select: none; overflow: hidden; }
     .canvas-wrap.dragging { cursor: grabbing; }
     canvas { display: block; width: 100%; height: 100%; }
@@ -46,7 +46,8 @@
     .legend span::before { content: ""; display: inline-block; width: 18px; height: 3px; margin-right: 6px; vertical-align: middle; }
     .legend .long-key::before { background: #2589c9; } .legend .short-key::before { background: #8257d9; }
     .empty { position: absolute; inset: 0; display: grid; place-items: center; color: #75808b; font-size: 13px; }
-    @media (max-width: 720px) { header, .toolbar, .chart-section { padding-left: 12px; padding-right: 12px; } .toolbar { align-items: stretch; flex-direction: column; } select { width: 100%; } .summary { grid-template-columns: repeat(3, minmax(120px, 1fr)); } .canvas-wrap { height: 430px; } }
+    @media (max-width: 1180px) { .summary { grid-template-columns: repeat(3, minmax(0, 1fr)); } .metric:nth-child(4) { border-left: 0; } }
+    @media (max-width: 720px) { header, .toolbar, .chart-section { padding-left: 12px; padding-right: 12px; } .toolbar { align-items: stretch; flex-direction: column; } select { width: 100%; } .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric:nth-child(odd) { border-left: 0; } .metric:nth-child(4) { border-left: 1px solid #e1e6ea; } .chart-head-right { width: 100%; justify-content: space-between; } .canvas-wrap { height: 430px; } }
   </style>
 </head>
 <body>
@@ -73,8 +74,9 @@
   </main>
   <script>
     const $ = (id) => document.getElementById(id);
-    let rangeSeconds = 86400, seriesMode = "both", payload = null, hoverPoints = [];
-    let viewport = null, chartGeometry = null, dragging = null, windowEndMs = null;
+    let rangeSeconds = 86400, viewDurationMs = rangeSeconds * 1000, seriesMode = "both", payload = null, hoverPoints = [];
+    let chartGeometry = null, dragging = null, hover = null, windowEndMs = null, refreshSequence = 0;
+    const MIN_VIEW_MS = 10000, MAX_VIEW_MS = 7 * 24 * 3600 * 1000;
     const TIME_ZONE = "Asia/Shanghai";
     const dateTime = (timestamp) => new Intl.DateTimeFormat("zh-CN", { timeZone: TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).format(new Date(timestamp));
     const edge = (v) => Number.isFinite(Number(v)) ? `${Number(v) >= 0 ? "+" : ""}${Number(v).toFixed(4)}%` : "--";
@@ -92,8 +94,11 @@
       const asset = $("assetSelect").value;
       if (!asset) { setStatus(false, "等待行情"); draw(); return; }
       try {
+        const requestSequence = ++refreshSequence;
         const endParam = windowEndMs == null ? "" : `&end=${Math.round(windowEndMs)}`;
-        payload = await fetch(`/api/history?asset=${encodeURIComponent(asset)}&range=${rangeSeconds}&points=1400${endParam}`, { cache: "no-store" }).then((r) => r.json());
+        const nextPayload = await fetch(`/api/history?asset=${encodeURIComponent(asset)}&range=${viewDurationMs / 1000}&points=1400${endParam}`, { cache: "no-store" }).then((r) => r.json());
+        if (requestSequence !== refreshSequence) return;
+        payload = nextPayload;
         renderSummary(); draw(); setStatus(true, windowEndMs == null ? "实时更新" : "历史浏览");
       } catch (error) { setStatus(false, "连接中断"); }
     }
@@ -117,7 +122,7 @@
       const allPoints = payload?.points || []; $("empty").style.display = allPoints.length ? "none" : "grid"; hoverPoints = [];
       if (!allPoints.length) return;
       const dataStart = allPoints[0].timestampMs, dataEnd = allPoints.at(-1).timestampMs;
-      const viewStart = viewport?.start ?? dataStart, viewEnd = viewport?.end ?? dataEnd;
+      const viewStart = payload?.windowStartMs ?? dataStart, viewEnd = payload?.windowEndMs ?? dataEnd;
       const points = allPoints.filter((point) => point.timestampMs >= viewStart && point.timestampMs <= viewEnd);
       if (!points.length) return;
       const values = points.flatMap((point) => {
@@ -130,7 +135,8 @@
       const decimals = magnitude < 0.001 ? 5 : magnitude < 0.01 ? 4 : magnitude < 0.1 ? 3 : 2;
       const area = { l: 82, r: width - 24, t: 18, b: height - 48 }, first = viewStart, last = viewEnd, span = Math.max(1, last - first);
       const x = (t) => area.l + (t - first) / span * (area.r - area.l), y = (v) => area.b - (v - lo) / (hi - lo) * (area.b - area.t);
-      chartGeometry = { area, first, last, dataStart, dataEnd, x };
+      const edgeAtY = (py) => hi - (py - area.t) / (area.b - area.t) * (hi - lo);
+      chartGeometry = { area, first, last, dataStart, dataEnd, x, y, edgeAtY };
       ctx.font = "11px system-ui"; ctx.fillStyle = "#6b7681"; ctx.strokeStyle = "#e5e9ed"; ctx.lineWidth = 1;
       for (let i = 0; i <= 6; i++) { const v = hi - (hi - lo) * i / 6, py = area.t + (area.b - area.t) * i / 6; ctx.beginPath(); ctx.moveTo(area.l, py); ctx.lineTo(area.r, py); ctx.stroke(); ctx.fillText(`${v >= 0 ? "+" : ""}${v.toFixed(decimals)}%`, 8, py + 4); }
       const tickCount = Math.max(3, Math.min(8, Math.floor((area.r - area.l) / 140)));
@@ -140,31 +146,47 @@
       const line = (key, color) => { const coordinates = points.map((point) => ({ point, value: Number(point[key]) })).filter((row) => Number.isFinite(row.value)).map((row) => ({ point: row.point, x: x(row.point.timestampMs), y: y(row.value) })); if (!coordinates.length) return; coordinates.forEach((row) => hoverPoints.push({ x: row.x, point: row.point })); ctx.strokeStyle = color; ctx.lineWidth = 1.8; ctx.lineJoin = "round"; ctx.lineCap = "round"; ctx.beginPath(); ctx.moveTo(coordinates[0].x, coordinates[0].y); for (let index = 1; index < coordinates.length - 1; index++) { const current = coordinates[index], next = coordinates[index + 1]; ctx.quadraticCurveTo(current.x, current.y, (current.x + next.x) / 2, (current.y + next.y) / 2); } if (coordinates.length > 1) ctx.lineTo(coordinates.at(-1).x, coordinates.at(-1).y); ctx.stroke(); };
       if (seriesMode !== "short") line("longEdge", "#2589c9");
       if (seriesMode !== "long") line("shortEdge", "#8257d9");
+      if (hover && hover.x >= area.l && hover.x <= area.r && hover.y >= area.t && hover.y <= area.b) {
+        const hoverEdge = edgeAtY(hover.y), label = edge(hoverEdge);
+        ctx.save();
+        ctx.setLineDash([5, 4]); ctx.strokeStyle = "#51606d"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(area.l, hover.y); ctx.lineTo(area.r, hover.y); ctx.stroke();
+        ctx.setLineDash([]); ctx.font = "700 11px ui-monospace, monospace";
+        const labelWidth = Math.max(64, ctx.measureText(label).width + 12);
+        ctx.fillStyle = "#33404c"; ctx.fillRect(area.l - labelWidth - 4, hover.y - 10, labelWidth, 20);
+        ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.fillText(label, area.l - labelWidth / 2 - 4, hover.y + 4);
+        ctx.restore();
+      }
     }
-    function zoom(factor, anchorRatio = 0.5) {
-      const points = payload?.points || []; if (points.length < 2) return;
-      const dataStart = points[0].timestampMs, dataEnd = points.at(-1).timestampMs;
-      const start = viewport?.start ?? dataStart, end = viewport?.end ?? dataEnd, duration = end - start;
-      const minimum = Math.min(10000, Math.max(1000, dataEnd - dataStart));
-      const nextDuration = Math.max(minimum, Math.min(dataEnd - dataStart, duration * factor));
+    function syncRangeButtons() {
+      document.querySelectorAll("[data-range]").forEach((button) => {
+        button.classList.toggle("active", windowEndMs == null && Math.abs(Number(button.dataset.range) * 1000 - viewDurationMs) < 1);
+      });
+    }
+    async function zoom(factor, anchorRatio = 0.5) {
+      if (!chartGeometry) return;
+      const end = windowEndMs ?? payload?.windowEndMs ?? Date.now(), duration = viewDurationMs, start = end - duration;
+      const nextDuration = Math.max(MIN_VIEW_MS, Math.min(MAX_VIEW_MS, duration * factor));
       const anchor = start + duration * anchorRatio;
       let nextStart = anchor - nextDuration * anchorRatio, nextEnd = nextStart + nextDuration;
-      if (nextStart < dataStart) { nextEnd += dataStart - nextStart; nextStart = dataStart; }
-      if (nextEnd > dataEnd) { nextStart -= nextEnd - dataEnd; nextEnd = dataEnd; }
-      viewport = nextDuration >= dataEnd - dataStart ? null : { start: nextStart, end: nextEnd };
-      draw();
+      const now = Date.now();
+      if (nextEnd > now) { nextStart -= nextEnd - now; nextEnd = now; }
+      viewDurationMs = nextDuration;
+      windowEndMs = nextEnd >= now - 2000 ? null : nextEnd;
+      hover = null; $("tooltip").style.display = "none"; syncRangeButtons();
+      await refresh();
     }
-    function resetViewport() { viewport = null; windowEndMs = null; refresh(); }
-    $("assetSelect").addEventListener("change", () => { viewport = null; windowEndMs = null; refresh(); });
-    document.querySelectorAll("[data-range]").forEach((button) => button.addEventListener("click", () => { rangeSeconds = Number(button.dataset.range); viewport = null; windowEndMs = null; document.querySelectorAll("[data-range]").forEach((b) => b.classList.toggle("active", b === button)); refresh(); }));
+    function resetViewport() { viewDurationMs = rangeSeconds * 1000; windowEndMs = null; hover = null; syncRangeButtons(); refresh(); }
+    $("assetSelect").addEventListener("change", () => { windowEndMs = null; hover = null; refresh(); });
+    document.querySelectorAll("[data-range]").forEach((button) => button.addEventListener("click", () => { rangeSeconds = Number(button.dataset.range); viewDurationMs = rangeSeconds * 1000; windowEndMs = null; hover = null; syncRangeButtons(); refresh(); }));
     document.querySelectorAll("[data-series]").forEach((button) => button.addEventListener("click", () => { seriesMode = button.dataset.series; document.querySelectorAll("[data-series]").forEach((candidate) => candidate.classList.toggle("active", candidate === button)); $("legendLong").classList.toggle("muted", seriesMode === "short"); $("legendShort").classList.toggle("muted", seriesMode === "long"); draw(); }));
     $("zoomIn").addEventListener("click", () => zoom(0.6)); $("zoomOut").addEventListener("click", () => zoom(1.7)); $("resetZoom").addEventListener("click", resetViewport);
     $("canvasWrap").addEventListener("wheel", (event) => { event.preventDefault(); if (!chartGeometry) return; const rect = $("canvasWrap").getBoundingClientRect(), ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - chartGeometry.area.l) / (chartGeometry.area.r - chartGeometry.area.l))); zoom(event.deltaY < 0 ? 0.75 : 1.33, ratio); }, { passive: false });
-    $("canvasWrap").addEventListener("mousedown", (event) => { if (!chartGeometry || event.button !== 0) return; dragging = { x: event.clientX, delta: 0, duration: chartGeometry.last - chartGeometry.first }; $("tooltip").style.display = "none"; $("canvasWrap").classList.add("dragging"); });
-    window.addEventListener("mouseup", async () => { if (!dragging || !chartGeometry) return; const drag = dragging; dragging = null; $("canvasWrap").classList.remove("dragging"); $("chart").style.transform = ""; if (Math.abs(drag.delta) < 3) return; const width = chartGeometry.area.r - chartGeometry.area.l; const shiftMs = -drag.delta / width * drag.duration; const baseEnd = payload?.windowEndMs || Date.now(); windowEndMs = Math.min(Date.now(), baseEnd + shiftMs); viewport = null; await refresh(); });
-    $("canvasWrap").addEventListener("mousemove", (event) => { const rect = $("canvasWrap").getBoundingClientRect(), mx = event.clientX - rect.left; if (dragging) { dragging.delta = event.clientX - dragging.x; $("chart").style.transform = `translateX(${dragging.delta}px)`; return; } if (!hoverPoints.length) return; const nearest = hoverPoints.reduce((a, b) => Math.abs(b.x - mx) < Math.abs(a.x - mx) ? b : a).point; const lines = [`<strong>${dateTime(nearest.timestampMs)} UTC+8</strong>`]; if (seriesMode !== "short") lines.push(`<span class="long">做多价差 ${edge(nearest.longEdge)}</span>`); if (seriesMode !== "long") lines.push(`<span class="short">做空价差 ${edge(nearest.shortEdge)}</span>`); const tip = $("tooltip"); tip.innerHTML = lines.join("<br>"); tip.style.display = "block"; tip.style.left = `${Math.min(rect.width - 190, Math.max(8, mx + 12))}px`; tip.style.top = `${Math.max(8, event.clientY - rect.top - 20)}px`; });
+    $("canvasWrap").addEventListener("mousedown", (event) => { if (!chartGeometry || event.button !== 0) return; dragging = { x: event.clientX, delta: 0, duration: chartGeometry.last - chartGeometry.first, end: chartGeometry.last }; hover = null; $("tooltip").style.display = "none"; $("canvasWrap").classList.add("dragging"); draw(); });
+    window.addEventListener("mouseup", async () => { if (!dragging || !chartGeometry) return; const drag = dragging; dragging = null; $("canvasWrap").classList.remove("dragging"); if (Math.abs(drag.delta) < 3) return; const width = chartGeometry.area.r - chartGeometry.area.l; const shiftMs = -drag.delta / width * drag.duration; const now = Date.now(); const nextEnd = Math.min(now, drag.end + shiftMs); viewDurationMs = drag.duration; windowEndMs = nextEnd >= now - 2000 ? null : nextEnd; syncRangeButtons(); await refresh(); });
+    $("canvasWrap").addEventListener("mousemove", (event) => { const rect = $("canvasWrap").getBoundingClientRect(), mx = event.clientX - rect.left, my = event.clientY - rect.top; if (dragging) { dragging.delta = event.clientX - dragging.x; return; } if (!chartGeometry || mx < chartGeometry.area.l || mx > chartGeometry.area.r || my < chartGeometry.area.t || my > chartGeometry.area.b) { hover = null; $("tooltip").style.display = "none"; draw(); return; } hover = { x: mx, y: my }; draw(); if (!hoverPoints.length) return; const nearest = hoverPoints.reduce((a, b) => Math.abs(b.x - mx) < Math.abs(a.x - mx) ? b : a).point; const lines = [`<strong>${dateTime(nearest.timestampMs)} UTC+8</strong>`, `<span>横线 Edge ${edge(chartGeometry.edgeAtY(my))}</span>`]; if (seriesMode !== "short") lines.push(`<span class="long">做多价差 ${edge(nearest.longEdge)}</span>`); if (seriesMode !== "long") lines.push(`<span class="short">做空价差 ${edge(nearest.shortEdge)}</span>`); const tip = $("tooltip"); tip.innerHTML = lines.join("<br>"); tip.style.display = "block"; tip.style.left = `${Math.min(rect.width - 190, Math.max(8, mx + 12))}px`; tip.style.top = `${Math.min(rect.height - tip.offsetHeight - 8, Math.max(8, my - 20))}px`; });
     $("canvasWrap").addEventListener("dblclick", resetViewport);
-    $("canvasWrap").addEventListener("mouseleave", () => { $("tooltip").style.display = "none"; });
+    $("canvasWrap").addEventListener("mouseleave", () => { hover = null; $("tooltip").style.display = "none"; draw(); });
     window.addEventListener("resize", draw);
     async function refreshLoop() {
       await loadAssets();

@@ -143,6 +143,17 @@ class SpreadDashboardTest(unittest.TestCase):
         self.assertIn('UTC+8', html)
         self.assertIn("setTimeout(refreshLoop", html)
 
+    def test_dashboard_crosshair_and_viewport_interactions_are_stable(self):
+        html = (Path(__file__).resolve().parents[1] / "web" / "spread_dashboard.html").read_text(encoding="utf-8")
+
+        self.assertIn("横线 Edge", html)
+        self.assertIn("edgeAtY", html)
+        self.assertIn("viewDurationMs = drag.duration", html)
+        self.assertIn("MAX_VIEW_MS", html)
+        self.assertNotIn("style.transform", html)
+        self.assertIn("overflow-x: hidden", html)
+        self.assertIn("@media (max-width: 1180px)", html)
+
     def test_dashboard_serves_html_assets_and_history(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
