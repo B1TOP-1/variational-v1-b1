@@ -147,6 +147,7 @@ class RoundExitLedgerTest(unittest.TestCase):
         )
         self.assertEqual(completed[0].edge_pnl, D("0.010"))
         self.assertEqual(completed[0].estimated_quote_pnl, D("0.013000"))
+        self.assertFalse(completed[0].quote_pnl_exact)
         self.assertIsNone(ledger.entry_edge_actual)
         self.assertIsNone(ledger.close_edge_actual)
         self.assertEqual(len(ledger.completed_rounds), 1)
@@ -178,6 +179,36 @@ class RoundExitLedgerTest(unittest.TestCase):
         )
 
         self.assertEqual(completed[0].estimated_quote_pnl, D("0.0197"))
+
+    def test_exact_quote_pnl_and_cumulative_completed_cycle_totals(self):
+        ledger = self.ledger()
+        ledger.apply_fill(
+            "buy", D("0.010"), D("0.060"), unit_spread=D("38.044")
+        )
+        first = ledger.apply_fill(
+            "sell", D("0.010"), D("0.045"), unit_spread=D("-29.5228")
+        )[0]
+        ledger.apply_fill(
+            "sell", D("0.020"), D("0.040"), unit_spread=D("-20")
+        )
+        second = ledger.apply_fill(
+            "buy", D("0.020"), D("0.050"), unit_spread=D("25")
+        )[0]
+
+        self.assertEqual(first.estimated_quote_pnl, D("0.085212"))
+        self.assertTrue(first.quote_pnl_exact)
+        self.assertEqual(second.estimated_quote_pnl, D("0.10"))
+        self.assertTrue(second.quote_pnl_exact)
+        self.assertEqual(ledger.cumulative_quote_pnl, D("0.185212"))
+        self.assertTrue(ledger.cumulative_quote_pnl_exact)
+        self.assertEqual(
+            ledger.cumulative_edge_pnl_average,
+            D("0.01166666666666666666666666667"),
+        )
+
+        restored = RoundExitLedger.from_state(ledger.config, ledger.to_state())
+        self.assertEqual(restored.cumulative_quote_pnl, D("0.185212"))
+        self.assertTrue(restored.cumulative_quote_pnl_exact)
 
     def test_cross_zero_fill_splits_completed_and_new_round(self):
         ledger = self.ledger()

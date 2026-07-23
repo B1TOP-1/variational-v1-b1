@@ -14,12 +14,15 @@ class SpreadStore:
 
     _DAY_MS = 86_400_000
     _UTC8_OFFSET_MS = 8 * 3_600_000
+    RETENTION_SECONDS = 8 * 24 * 3600
+    PRUNE_INTERVAL_SECONDS = 3600
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._write_lock = threading.RLock()
         self._read_lock = threading.RLock()
+        self._last_prune_monotonic = time.monotonic()
         in_memory = str(path) == ":memory:"
         database: str | Path = f"file:spread-store-{id(self)}?mode=memory&cache=shared" if in_memory else path
         self._writer = sqlite3.connect(database, check_same_thread=False, uri=in_memory)
@@ -61,6 +64,10 @@ class SpreadStore:
             self._writer.execute(
                 "CREATE INDEX IF NOT EXISTS idx_spread_samples_asset_time "
                 "ON spread_samples(asset, timestamp_ms)"
+            )
+            self._writer.execute(
+                "CREATE INDEX IF NOT EXISTS idx_spread_samples_time "
+                "ON spread_samples(timestamp_ms)"
             )
             self._writer.commit()
         self._reader = sqlite3.connect(database, check_same_thread=False, uri=in_memory)
@@ -114,6 +121,14 @@ class SpreadStore:
                 """,
                 values,
             )
+            now_monotonic = time.monotonic()
+            if now_monotonic - self._last_prune_monotonic >= self.PRUNE_INTERVAL_SECONDS:
+                cutoff_ms = int(time.time() * 1000) - self.RETENTION_SECONDS * 1000
+                self._writer.execute(
+                    "DELETE FROM spread_samples WHERE timestamp_ms < ?",
+                    (cutoff_ms,),
+                )
+                self._last_prune_monotonic = now_monotonic
             self._writer.commit()
 
     def window_stats(self, asset: str, window_seconds: float, side: str) -> tuple[float | None, float | None, float | None]:

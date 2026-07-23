@@ -12,6 +12,30 @@ from variational.spread_dashboard import SpreadDashboardServer
 
 
 class SpreadStoreTest(unittest.TestCase):
+    def test_old_samples_are_pruned_periodically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SpreadStore(Path(directory) / "spreads.sqlite3")
+            now_ms = int(time.time() * 1000)
+            store.record(
+                asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                long_edge_pct=5, short_edge_pct=6,
+                timestamp_ms=now_ms - (store.RETENTION_SECONDS + 1) * 1000,
+            )
+            store.record(
+                asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                long_edge_pct=7, short_edge_pct=8,
+                timestamp_ms=now_ms,
+            )
+            store._last_prune_monotonic = 0
+            store.record(
+                asset="BTC", var_bid=1, var_ask=2, lighter_bid=3, lighter_ask=4,
+                long_edge_pct=9, short_edge_pct=10,
+                timestamp_ms=now_ms,
+            )
+
+            self.assertEqual(store.sample_count("BTC"), 2)
+            store.close()
+
     def test_records_stablecoin_book_with_each_spread_sample(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SpreadStore(Path(directory) / "spreads.sqlite3")

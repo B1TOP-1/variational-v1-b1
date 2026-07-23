@@ -19,7 +19,7 @@ from main import SIGNAL_CONFIRM_SECONDS
 from main import SIGNAL_FAST_CONFIRM_MIN_QUOTES
 from main import SIGNAL_FAST_CONFIRM_SECONDS
 from main import SPREAD_TREND_WINDOW_SECONDS
-from main import DASHBOARD_REFRESH_SECONDS
+from main import DASHBOARD_REFRESH_SECONDS, SPREAD_SAMPLE_INTERVAL_SECONDS
 from main import CstLogFormatter
 from main import VariationalToLighterRuntime
 from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, BrowserOrderDispatchQueue
@@ -71,6 +71,7 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
     def test_terminal_dashboard_refreshes_at_active_quote_frequency(self):
         self.assertEqual(DASHBOARD_REFRESH_SECONDS, 0.2)
+        self.assertEqual(SPREAD_SAMPLE_INTERVAL_SECONDS, 1.0)
 
     def test_browser_smoke_test_args_are_available(self):
         args = parse_args(["--browser-smoke-test", "--browser-smoke-qty", "0.001"])
@@ -1163,10 +1164,53 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         )
         rt.records = {complete.trade_key: complete, partial.trade_key: partial}
         rt.record_order.extend((complete.trade_key, partial.trade_key))
+        rt._record_session_execution(complete)
 
         self.assertEqual(
             rt._session_execution_summary(),
             (Decimal("0.002"), Decimal("0.002"), 1),
+        )
+
+    def test_record_cache_releases_old_completed_lifecycle_objects(self):
+        rt = self._runtime()
+        for index in range(550):
+            key = f"strategy:{index}"
+            record = OrderLifecycle(
+                trade_key=key,
+                trade_id="",
+                side="buy",
+                qty=Decimal("0.001"),
+                asset="BTC",
+                auto_hedge_enabled=True,
+                last_variational_status="filled",
+            )
+            rt._remember_record(key, record)
+
+        self.assertEqual(len(rt.record_order), 500)
+        self.assertEqual(len(rt.records), 500)
+        self.assertNotIn("strategy:0", rt.records)
+
+    def test_session_summary_is_counter_based_after_record_eviction(self):
+        rt = self._runtime()
+        record = OrderLifecycle(
+            trade_key="strategy:counter",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal("100"),
+            lighter_fill_price=Decimal("101"),
+            lighter_filled_qty=Decimal("0.001"),
+        )
+        rt._record_session_execution(record)
+        rt.records.clear()
+        rt.record_order.clear()
+
+        self.assertEqual(
+            rt._session_execution_summary(),
+            (Decimal("0.001"), Decimal("0.001"), 1),
         )
 
     async def test_immediate_lighter_fill_is_mapped_before_create_order_returns(self):

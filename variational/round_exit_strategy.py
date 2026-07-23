@@ -39,6 +39,7 @@ class CompletedRound:
     close_edge_actual: Decimal
     edge_pnl: Decimal
     estimated_quote_pnl: Decimal | None = None
+    quote_pnl_exact: bool = False
 
 
 class RoundExitLedger:
@@ -57,12 +58,37 @@ class RoundExitLedger:
         self.normal_close_threshold: Decimal | None = None
         self.entry_qty = Decimal("0")
         self._entry_edge_weighted = Decimal("0")
+        self._entry_quote_weighted: Decimal | None = Decimal("0")
         self.close_qty = Decimal("0")
         self._close_edge_weighted = Decimal("0")
         self._closed_entry_edge_weighted = Decimal("0")
         self._estimated_quote_pnl = Decimal("0")
         self._estimated_quote_pnl_qty = Decimal("0")
+        self._quote_pnl_exact: Decimal | None = Decimal("0")
         self.guard_started = False
+
+    @property
+    def cumulative_quote_pnl(self) -> Decimal | None:
+        values = [item.estimated_quote_pnl for item in self.completed_rounds]
+        if not values or any(value is None for value in values):
+            return None
+        return sum(values, Decimal("0"))
+
+    @property
+    def cumulative_quote_pnl_exact(self) -> bool:
+        return bool(self.completed_rounds) and all(item.quote_pnl_exact for item in self.completed_rounds)
+
+    @property
+    def cumulative_edge_pnl_average(self) -> Decimal | None:
+        if not self.completed_rounds:
+            return None
+        total_qty = sum((item.close_qty for item in self.completed_rounds), Decimal("0"))
+        if total_qty <= 0:
+            return None
+        return sum(
+            (item.edge_pnl * item.close_qty for item in self.completed_rounds),
+            Decimal("0"),
+        ) / total_qty
 
     @property
     def entry_edge_actual(self) -> Decimal | None:
@@ -94,6 +120,7 @@ class RoundExitLedger:
         qty: Decimal,
         edge_pct: Decimal,
         normal_close_threshold: Decimal | None,
+        unit_spread: Decimal | None,
     ) -> None:
         self.round_id = self._next_round_id
         self._next_round_id += 1
@@ -102,6 +129,7 @@ class RoundExitLedger:
         self.normal_close_threshold = normal_close_threshold
         self.entry_qty = qty
         self._entry_edge_weighted = qty * edge_pct
+        self._entry_quote_weighted = qty * unit_spread if unit_spread is not None else None
         self.close_qty = Decimal("0")
         self._close_edge_weighted = Decimal("0")
         self.guard_started = False
@@ -131,9 +159,16 @@ class RoundExitLedger:
             entry,
             close,
             pnl,
-            self._estimated_quote_pnl
-            if self._estimated_quote_pnl_qty == self.close_qty
-            else None,
+            (
+                self._quote_pnl_exact
+                if self._quote_pnl_exact is not None
+                else (
+                    self._estimated_quote_pnl
+                    if self._estimated_quote_pnl_qty == self.close_qty
+                    else None
+                )
+            ),
+            self._quote_pnl_exact is not None,
         )
         self.completed_rounds.append(completed)
         return completed
@@ -147,6 +182,7 @@ class RoundExitLedger:
         normal_close_threshold: Decimal | None = None,
         next_normal_close_threshold: Decimal | None = None,
         reference_price: Decimal | None = None,
+        unit_spread: Decimal | None = None,
     ) -> list[CompletedRound]:
         side = order_side.strip().lower()
         if side not in {"buy", "sell"}:
@@ -155,12 +191,16 @@ class RoundExitLedger:
             raise ValueError("fill qty must be positive")
 
         if self.position_qty == 0:
-            self._start_round(side, qty, edge_pct, normal_close_threshold)
+            self._start_round(side, qty, edge_pct, normal_close_threshold, unit_spread)
             return []
 
         if self._same_direction(side):
             self.entry_qty += qty
             self._entry_edge_weighted += qty * edge_pct
+            if self._entry_quote_weighted is not None and unit_spread is not None:
+                self._entry_quote_weighted += qty * unit_spread
+            else:
+                self._entry_quote_weighted = None
             self.position_qty += qty if self.side == "long" else -qty
             return []
 
@@ -171,6 +211,11 @@ class RoundExitLedger:
         self.close_qty += close_part
         self._close_edge_weighted += close_part * edge_pct
         self._closed_entry_edge_weighted += close_part * entry_before_close
+        if self._quote_pnl_exact is not None and self._entry_quote_weighted is not None and unit_spread is not None:
+            entry_unit_spread = self._entry_quote_weighted / self.entry_qty
+            self._quote_pnl_exact += close_part * (entry_unit_spread + unit_spread)
+        else:
+            self._quote_pnl_exact = None
         if reference_price is not None and reference_price > 0:
             edge_pnl = (
                 edge_pct - entry_before_close
@@ -181,6 +226,8 @@ class RoundExitLedger:
             self._estimated_quote_pnl_qty += close_part
         self.entry_qty -= close_part
         self._entry_edge_weighted -= close_part * entry_before_close
+        if self._entry_quote_weighted is not None:
+            self._entry_quote_weighted -= close_part * (self._entry_quote_weighted / (self.entry_qty + close_part))
         self.position_qty += close_part if self.side == "short" else -close_part
         if self._actual_close_profitable():
             self.guard_started = True
@@ -192,7 +239,7 @@ class RoundExitLedger:
         completed = self._complete_round()
         self._clear_live_round()
         if remainder > 0:
-            self._start_round(side, remainder, edge_pct, next_normal_close_threshold)
+            self._start_round(side, remainder, edge_pct, next_normal_close_threshold, unit_spread)
         return [completed]
 
     def projected_close_edge(self, next_qty: Decimal, next_edge: Decimal) -> Decimal | None:
@@ -202,7 +249,7 @@ class RoundExitLedger:
 
     def to_state(self) -> dict[str, object]:
         return {
-            "version": 3,
+            "version": 4,
             "next_round_id": self._next_round_id,
             "round_id": self.round_id,
             "side": self.side,
@@ -212,11 +259,15 @@ class RoundExitLedger:
             ),
             "entry_qty": str(self.entry_qty),
             "entry_edge_weighted": str(self._entry_edge_weighted),
+            "entry_quote_weighted": (
+                str(self._entry_quote_weighted) if self._entry_quote_weighted is not None else None
+            ),
             "close_qty": str(self.close_qty),
             "close_edge_weighted": str(self._close_edge_weighted),
             "closed_entry_edge_weighted": str(self._closed_entry_edge_weighted),
             "estimated_quote_pnl": str(self._estimated_quote_pnl),
             "estimated_quote_pnl_qty": str(self._estimated_quote_pnl_qty),
+            "quote_pnl_exact": str(self._quote_pnl_exact) if self._quote_pnl_exact is not None else None,
             "guard_started": self.guard_started,
             "completed_rounds": [
                 {
@@ -232,6 +283,7 @@ class RoundExitLedger:
                         if item.estimated_quote_pnl is not None
                         else None
                     ),
+                    "quote_pnl_exact": item.quote_pnl_exact,
                 }
                 for item in self.completed_rounds[-50:]
             ],
@@ -240,7 +292,7 @@ class RoundExitLedger:
     @classmethod
     def from_state(cls, config: RoundExitConfig, state: dict) -> RoundExitLedger:
         version = int(state.get("version", 0))
-        if version not in {2, 3}:
+        if version not in {2, 3, 4}:
             raise ValueError("unsupported round state version")
         ledger = cls(config)
         ledger._next_round_id = int(state.get("next_round_id", 1))
@@ -253,6 +305,10 @@ class RoundExitLedger:
         ledger.normal_close_threshold = Decimal(str(threshold)) if threshold is not None else None
         ledger.entry_qty = Decimal(str(state.get("entry_qty", "0")))
         ledger._entry_edge_weighted = Decimal(str(state.get("entry_edge_weighted", "0")))
+        entry_quote_weighted = state.get("entry_quote_weighted")
+        ledger._entry_quote_weighted = (
+            Decimal(str(entry_quote_weighted)) if entry_quote_weighted is not None else None
+        ) if version >= 4 else None
         ledger.close_qty = Decimal(str(state.get("close_qty", "0")))
         ledger._close_edge_weighted = Decimal(str(state.get("close_edge_weighted", "0")))
         ledger._closed_entry_edge_weighted = Decimal(
@@ -260,6 +316,10 @@ class RoundExitLedger:
         )
         ledger._estimated_quote_pnl = Decimal(str(state.get("estimated_quote_pnl", "0")))
         ledger._estimated_quote_pnl_qty = Decimal(str(state.get("estimated_quote_pnl_qty", "0")))
+        quote_pnl_exact = state.get("quote_pnl_exact")
+        ledger._quote_pnl_exact = (
+            Decimal(str(quote_pnl_exact)) if quote_pnl_exact is not None else None
+        ) if version >= 4 else None
         ledger.guard_started = bool(state.get("guard_started", False))
         if version >= 3:
             ledger.completed_rounds = [
@@ -276,6 +336,7 @@ class RoundExitLedger:
                         if item.get("estimated_quote_pnl") is not None
                         else None
                     ),
+                    quote_pnl_exact=bool(item.get("quote_pnl_exact", False)),
                 )
                 for item in state.get("completed_rounds", [])
             ]

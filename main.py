@@ -90,6 +90,8 @@ MAX_SPIKE_DEVIATION_PCT: Decimal | None = None
 POLL_INTERVAL_SECONDS = 0.05
 HEDGE_SLIPPAGE_BPS = 100.0
 DASHBOARD_REFRESH_SECONDS = 0.2
+SPREAD_SAMPLE_INTERVAL_SECONDS = 1.0
+TRADE_RECORDS_EXPORT_INTERVAL_SECONDS = 1.0
 DASHBOARD_RESIZE_SETTLE_SECONDS = 0.25
 SPREAD_STATS_REFRESH_SECONDS = 1.0
 HISTORY_CACHE_REFRESH_SECONDS = 5.0
@@ -469,6 +471,7 @@ class VariationalToLighterRuntime:
         self._order_write_lock = asyncio.Lock()
         self._trade_csv_write_lock = asyncio.Lock()
         self._trade_records_snapshot_sig: str | None = None
+        self._trade_records_exported_at = 0.0
 
         self.records: dict[str, OrderLifecycle] = {}
         self.record_order: deque[str] = deque(maxlen=500)
@@ -578,6 +581,9 @@ class VariationalToLighterRuntime:
         self._stat_lighter_slip = RunningStat()
         self._stat_long_fill_edge = RunningStat()
         self._stat_short_fill_edge = RunningStat()
+        self._session_cashflow = Decimal("0")
+        self._session_qty = Decimal("0")
+        self._session_completed_orders = 0
         self._last_gradient_signal_sig: tuple[str, str, str, str, str, str] | None = None
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._pending_prepare_sigs: set[tuple[str, str]] = set()
@@ -798,6 +804,9 @@ class VariationalToLighterRuntime:
             self.lighter_client_order_to_trade_key.clear()
             self._pending_variational_strategy_order_keys.clear()
             self._pending_trigger_spreads.clear()
+            self._session_cashflow = Decimal("0")
+            self._session_qty = Decimal("0")
+            self._session_completed_orders = 0
         # 历史价差按资产持久化，切换标的不删除数据库记录。
         # 换标的：清缓存仓位与在途/停止状态，避免用旧标的仓位误判平衡。
         self._cached_position_qty = None
@@ -969,6 +978,7 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
             if completed:
                 self.lighter_client_order_to_trade_key.pop(client_order_id, None)
+                self._prune_record_cache()
 
         await self.append_order_log("lighter_fill" if completed else "lighter_partial_fill", payload)
         logger = getattr(self, "logger", None)
@@ -1014,6 +1024,7 @@ class VariationalToLighterRuntime:
             elif record.side.strip().lower() == "sell":
                 self._stat_short_fill_edge.add(float(fill_edge))
             completed_rounds = self._account_round_fill(record, fill_edge)
+            self._record_session_execution(record)
             logger = getattr(self, "logger", None)
             if logger is not None:
                 short_id = record.trade_key.rsplit(":", 1)[-1][-8:]
@@ -1025,9 +1036,9 @@ class VariationalToLighterRuntime:
                     "rejected_conflict": "账本冲突",
                 }.get(record.round_fill_role or "", "未分类")
                 round_text = (
-                    f"轮次#{record.round_id} {role}"
+                    f"第{record.round_id}个持仓周期 {role}"
                     if record.round_id is not None
-                    else f"轮次未跟踪 {role}"
+                    else f"持仓周期未跟踪 {role}"
                 )
                 total_slip = record.spread_slippage_pct()
                 total_slip_text = "-" if total_slip is None else f"{total_slip:+.4f}%"
@@ -1049,15 +1060,33 @@ class VariationalToLighterRuntime:
                     decimal_to_str(self.round_exit_ledger.position_qty),
                 )
                 for item in completed_rounds:
+                    cycle_quote = "-" if item.estimated_quote_pnl is None else f"{item.estimated_quote_pnl:+.4f}u"
+                    cycle_quote_label = "毛收益=" if item.quote_pnl_exact else "约="
+                    cumulative_edge = self.round_exit_ledger.cumulative_edge_pnl_average
+                    cumulative_quote = self.round_exit_ledger.cumulative_quote_pnl
+                    cumulative_edge_text = "-" if cumulative_edge is None else f"{cumulative_edge:+.4f}%"
+                    cumulative_quote_text = "-" if cumulative_quote is None else f"{cumulative_quote:+.4f}u"
+                    cumulative_quote_label = (
+                        "毛收益="
+                        if self.round_exit_ledger.cumulative_quote_pnl_exact
+                        else "约="
+                    )
                     logger.info(
-                        "✅【仓位清零】轮次#%s %s | 入=%+.4f%% 平=%+.4f%% "
-                        "收益=%+.4f%% 约=%su",
+                        "✅【仓位清零】第%s个持仓周期 %s | 入=%+.4f%% 平=%+.4f%% "
+                        "Edge收益=%+.4f%% %s%s",
                         item.round_id,
                         "Long" if item.side == "long" else "Short",
                         item.entry_edge_actual,
                         item.close_edge_actual,
                         item.edge_pnl,
-                        "-" if item.estimated_quote_pnl is None else f"{item.estimated_quote_pnl:+.4f}",
+                        cycle_quote_label,
+                        cycle_quote,
+                    )
+                    logger.info(
+                        "📊累计清零收益 | 平均Edge=%s | %s%s",
+                        cumulative_edge_text,
+                        cumulative_quote_label,
+                        cumulative_quote_text,
                     )
         record.slippage_recorded = True
 
@@ -1103,6 +1132,7 @@ class VariationalToLighterRuntime:
                 normal_close_threshold=normal_threshold,
                 next_normal_close_threshold=normal_threshold,
                 reference_price=reference_price,
+                unit_spread=self._record_unit_spread(record),
             )
         except RoundStateError as exc:
             record.round_accounted = True
@@ -1116,6 +1146,38 @@ class VariationalToLighterRuntime:
         record.round_accounted = True
         self._persist_round_exit_ledger()
         return completed
+
+    def _record_session_execution(self, record: OrderLifecycle) -> None:
+        unit_spread = self._record_unit_spread(record)
+        if unit_spread is None or record.lighter_filled_qty < record.qty:
+            return
+        self._session_cashflow += unit_spread * record.qty
+        self._session_qty += record.qty
+        self._session_completed_orders += 1
+
+    def _record_is_referenced(self, trade_key: str) -> bool:
+        return trade_key in self.lighter_client_order_to_trade_key.values() or trade_key in self._pending_variational_strategy_order_keys
+
+    def _prune_record_cache(self) -> None:
+        """Keep recent dashboard rows while releasing completed old lifecycle objects."""
+        maxlen = getattr(self.record_order, "maxlen", None) or 500
+        if len(self.records) <= maxlen + 100:
+            return
+        retained = set(self.record_order)
+        for key in list(self.records):
+            if len(self.records) <= maxlen:
+                break
+            if key in retained or self._record_is_referenced(key):
+                continue
+            self.records.pop(key, None)
+
+    def _remember_record(self, trade_key: str, record: OrderLifecycle) -> None:
+        maxlen = getattr(self.record_order, "maxlen", None) or 500
+        evicted = self.record_order[0] if len(self.record_order) >= maxlen else None
+        self.records[trade_key] = record
+        self.record_order.append(trade_key)
+        if evicted is not None and evicted not in self.record_order and not self._record_is_referenced(evicted):
+            self.records.pop(evicted, None)
 
     def _load_round_exit_ledger(self) -> RoundExitLedger:
         config = RoundExitConfig(self.gradient_strategy.single_order_qty)
@@ -1561,8 +1623,7 @@ class VariationalToLighterRuntime:
                     last_variational_status=status,
                     trigger_spread_pct=self._consume_pending_trigger_spread(side),
                 )
-                self.records[key] = record
-                self.record_order.append(key)
+                self._remember_record(key, record)
                 created = True
             else:
                 previous_status = record.last_variational_status
@@ -2060,19 +2121,7 @@ class VariationalToLighterRuntime:
         The cashflow includes fills belonging to a still-open hedged position,
         so it is an execution difference rather than realized PnL.
         """
-        cashflow = Decimal("0")
-        quantity = Decimal("0")
-        count = 0
-        for record in self.records.values():
-            if record.lighter_filled_qty < record.qty:
-                continue
-            unit_spread = self._record_unit_spread(record)
-            if unit_spread is None:
-                continue
-            cashflow += unit_spread * record.qty
-            quantity += record.qty
-            count += 1
-        return cashflow, quantity, count
+        return self._session_cashflow, self._session_qty, self._session_completed_orders
 
     def compute_pnl(self) -> tuple[Decimal, Decimal, int, Decimal, Decimal | None]:
         """FIFO-offset PnL (USDC) over fully-filled rounds. Caller holds _record_lock.
@@ -2370,6 +2419,9 @@ class VariationalToLighterRuntime:
         if active_quote_key is not None and active_quote_key not in self._pending_signal_quote_keys:
             self._pending_signal_quote_keys.add(active_quote_key)
             self._pending_signal_edge_samples.append(signal.spread_pct)
+            if len(self._pending_signal_edge_samples) > 500:
+                self._pending_signal_edge_samples = self._pending_signal_edge_samples[-250:]
+                self._pending_signal_quote_keys = {active_quote_key}
         elapsed = 0.0 if self._pending_signal_started_at is None else now - self._pending_signal_started_at
         edge_range = (
             max(self._pending_signal_edge_samples) - min(self._pending_signal_edge_samples)
@@ -3047,15 +3099,16 @@ class VariationalToLighterRuntime:
                 f"{self.ticker or ''} / {session_count}笔 (含未平仓·未扣费)"
             )
             if latest_round is None:
-                grid.add_row("最近完整轮次收益: -")
+                grid.add_row("最近完成周期收益: -")
             else:
                 quote_text = (
-                    f"约 {latest_round.estimated_quote_pnl:+.4f}u"
+                    f"{'毛收益' if latest_round.quote_pnl_exact else '约'} "
+                    f"{latest_round.estimated_quote_pnl:+.4f}u"
                     if latest_round.estimated_quote_pnl is not None
                     else "金额不可用"
                 )
                 grid.add_row(
-                    f"最近完整轮次 #{latest_round.round_id}: "
+                    f"最近完成周期 第{latest_round.round_id}个: "
                     f"入 {latest_round.entry_edge_actual:+.4f}% → "
                     f"平 {latest_round.close_edge_actual:+.4f}% | "
                     f"收益 {latest_round.edge_pnl:+.4f}% ({quote_text}·未扣费)"
@@ -3078,15 +3131,15 @@ class VariationalToLighterRuntime:
                 "(includes open inventory; before fees)"
             )
             if latest_round is None:
-                grid.add_row("latest completed round PnL: -")
+                grid.add_row("latest completed cycle PnL: -")
             else:
                 quote_text = (
-                    f"est. {latest_round.estimated_quote_pnl:+.4f}u"
+                    f"{'gross' if latest_round.quote_pnl_exact else 'est.'} {latest_round.estimated_quote_pnl:+.4f}u"
                     if latest_round.estimated_quote_pnl is not None
                     else "quote unavailable"
                 )
                 grid.add_row(
-                    f"latest completed round #{latest_round.round_id}: "
+                    f"latest completed cycle {latest_round.round_id}: "
                     f"entry {latest_round.entry_edge_actual:+.4f}% → "
                     f"close {latest_round.close_edge_actual:+.4f}% | "
                     f"PnL {latest_round.edge_pnl:+.4f}% ({quote_text}; before fees)"
@@ -3308,21 +3361,22 @@ class VariationalToLighterRuntime:
         session_value = "0" if session_cashflow == 0 else f"{session_cashflow:+.4f}u"
         latest_round = ledger.completed_rounds[-1] if ledger.completed_rounds else None
         if latest_round is None:
-            latest_round_text = "最近完整轮次 -" if is_zh else "latest round -"
+            latest_round_text = "最近完成周期 -" if is_zh else "latest cycle -"
         else:
             round_color = "green" if latest_round.edge_pnl >= 0 else "red"
+            quote_prefix = "" if latest_round.quote_pnl_exact else ("约" if is_zh else "est. ")
             quote_text = (
-                f"≈{latest_round.estimated_quote_pnl:+.4f}u"
+                f"{quote_prefix}{latest_round.estimated_quote_pnl:+.4f}u"
                 if latest_round.estimated_quote_pnl is not None
                 else "金额--"
             )
             if is_zh:
                 latest_round_text = (
-                    f"最近完整轮次 [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
+                    f"最近完成周期 [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
                 )
             else:
                 latest_round_text = (
-                    f"latest round [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
+                    f"latest cycle [{round_color}]{latest_round.edge_pnl:+.4f}%({quote_text})[/]"
                 )
         if is_zh:
             pnl_text = (
@@ -3610,6 +3664,9 @@ class VariationalToLighterRuntime:
     async def export_trade_records_csv(self) -> None:
         if self.trade_records_csv_file is None:
             return
+        now = time.monotonic()
+        if now - self._trade_records_exported_at < TRADE_RECORDS_EXPORT_INTERVAL_SECONDS:
+            return
 
         async with self._record_lock:
             keys = list(self.record_order)
@@ -3683,6 +3740,7 @@ class VariationalToLighterRuntime:
 
         snapshot_sig = json.dumps(rows, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         if snapshot_sig == self._trade_records_snapshot_sig:
+            self._trade_records_exported_at = now
             return
 
         fieldnames = [
@@ -3742,6 +3800,7 @@ class VariationalToLighterRuntime:
                 return
             await asyncio.to_thread(self._write_csv_rows, self.trade_records_csv_file, fieldnames, rows)
             self._trade_records_snapshot_sig = snapshot_sig
+            self._trade_records_exported_at = now
 
     @staticmethod
     def _write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
@@ -3800,7 +3859,7 @@ class VariationalToLighterRuntime:
                 raise
             except Exception:
                 self.logger.exception("价差采集异常")
-            remaining = DASHBOARD_REFRESH_SECONDS - (time.monotonic() - started)
+            remaining = SPREAD_SAMPLE_INTERVAL_SECONDS - (time.monotonic() - started)
             await asyncio.sleep(max(0.0, remaining))
 
     async def dashboard_loop(self) -> None:
