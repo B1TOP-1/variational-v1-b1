@@ -43,7 +43,7 @@ from variational.browser_order import BrowserOrderBroker, BrowserOrderCommand, B
 from variational.differential_screen import DifferentialScreen
 from variational.gradient_strategy import EditableField, GradientSignal, GradientStrategyState, StrategySection
 from variational.quote_comparator import QuoteComparator
-from variational.round_exit_strategy import RoundExitConfig, RoundExitLedger, RoundStateError
+from variational.round_exit_strategy import CompletedRound, RoundExitConfig, RoundExitLedger, RoundStateError
 from variational.spread_store import SpreadStore
 from variational.spread_dashboard import SpreadDashboardServer
 
@@ -974,12 +974,15 @@ class VariationalToLighterRuntime:
         logger = getattr(self, "logger", None)
         if logger is not None and not completed:
             short_id = record.trade_key.rsplit(":", 1)[-1][-8:]
+            lighter_slip = record.lighter_slippage_pct()
+            lighter_slip_text = "-" if lighter_slip is None else f"{lighter_slip:+.4f}%"
             logger.info(
-                "L分片 #%s %s/%s @%s",
+                "L分片 #%s | 累计=%s/%s 均价=%s | L滑点=%s",
                 short_id,
                 decimal_to_str(record.lighter_filled_qty),
                 decimal_to_str(record.qty),
                 decimal_to_str(record.lighter_fill_price),
+                lighter_slip_text,
             )
 
     def _maybe_record_slippage_stats(self, record: OrderLifecycle) -> None:
@@ -1010,29 +1013,52 @@ class VariationalToLighterRuntime:
                 self._stat_long_fill_edge.add(float(fill_edge))
             elif record.side.strip().lower() == "sell":
                 self._stat_short_fill_edge.add(float(fill_edge))
-            self._account_round_fill(record, fill_edge)
+            completed_rounds = self._account_round_fill(record, fill_edge)
             logger = getattr(self, "logger", None)
             if logger is not None:
                 short_id = record.trade_key.rsplit(":", 1)[-1][-8:]
                 direction = "买V/卖L" if record.side.strip().lower() == "buy" else "卖V/买L"
                 role = {
-                    "entry": "开",
-                    "close": "平",
-                    "close_and_new_entry": "平后反开",
-                    "rejected_conflict": "冲突",
-                }.get(record.round_fill_role or "", "-")
+                    "entry": "开仓",
+                    "close": "平仓",
+                    "close_and_new_entry": "平仓并反向开仓",
+                    "rejected_conflict": "账本冲突",
+                }.get(record.round_fill_role or "", "未分类")
+                round_text = (
+                    f"轮次#{record.round_id} {role}"
+                    if record.round_id is not None
+                    else f"轮次未跟踪 {role}"
+                )
+                total_slip = record.spread_slippage_pct()
+                total_slip_text = "-" if total_slip is None else f"{total_slip:+.4f}%"
+                var_slip_text = "-" if v is None else f"{v:+.4f}%"
+                lighter_slip_text = "-" if l is None else f"{l:+.4f}%"
                 logger.info(
-                    "成交 #%s %s %s | V=%s L=%s Edge=%+.4f%% | 轮%s/%s 仓=%s",
+                    "成交 #%s %s %s | V=%s L均价=%s Edge=%+.4f%% | "
+                    "滑点(有利+) 总=%s V=%s L=%s | %s 仓=%s",
                     short_id,
                     direction,
                     decimal_to_str(record.qty),
                     decimal_to_str(record.var_fill_price),
                     decimal_to_str(record.lighter_fill_price),
                     fill_edge,
-                    record.round_id or "-",
-                    role,
+                    total_slip_text,
+                    var_slip_text,
+                    lighter_slip_text,
+                    round_text,
                     decimal_to_str(self.round_exit_ledger.position_qty),
                 )
+                for item in completed_rounds:
+                    logger.info(
+                        "✅【仓位清零】轮次#%s %s | 入=%+.4f%% 平=%+.4f%% "
+                        "收益=%+.4f%% 约=%su",
+                        item.round_id,
+                        "Long" if item.side == "long" else "Short",
+                        item.entry_edge_actual,
+                        item.close_edge_actual,
+                        item.edge_pnl,
+                        "-" if item.estimated_quote_pnl is None else f"{item.estimated_quote_pnl:+.4f}",
+                    )
         record.slippage_recorded = True
 
     def _normal_close_threshold_for_entry_side(self, entry_side: str) -> Decimal | None:
@@ -1050,10 +1076,10 @@ class VariationalToLighterRuntime:
         ]
         return max(values) if values else None
 
-    def _account_round_fill(self, record: OrderLifecycle, fill_edge: Decimal) -> None:
+    def _account_round_fill(self, record: OrderLifecycle, fill_edge: Decimal) -> list[CompletedRound]:
         """Feed one fully-filled two-leg order into the live round ledger."""
         if record.round_accounted or not self._round_ledger_synced:
-            return
+            return []
         ledger = self.round_exit_ledger
         side = record.side.strip().lower()
         if ledger.position_qty == 0:
@@ -1084,21 +1110,12 @@ class VariationalToLighterRuntime:
             self._strategy_halted = True
             self._halt_reason = f"本轮账本冲突: {exc}"
             self.logger.error("策略已停止（需手动检查）：%s", self._halt_reason)
-            return
+            return []
         record.round_id = existing_round_id or (completed[0].round_id if completed else ledger.round_id)
         record.round_fill_role = role
         record.round_accounted = True
         self._persist_round_exit_ledger()
-        for item in completed:
-            self.logger.info(
-                "轮次#%s完成 %s | 入=%+.4f%% 平=%+.4f%% 收益=%+.4f%% 约=%su",
-                item.round_id,
-                "Long" if item.side == "long" else "Short",
-                item.entry_edge_actual,
-                item.close_edge_actual,
-                item.edge_pnl,
-                "-" if item.estimated_quote_pnl is None else f"{item.estimated_quote_pnl:+.4f}",
-            )
+        return completed
 
     def _load_round_exit_ledger(self) -> RoundExitLedger:
         config = RoundExitConfig(self.gradient_strategy.single_order_qty)
