@@ -292,7 +292,7 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rt._strategy_halted)
         self.assertIn("账本与真实仓位不一致", rt._manual_fill_recovery_status)
 
-    def test_pending_fill_match_uses_nearest_order_time_not_fifo(self):
+    def test_pending_fill_match_uses_fifo(self):
         rt = self._runtime()
         old = OrderLifecycle(
             trade_key="strategy:old",
@@ -322,12 +322,11 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
             "buy",
             Decimal("0.001"),
             "BTC",
-            event_timestamp=1_301,
         )
 
-        self.assertIs(selected, current)
-        self.assertIn(old.trade_key, rt._pending_variational_strategy_order_keys)
-        self.assertNotIn(current.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertIs(selected, old)
+        self.assertNotIn(old.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertIn(current.trade_key, rt._pending_variational_strategy_order_keys)
 
     def test_filled_pending_record_cannot_consume_next_trade(self):
         rt = self._runtime()
@@ -360,7 +359,7 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(selected, current)
         self.assertNotIn(stale.trade_key, rt._pending_variational_strategy_order_keys)
 
-    def test_order_id_match_overrides_fifo_order(self):
+    def test_order_ids_do_not_override_fifo_order(self):
         rt = self._runtime()
         old = OrderLifecycle(
             trade_key="strategy:old",
@@ -390,13 +389,13 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
             "buy",
             Decimal("0.001"),
             "BTC",
-            trade_id="order-current",
         )
 
-        self.assertIs(selected, current)
-        self.assertIn(old.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertIs(selected, old)
+        self.assertNotIn(old.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertIn(current.trade_key, rt._pending_variational_strategy_order_keys)
 
-    def test_unknown_trade_id_is_never_fifo_matched(self):
+    def test_unknown_trade_id_falls_back_to_fifo(self):
         rt = self._runtime()
         pending = OrderLifecycle(
             trade_key="strategy:pending",
@@ -411,15 +410,79 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         rt.records[pending.trade_key] = pending
         rt._pending_variational_strategy_order_keys.append(pending.trade_key)
 
-        selected = rt._match_pending_variational_strategy_order(
-            "buy",
-            Decimal("0.001"),
-            "BTC",
-            trade_id="different-order",
-        )
+        selected = rt._match_pending_variational_strategy_order("buy", Decimal("0.001"), "BTC")
 
-        self.assertIsNone(selected)
-        self.assertIn(pending.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertIs(selected, pending)
+        self.assertNotIn(pending.trade_key, rt._pending_variational_strategy_order_keys)
+
+    async def test_same_size_trade_events_consume_fifo_once_without_overwrite(self):
+        rt = self._runtime()
+        rt.accepted_assets = {"BTC"}
+        rt.variational_ticker = "BTC"
+        rt.logged_fills = []
+
+        async def append_order_log(event_type, payload):
+            rt.logged_fills.append((event_type, payload))
+
+        rt.append_order_log = append_order_log
+        first = OrderLifecycle(
+            trade_key="strategy:first",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        second = OrderLifecycle(
+            trade_key="strategy:second",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        for record in (first, second):
+            rt.records[record.trade_key] = record
+            rt.record_order.append(record.trade_key)
+            rt._pending_variational_strategy_order_keys.append(record.trade_key)
+
+        await rt.process_variational_trade_event({
+            "trade_id": "fill-1",
+            "side": "buy",
+            "qty": "0.001",
+            "asset": "BTC",
+            "status": "filled",
+            "price": "65000",
+            "timestamp": "2026-07-24T00:00:01Z",
+        })
+        await rt.process_variational_trade_event({
+            "trade_id": "fill-2",
+            "side": "buy",
+            "qty": "0.001",
+            "asset": "BTC",
+            "status": "filled",
+            "price": "65001",
+            "timestamp": "2026-07-24T00:00:02Z",
+        })
+        # 重复推送只命中原 trade_id，不得覆盖价格或消费新的在途单。
+        await rt.process_variational_trade_event({
+            "trade_id": "fill-1",
+            "side": "buy",
+            "qty": "0.001",
+            "asset": "BTC",
+            "status": "filled",
+            "price": "99999",
+            "timestamp": "2026-07-24T00:00:03Z",
+        })
+
+        self.assertEqual(first.trade_id, "fill-1")
+        self.assertEqual(first.var_fill_price, Decimal("65000"))
+        self.assertEqual(second.trade_id, "fill-2")
+        self.assertEqual(second.var_fill_price, Decimal("65001"))
+        self.assertEqual(list(rt._pending_variational_strategy_order_keys), [])
+        self.assertEqual([event for event, _ in rt.logged_fills], ["variational_fill", "variational_fill"])
 
     async def test_fill_arriving_before_order_response_is_merged_by_id(self):
         rt = self._runtime()

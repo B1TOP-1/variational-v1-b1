@@ -1587,10 +1587,6 @@ class VariationalToLighterRuntime:
         side: str,
         qty: Decimal,
         asset: str,
-        *,
-        trade_id: str = "",
-        order_id: str = "",
-        event_timestamp: Any = None,
     ) -> OrderLifecycle | None:
         side_n = side.strip().lower()
         asset_n = asset.strip().upper()
@@ -1608,49 +1604,9 @@ class VariationalToLighterRuntime:
         if not candidates:
             return None
 
-        event_ids = {value for value in (trade_id.strip(), order_id.strip()) if value}
-        exact = [record for record in candidates if record.var_submit_order_id in event_ids]
-        if len(exact) == 1:
-            selected = exact[0]
-        elif event_ids:
-            logger = getattr(self, "logger", None)
-            if logger is not None:
-                logger.warning(
-                    "Var成交ID尚未匹配到下单记录，禁止FIFO绑定: trade_id=%s order_id=%s side=%s qty=%s",
-                    trade_id or "-",
-                    order_id or "-",
-                    side_n,
-                    decimal_to_str(qty),
-                )
-            return None
-        else:
-            event_ms = self._epoch_ms(event_timestamp)
-            timed: list[tuple[float, OrderLifecycle]] = []
-            if event_ms is not None:
-                for record in candidates:
-                    submitted_ms = record.var_submit_click_started_at_ms or record.strategy_created_at_ms
-                    if submitted_ms is None:
-                        continue
-                    distance_ms = abs(event_ms - float(submitted_ms))
-                    if distance_ms <= 120_000:
-                        timed.append((distance_ms, record))
-            timed.sort(key=lambda item: item[0])
-            if timed and (len(timed) == 1 or timed[0][0] < timed[1][0]):
-                selected = timed[0][1]
-            elif len(candidates) == 1:
-                selected = candidates[0]
-            else:
-                logger = getattr(self, "logger", None)
-                if logger is not None:
-                    logger.error(
-                        "Var成交无法唯一匹配策略单，拒绝FIFO绑定: side=%s qty=%s trade_id=%s order_id=%s candidates=%s",
-                        side_n,
-                        decimal_to_str(qty),
-                        trade_id or "-",
-                        order_id or "-",
-                        [record.trade_key for record in candidates],
-                    )
-                return None
+        # Variational 的下单响应与成交推送没有稳定的同一 ID。
+        # 恢复仓位推导之前的行为：同资产、方向、数量按创建顺序消费。
+        selected = candidates[0]
 
         with contextlib.suppress(ValueError):
             self._pending_variational_strategy_order_keys.remove(selected.trade_key)
@@ -1739,7 +1695,6 @@ class VariationalToLighterRuntime:
         status = normalize_variational_status(str(event.get("status", "")))
         asset = str(event.get("asset", "")).strip().upper() or self.variational_ticker
         trade_id = str(event.get("trade_id", "")).strip()
-        order_id = str(event.get("order_id", "")).strip()
 
         now_iso = utc_now()
         fill_iso = str(event.get("timestamp") or now_iso)
@@ -1747,7 +1702,6 @@ class VariationalToLighterRuntime:
         created = False
 
         async with self._record_lock:
-            event_ids = {value for value in (trade_id, order_id) if value}
             record = next(
                 (
                     item
@@ -1756,15 +1710,6 @@ class VariationalToLighterRuntime:
                 ),
                 None,
             )
-            if record is None and event_ids:
-                record = next(
-                    (
-                        item
-                        for item in self.records.values()
-                        if item.var_submit_order_id in event_ids
-                    ),
-                    None,
-                )
             if record is None:
                 record = self.records.get(key)
             if record is None:
@@ -1772,9 +1717,6 @@ class VariationalToLighterRuntime:
                     side,
                     qty,
                     asset if asset else "UNKNOWN",
-                    trade_id=trade_id,
-                    order_id=order_id,
-                    event_timestamp=event.get("timestamp"),
                 )
             elif record.trade_key.startswith("strategy:"):
                 with contextlib.suppress(ValueError):
