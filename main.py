@@ -533,7 +533,7 @@ class VariationalToLighterRuntime:
         self._dashboard_size: tuple[int, int] | None = None
         self._dashboard_resize_deadline = 0.0
 
-        self.gradient_strategy = GradientStrategyState.default()
+        self.gradient_strategy = GradientStrategyState.from_config(os.environ)
         self.round_exit_state_file: Path | None = None if self.args.browser_smoke_test else ROUND_EXIT_STATE_FILE
         self.round_exit_ledger = self._load_round_exit_ledger()
         self._round_ledger_synced = False

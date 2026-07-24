@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from typing import Mapping
+
+
+GRADIENT_SINGLE_ORDER_QTY_ENV = "GRADIENT_SINGLE_ORDER_QTY"
+GRADIENT_LONG_ENV = "GRADIENT_LONG"
+GRADIENT_SHORT_ENV = "GRADIENT_SHORT"
 
 
 class StrategySection(str, Enum):
@@ -69,6 +75,61 @@ class GradientStrategyState:
     @classmethod
     def default(cls) -> GradientStrategyState:
         return cls()
+
+    @classmethod
+    def from_config(cls, config: Mapping[str, str]) -> GradientStrategyState:
+        """Build disabled runtime state from optional environment presets."""
+        state = cls.default()
+        order_qty = config.get(GRADIENT_SINGLE_ORDER_QTY_ENV, "").strip()
+        if order_qty:
+            state.single_order_qty = cls._parse_config_decimal(
+                GRADIENT_SINGLE_ORDER_QTY_ENV,
+                order_qty,
+            )
+
+        for env_name, section in (
+            (GRADIENT_LONG_ENV, StrategySection.OPEN),
+            (GRADIENT_SHORT_ENV, StrategySection.CLOSE),
+        ):
+            raw_value = config.get(env_name, "").strip()
+            if not raw_value:
+                continue
+            rows: list[GradientRow] = []
+            for index, raw_row in enumerate(raw_value.split(","), start=1):
+                threshold_text, separator, target_text = raw_row.partition(":")
+                threshold_text = threshold_text.strip()
+                target_text = target_text.strip()
+                if not separator or not threshold_text or not target_text:
+                    raise ValueError(
+                        f"{env_name} 第 {index} 档格式错误，应为 阈值:目标仓位"
+                    )
+                rows.append(
+                    GradientRow(
+                        threshold_pct=cls._parse_config_decimal(
+                            f"{env_name} 第 {index} 档阈值",
+                            threshold_text,
+                        ),
+                        target_qty=cls._parse_config_decimal(
+                            f"{env_name} 第 {index} 档目标仓位",
+                            target_text,
+                        ),
+                    )
+                )
+            if section == StrategySection.OPEN:
+                state.open_rows = rows
+            else:
+                state.close_rows = rows
+        return state
+
+    @staticmethod
+    def _parse_config_decimal(name: str, raw_value: str) -> Decimal:
+        try:
+            value = Decimal(raw_value)
+        except InvalidOperation as exc:
+            raise ValueError(f"{name} 不是有效数字: {raw_value}") from exc
+        if not value.is_finite():
+            raise ValueError(f"{name} 必须是有限数字: {raw_value}")
+        return value
 
     def rows_for(self, section: StrategySection) -> list[GradientRow]:
         return self.open_rows if section == StrategySection.OPEN else self.close_rows

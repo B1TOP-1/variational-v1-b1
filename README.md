@@ -49,6 +49,19 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
+可以同时在 `.env` 预制第二页的梯度。每档格式为 `阈值%:目标净仓位`，多档用逗号分隔：
+
+```bash
+GRADIENT_SINGLE_ORDER_QTY=0.001
+GRADIENT_LONG=0.060:0.005,0.065:0.010,0.070:0.015
+GRADIENT_SHORT=0.040:-0.005,0.035:-0.010,0.030:-0.015
+```
+
+程序每次启动时读取这些值，但不会自动启动策略；进入第二页在启动行按一次 `Enter`
+才会开始下单。运行中仍可自由增删或修改梯度，修改只在本次进程内生效，不会回写
+`.env`。环境变量格式错误会阻止程序启动；梯度顺序、重复值等策略错误会显示在第二页并
+保持未启动。
+
 ### Lighter Rust 全流程
 
 Lighter 的公共订单簿、指定美元深度 VWAP、市场精度、nonce、原生签名、HTTP
@@ -222,7 +235,7 @@ python main.py --lang en
 ```
 
 ### 第二页触发策略
-第二页提供运行中的梯度目标仓位配置，默认 Long 梯度和 Short 梯度各一行空参数，不会在未填完整前触发。
+第二页提供运行中的梯度目标仓位配置。未设置 `.env` 预制梯度时，Long 梯度和 Short 梯度各有一行空参数，不会在未填完整前触发。
 策略默认未启动；录入参数只会保存配置，必须把光标移动到启动行并按 `Enter` 后才会产生触发信号。
 
 - `Tab`：切换第一页/第二页。
@@ -301,6 +314,18 @@ LIGHTER_ACCOUNT_INDEX=...
 LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
+
+Optional Page 2 gradient presets can be loaded from `.env`. Each level uses
+`threshold_percent:target_net_position`, separated by commas:
+
+```bash
+GRADIENT_SINGLE_ORDER_QTY=0.001
+GRADIENT_LONG=0.060:0.005,0.065:0.010,0.070:0.015
+GRADIENT_SHORT=0.040:-0.005,0.035:-0.010,0.030:-0.015
+```
+
+Presets are loaded on each process start, but the strategy remains disabled until
+you press `Enter` on the Page 2 start row. Runtime edits never write back to `.env`.
 
 If you need to temporarily force Lighter's legacy application-level ping/pong behavior during the rollout window, you can also set:
 ```bash

@@ -24,6 +24,58 @@ class GradientStrategyStateTest(unittest.TestCase):
         self.assertFalse(state.enabled)
         self.assertIn("至少配置一条", state.validation_error)
 
+    def test_environment_presets_populate_rows_but_stay_disabled(self):
+        state = GradientStrategyState.from_config(
+            {
+                "GRADIENT_SINGLE_ORDER_QTY": "0.001",
+                "GRADIENT_LONG": "0.060:0.005, 0.065:0.010,0.070:0.015",
+                "GRADIENT_SHORT": "0.040:-0.005,0.035:-0.010,0.030:-0.015",
+            }
+        )
+
+        self.assertFalse(state.enabled)
+        self.assertEqual(state.single_order_qty, Decimal("0.001"))
+        self.assertEqual(
+            [(row.threshold_pct, row.target_qty) for row in state.open_rows],
+            [
+                (Decimal("0.060"), Decimal("0.005")),
+                (Decimal("0.065"), Decimal("0.010")),
+                (Decimal("0.070"), Decimal("0.015")),
+            ],
+        )
+        self.assertEqual(
+            [(row.threshold_pct, row.target_qty) for row in state.close_rows],
+            [
+                (Decimal("0.040"), Decimal("-0.005")),
+                (Decimal("0.035"), Decimal("-0.010")),
+                (Decimal("0.030"), Decimal("-0.015")),
+            ],
+        )
+        self.assertEqual(state.validation_errors(), [])
+
+    def test_missing_environment_presets_keep_empty_defaults(self):
+        state = GradientStrategyState.from_config({})
+
+        self.assertEqual(state.single_order_qty, Decimal("0.001"))
+        self.assertEqual(state.open_rows, [GradientRow()])
+        self.assertEqual(state.close_rows, [GradientRow()])
+        self.assertFalse(state.enabled)
+
+    def test_malformed_environment_preset_has_actionable_error(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            "GRADIENT_LONG 第 2 档格式错误",
+        ):
+            GradientStrategyState.from_config(
+                {"GRADIENT_LONG": "0.060:0.005,broken"}
+            )
+
+    def test_non_finite_environment_value_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "必须是有限数字"):
+            GradientStrategyState.from_config(
+                {"GRADIENT_SINGLE_ORDER_QTY": "NaN"}
+            )
+
     def test_duplicate_threshold_and_position_are_rejected(self):
         state = GradientStrategyState.default()
         self._complete_minimum_config(state)
