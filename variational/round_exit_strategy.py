@@ -95,6 +95,39 @@ class RoundExitLedger:
         return self._cumulative_close_qty
 
     @property
+    def paired_close_qty(self) -> Decimal:
+        """Quantity already offset by opposite fills, including the live round."""
+        return self._cumulative_close_qty + self.close_qty
+
+    @property
+    def paired_quote_pnl(self) -> Decimal | None:
+        """Realized fill-spread cashflow for all offset quantity."""
+        if self.paired_close_qty <= 0:
+            return None
+        archived = self._cumulative_quote_pnl
+        if self._completed_round_count == 0:
+            archived = Decimal("0")
+        if archived is None:
+            return None
+        if self.close_qty <= 0:
+            return archived
+        if self._quote_pnl_exact is not None:
+            return archived + self._quote_pnl_exact
+        if self._estimated_quote_pnl_qty == self.close_qty:
+            return archived + self._estimated_quote_pnl
+        return None
+
+    @property
+    def paired_quote_pnl_exact(self) -> bool:
+        if self.paired_close_qty <= 0:
+            return False
+        archived_exact = (
+            self._completed_round_count == 0 or self._cumulative_quote_pnl_exact
+        )
+        live_exact = self.close_qty <= 0 or self._quote_pnl_exact is not None
+        return archived_exact and live_exact
+
+    @property
     def cumulative_edge_pnl_average(self) -> Decimal | None:
         if self._cumulative_close_qty <= 0:
             return None

@@ -276,6 +276,27 @@ class RoundExitLedgerTest(unittest.TestCase):
         self.assertEqual(ledger.completed_round_count, 1)
         self.assertEqual(ledger.cumulative_quote_pnl, D("0.001"))
 
+    def test_paired_profit_combines_completed_and_live_partial_closes(self):
+        ledger = self.ledger()
+        ledger.apply_fill(
+            "buy", D("0.001"), D("0.060"), unit_spread=D("10")
+        )
+        ledger.apply_fill(
+            "sell", D("0.001"), D("0.040"), unit_spread=D("-9")
+        )
+        ledger.apply_fill(
+            "buy", D("0.002"), D("0.060"), unit_spread=D("4")
+        )
+        ledger.apply_fill(
+            "sell", D("0.001"), D("0.050"), unit_spread=D("-3.5")
+        )
+
+        self.assertEqual(ledger.position_qty, D("0.001"))
+        self.assertEqual(ledger.completed_round_count, 1)
+        self.assertEqual(ledger.paired_close_qty, D("0.002"))
+        self.assertEqual(ledger.paired_quote_pnl, D("0.0015"))
+        self.assertTrue(ledger.paired_quote_pnl_exact)
+
     def test_cross_zero_fill_splits_completed_and_new_round(self):
         ledger = self.ledger()
         ledger.apply_fill("sell", D("0.001"), D("0.042"), normal_close_threshold=D("0.06"))

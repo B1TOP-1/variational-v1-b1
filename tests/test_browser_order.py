@@ -1201,7 +1201,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("持仓-0.011BTC", binance_line)
         self.assertIn("Lit仓+0.011", binance_line)
-        self.assertIn("累计清零毛收益", var_line)
+        self.assertIn("累计已配对毛收益", var_line)
         self.assertNotIn("含未平单", var_line)
         self.assertNotIn("持仓", var_line)
         self.assertNotIn("Lit仓", var_line)
@@ -1484,7 +1484,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rt.records[key].slippage_recorded)
         self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.01"))
 
-    def test_dashboard_cumulative_profit_excludes_open_round(self):
+    def test_dashboard_cumulative_profit_includes_only_realtime_paired_quantity(self):
         rt = self._runtime()
         rt.ticker = "BTC"
         rt.round_exit_ledger.apply_fill(
@@ -1498,21 +1498,35 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         console.print(rt._render_stats_panel(is_zh=True))
         open_text = console.export_text()
 
-        self.assertIn("累计清零毛收益: 0 / 0周期", open_text)
+        self.assertIn("累计已配对毛收益: 0 | 已配对数量 0 BTC", open_text)
         self.assertNotIn("+0.0020u", open_text)
 
         rt.round_exit_ledger.apply_fill(
             "sell",
-            Decimal("0.002"),
+            Decimal("0.001"),
             Decimal("0.5"),
             unit_spread=Decimal("-0.5"),
         )
         console = Console(record=True, width=120)
         console.print(rt._render_stats_panel(is_zh=True))
-        closed_text = console.export_text()
+        partially_paired_text = console.export_text()
 
-        self.assertIn("累计清零毛收益: +0.0010u / 1周期", closed_text)
-        self.assertIn("清零数量 0.002 BTC", closed_text)
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.001"))
+        self.assertIn("累计已配对毛收益: +0.0005u", partially_paired_text)
+        self.assertIn("已配对数量 0.001 BTC", partially_paired_text)
+
+        rt.round_exit_ledger.apply_fill(
+            "sell",
+            Decimal("0.001"),
+            Decimal("0.5"),
+            unit_spread=Decimal("-0.5"),
+        )
+        console = Console(record=True, width=120)
+        console.print(rt._render_stats_panel(is_zh=True))
+        fully_paired_text = console.export_text()
+
+        self.assertIn("累计已配对毛收益: +0.0010u", fully_paired_text)
+        self.assertIn("已配对数量 0.002 BTC", fully_paired_text)
 
     def test_record_cache_releases_old_completed_lifecycle_objects(self):
         rt = self._runtime()

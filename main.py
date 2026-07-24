@@ -3432,9 +3432,8 @@ class VariationalToLighterRuntime:
         grid = Table.grid(expand=True)
         grid.add_column(ratio=1)
         ledger = self.round_exit_ledger
-        realized_cashflow = ledger.cumulative_quote_pnl
-        realized_qty = ledger.cumulative_close_qty
-        realized_round_count = ledger.completed_round_count
+        paired_cashflow = ledger.paired_quote_pnl
+        paired_qty = ledger.paired_close_qty
         latest_round = (
             ledger.completed_rounds[-1]
             if ledger.completed_rounds
@@ -3442,17 +3441,17 @@ class VariationalToLighterRuntime:
         )
         if is_zh:
             grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
-            realized_text = (
+            paired_text = (
                 "0"
-                if realized_round_count == 0
-                else ("-" if realized_cashflow is None else f"{realized_cashflow:+.4f}u")
+                if paired_qty == 0
+                else ("-" if paired_cashflow is None else f"{paired_cashflow:+.4f}u")
             )
-            realized_prefix = (
-                "约" if realized_round_count > 0 and not ledger.cumulative_quote_pnl_exact else ""
+            paired_prefix = (
+                "约" if paired_qty > 0 and not ledger.paired_quote_pnl_exact else ""
             )
             grid.add_row(
-                f"累计清零毛收益: {realized_prefix}{realized_text} / {realized_round_count}周期 | "
-                f"清零数量 {realized_qty:g} {self.ticker or ''}"
+                f"累计已配对毛收益: {paired_prefix}{paired_text} | "
+                f"已配对数量 {paired_qty:g} {self.ticker or ''}"
             )
             if latest_round is None:
                 grid.add_row("最近完成周期收益: -")
@@ -3481,17 +3480,17 @@ class VariationalToLighterRuntime:
             title = "统计（本地会话）"
         else:
             grid.add_row(f"orders: {self._stat_fired}   both-filled: {self._stat_both_filled}")
-            realized_text = (
+            paired_text = (
                 "0"
-                if realized_round_count == 0
-                else ("-" if realized_cashflow is None else f"{realized_cashflow:+.4f}u")
+                if paired_qty == 0
+                else ("-" if paired_cashflow is None else f"{paired_cashflow:+.4f}u")
             )
-            realized_prefix = (
-                "est. " if realized_round_count > 0 and not ledger.cumulative_quote_pnl_exact else ""
+            paired_prefix = (
+                "est. " if paired_qty > 0 and not ledger.paired_quote_pnl_exact else ""
             )
             grid.add_row(
-                f"realized flat-cycle gross: {realized_prefix}{realized_text} / "
-                f"{realized_round_count} cycles | closed {realized_qty:g} {self.ticker or ''}"
+                f"cumulative paired gross: {paired_prefix}{paired_text} | "
+                f"paired {paired_qty:g} {self.ticker or ''}"
             )
             if latest_round is None:
                 grid.add_row("latest completed cycle PnL: -")
@@ -3731,16 +3730,16 @@ class VariationalToLighterRuntime:
         hedge_color = "green" if self.args.auto_hedge else "red"
         hedge_text = auto_hedge_on if self.args.auto_hedge else auto_hedge_off
 
-        realized_cashflow = ledger.cumulative_quote_pnl
-        realized_round_count = ledger.completed_round_count
-        session_color = "green" if realized_cashflow is None or realized_cashflow >= 0 else "red"
-        if realized_cashflow is None:
-            session_value = "0" if realized_round_count == 0 else "-"
+        paired_cashflow = ledger.paired_quote_pnl
+        paired_qty = ledger.paired_close_qty
+        session_color = "green" if paired_cashflow is None or paired_cashflow >= 0 else "red"
+        if paired_cashflow is None:
+            session_value = "0" if paired_qty == 0 else "-"
         else:
-            session_value = "0" if realized_cashflow == 0 else f"{realized_cashflow:+.4f}u"
+            session_value = "0" if paired_cashflow == 0 else f"{paired_cashflow:+.4f}u"
         session_prefix = (
             ("约" if is_zh else "est. ")
-            if realized_round_count > 0 and not ledger.cumulative_quote_pnl_exact
+            if paired_qty > 0 and not ledger.paired_quote_pnl_exact
             else ""
         )
         latest_round = ledger.completed_rounds[-1] if ledger.completed_rounds else None
@@ -3764,14 +3763,14 @@ class VariationalToLighterRuntime:
                 )
         if is_zh:
             pnl_text = (
-                f"累计清零毛收益 [{session_color}]{session_prefix}{session_value}[/]/"
-                f"{realized_round_count}周期 | "
+                f"累计已配对毛收益 [{session_color}]{session_prefix}{session_value}[/] | "
+                f"已配对数量 {paired_qty:g}{self.ticker or ''} | "
                 f"{latest_round_text}"
             )
         else:
             pnl_text = (
-                f"realized flat-cycle gross [{session_color}]{session_prefix}{session_value}[/]/"
-                f"{realized_round_count} cycles | "
+                f"cumulative paired gross [{session_color}]{session_prefix}{session_value}[/] | "
+                f"paired {paired_qty:g}{self.ticker or ''} | "
                 f"{latest_round_text}"
             )
 
