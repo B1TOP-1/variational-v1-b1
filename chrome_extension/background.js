@@ -2083,13 +2083,10 @@ function readPositionInPage() {
     }
   }
   const row = document.querySelector("tr[data-testid='positions-table-row']");
-  const cells = row ? Array.from(row.querySelectorAll("td")) : [];
   const quantityCell = row?.querySelector("[data-testid='position-quantity']");
   return {
     found: Boolean(label || quantityCell),
-    valueText: valueText || String(quantityCell?.innerText || quantityCell?.textContent || "").replace(/\s+/g, " ").trim(),
-    // Positions table column 3 is the average entry price for the active instrument.
-    avgEntryPriceText: String(cells[2]?.innerText || cells[2]?.textContent || "").replace(/\s+/g, " ").trim()
+    valueText: valueText || String(quantityCell?.innerText || quantityCell?.textContent || "").replace(/\s+/g, " ").trim()
   };
 }
 
@@ -2100,7 +2097,6 @@ async function handleReadPosition(payload) {
     ok: true,
     found: Boolean(result && result.found),
     valueText: String((result && result.valueText) || ""),
-    avgEntryPriceText: String((result && result.avgEntryPriceText) || ""),
     attachedTabId: tabId
   };
 }

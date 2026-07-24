@@ -230,9 +230,17 @@ class VariationalMonitor:
             asset = str(instrument.get("underlying", "UNKNOWN"))
 
         trade_id = str(data.get("id", ""))
+        order = data.get("order")
+        order_id = (
+            data.get("order_id")
+            or data.get("orderId")
+            or (order.get("id") if isinstance(order, dict) else None)
+            or ""
+        )
         summary = {
             "timestamp": data.get("created_at") or payload.get("timestamp") or "-",
             "trade_id": trade_id,
+            "order_id": str(order_id),
             "side": data.get("side", "-"),
             "asset": asset,
             "price": data.get("price", "-"),

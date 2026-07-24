@@ -555,6 +555,7 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
             asset="BTC",
             auto_hedge_enabled=True,
             last_variational_status="created",
+            var_submit_order_id="var-123",
         )
         runtime.records[record.trade_key] = record
         runtime.record_order.append(record.trade_key)
@@ -652,6 +653,7 @@ class StrategyOrderAsyncTest(unittest.IsolatedAsyncioTestCase):
             asset="LIGHTER",
             auto_hedge_enabled=True,
             last_variational_status="created",
+            var_submit_order_id="lit-var-1",
         )
         runtime.records[record.trade_key] = record
         runtime.record_order.append(record.trade_key)

@@ -188,52 +188,6 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertIsNone(parse(""))
         self.assertIsNone(parse(None))
 
-    def test_derive_position_fill_price_from_weighted_entry(self):
-        derive = VariationalToLighterRuntime._derive_position_fill_price
-
-        price = derive(
-            side="buy",
-            qty=Decimal("0.001"),
-            before_qty=Decimal("0.005"),
-            before_avg_price=Decimal("65000"),
-            before_rpnl=Decimal("0"),
-            after_qty=Decimal("0.006"),
-            after_avg_price=Decimal("65100"),
-            after_rpnl=Decimal("0"),
-            tolerance=Decimal("0.00001"),
-        )
-        self.assertEqual(price, Decimal("65600"))
-
-    def test_derive_position_close_price_uses_realized_pnl_delta(self):
-        derive = VariationalToLighterRuntime._derive_position_fill_price
-
-        price = derive(
-            side="sell",
-            qty=Decimal("0.001"),
-            before_qty=Decimal("0.005"),
-            before_avg_price=Decimal("65000"),
-            before_rpnl=Decimal("0"),
-            after_qty=Decimal("0.004"),
-            after_avg_price=Decimal("65000"),
-            after_rpnl=Decimal("0.5"),
-            tolerance=Decimal("0.00001"),
-        )
-        self.assertEqual(price, Decimal("65500"))
-        self.assertIsNone(
-            derive(
-                side="sell",
-                qty=Decimal("0.001"),
-                before_qty=Decimal("0.005"),
-                before_avg_price=Decimal("65000"),
-                before_rpnl=None,
-                after_qty=Decimal("0.004"),
-                after_avg_price=Decimal("65000"),
-                after_rpnl=None,
-                tolerance=Decimal("0.00001"),
-            )
-        )
-
-
 class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _runtime():
@@ -243,54 +197,6 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         runtime._lighter_position_ready.set()
         runtime.lighter_gateway.size_multiplier = 1000
         return runtime
-
-    async def test_missing_var_fill_is_recovered_from_position_snapshots(self):
-        rt = self._runtime()
-        rt._round_ledger_synced = True
-        entry = OrderLifecycle(
-            trade_key="strategy:entry",
-            trade_id="",
-            side="buy",
-            qty=Decimal("0.005"),
-            asset="BTC",
-            auto_hedge_enabled=True,
-            var_fill_price=Decimal("65000"),
-            lighter_fill_price=Decimal("65010"),
-            lighter_filled_qty=Decimal("0.005"),
-            last_variational_status="filled",
-        )
-        rt.records[entry.trade_key] = entry
-        rt.record_order.append(entry.trade_key)
-        rt._account_round_fill(entry, Decimal("0.05"))
-
-        missing = OrderLifecycle(
-            trade_key="strategy:missing",
-            trade_id="",
-            side="sell",
-            qty=Decimal("0.001"),
-            asset="BTC",
-            auto_hedge_enabled=True,
-            lighter_fill_price=Decimal("65510"),
-            lighter_filled_qty=Decimal("0.001"),
-            var_position_before_qty=Decimal("0.005"),
-            var_position_before_avg_price=Decimal("65000"),
-            var_position_before_rpnl=Decimal("0"),
-            signal_trigger_monotonic=time.monotonic() - 3.0,
-            last_variational_status="strategy_submitted",
-        )
-        rt.records[missing.trade_key] = missing
-        rt.record_order.append(missing.trade_key)
-        rt._cached_position_qty = Decimal("0.004")
-        rt._cached_position_avg_price = Decimal("65000")
-        rt._cached_position_rpnl = Decimal("0.5")
-
-        recovered = await rt._recover_missing_var_fill_from_position(Decimal("0.004"))
-
-        self.assertTrue(recovered)
-        self.assertEqual(missing.var_fill_price, Decimal("65500"))
-        self.assertTrue(missing.var_fill_price_estimated)
-        self.assertEqual(missing.var_fill_price_source, "position_snapshot")
-        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.004"))
 
     async def test_manual_missing_var_fill_uses_price_and_marks_source(self):
         rt = self._runtime()
@@ -323,6 +229,7 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         )
         rt.records[missing.trade_key] = missing
         rt.record_order.append(missing.trade_key)
+        rt._pending_variational_strategy_order_keys.append(missing.trade_key)
         rt._cached_position_qty = Decimal("0.004")
 
         await rt._manual_recover_missing_var_fill(Decimal("65500"))
@@ -331,9 +238,196 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.var_fill_price_source, "manual_input")
         self.assertTrue(missing.var_fill_price_estimated)
         self.assertIn("手动补记成功", rt._manual_fill_recovery_status)
+        self.assertNotIn(missing.trade_key, rt._pending_variational_strategy_order_keys)
+
+    def test_pending_fill_match_uses_nearest_order_time_not_fifo(self):
+        rt = self._runtime()
+        old = OrderLifecycle(
+            trade_key="strategy:old",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            strategy_created_at_ms=1_000_000,
+            last_variational_status="strategy_submitted",
+        )
+        current = OrderLifecycle(
+            trade_key="strategy:current",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            strategy_created_at_ms=1_300_000,
+            last_variational_status="strategy_submitted",
+        )
+        for record in (old, current):
+            rt.records[record.trade_key] = record
+            rt._pending_variational_strategy_order_keys.append(record.trade_key)
+
+        selected = rt._match_pending_variational_strategy_order(
+            "buy",
+            Decimal("0.001"),
+            "BTC",
+            event_timestamp=1_301,
+        )
+
+        self.assertIs(selected, current)
+        self.assertIn(old.trade_key, rt._pending_variational_strategy_order_keys)
+        self.assertNotIn(current.trade_key, rt._pending_variational_strategy_order_keys)
+
+    def test_filled_pending_record_cannot_consume_next_trade(self):
+        rt = self._runtime()
+        stale = OrderLifecycle(
+            trade_key="strategy:stale",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65000"),
+            var_fill_price_source="manual_input",
+            last_variational_status="filled",
+        )
+        current = OrderLifecycle(
+            trade_key="strategy:current",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        for record in (stale, current):
+            rt.records[record.trade_key] = record
+            rt._pending_variational_strategy_order_keys.append(record.trade_key)
+
+        selected = rt._match_pending_variational_strategy_order("buy", Decimal("0.001"), "BTC")
+
+        self.assertIs(selected, current)
+        self.assertNotIn(stale.trade_key, rt._pending_variational_strategy_order_keys)
+
+    def test_order_id_match_overrides_fifo_order(self):
+        rt = self._runtime()
+        old = OrderLifecycle(
+            trade_key="strategy:old",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_submit_order_id="order-old",
+            last_variational_status="strategy_submitted",
+        )
+        current = OrderLifecycle(
+            trade_key="strategy:current",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_submit_order_id="order-current",
+            last_variational_status="strategy_submitted",
+        )
+        for record in (old, current):
+            rt.records[record.trade_key] = record
+            rt._pending_variational_strategy_order_keys.append(record.trade_key)
+
+        selected = rt._match_pending_variational_strategy_order(
+            "buy",
+            Decimal("0.001"),
+            "BTC",
+            trade_id="order-current",
+        )
+
+        self.assertIs(selected, current)
+        self.assertIn(old.trade_key, rt._pending_variational_strategy_order_keys)
+
+    def test_unknown_trade_id_is_never_fifo_matched(self):
+        rt = self._runtime()
+        pending = OrderLifecycle(
+            trade_key="strategy:pending",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_submit_order_id="known-order",
+            last_variational_status="strategy_submitted",
+        )
+        rt.records[pending.trade_key] = pending
+        rt._pending_variational_strategy_order_keys.append(pending.trade_key)
+
+        selected = rt._match_pending_variational_strategy_order(
+            "buy",
+            Decimal("0.001"),
+            "BTC",
+            trade_id="different-order",
+        )
+
+        self.assertIsNone(selected)
+        self.assertIn(pending.trade_key, rt._pending_variational_strategy_order_keys)
+
+    async def test_fill_arriving_before_order_response_is_merged_by_id(self):
+        rt = self._runtime()
+        strategy = OrderLifecycle(
+            trade_key="strategy:race",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="strategy_submitted",
+        )
+        orphan = OrderLifecycle(
+            trade_key="id:order-race",
+            trade_id="order-race",
+            side="buy",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65001"),
+            var_fill_ts_iso="2026-07-24T00:00:00Z",
+            last_variational_status="filled",
+        )
+        for record in (strategy, orphan):
+            rt.records[record.trade_key] = record
+            rt.record_order.append(record.trade_key)
+        rt._pending_variational_strategy_order_keys.append(strategy.trade_key)
+
+        await rt._record_var_submit_result(strategy.trade_key, {
+            "ok": True,
+            "orderResponse": {"status": 200, "json": {"id": "order-race"}},
+        })
+
+        self.assertEqual(strategy.var_submit_order_id, "order-race")
+        self.assertEqual(strategy.trade_id, "order-race")
+        self.assertEqual(strategy.var_fill_price, Decimal("65001"))
+        self.assertNotIn(orphan.trade_key, rt.records)
+        self.assertNotIn(strategy.trade_key, rt._pending_variational_strategy_order_keys)
 
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):
+    def test_trade_event_preserves_order_id(self):
+        monitor = VariationalMonitor()
+
+        monitor._update_trade_event({
+            "type": "trade_filled",
+            "data": {
+                "id": "trade-1",
+                "order_id": "order-1",
+                "side": "buy",
+                "qty": "0.001",
+                "price": "65000",
+                "status": "filled",
+                "instrument": {"underlying": "BTC"},
+            },
+        })
+
+        self.assertEqual(monitor.trade_events[-1]["trade_id"], "trade-1")
+        self.assertEqual(monitor.trade_events[-1]["order_id"], "order-1")
+
     async def test_listener_only_accepts_active_sequenced_quotes(self):
         monitor = VariationalMonitor()
         base_event = {
