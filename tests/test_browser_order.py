@@ -391,6 +391,7 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(draft)
         self.assertIn("没有检测到两腿已手动归零", rt._manual_fill_recovery_status)
 
+
     def test_enter_resumes_strategy_from_dedicated_halted_row(self):
         rt = self._runtime()
         rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.05")
@@ -652,6 +653,65 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(strategy.var_fill_price, Decimal("65001"))
         self.assertNotIn(orphan.trade_key, rt.records)
         self.assertNotIn(strategy.trade_key, rt._pending_variational_strategy_order_keys)
+
+
+class TelegramFillMessageTest(unittest.TestCase):
+    @staticmethod
+    def _runtime():
+        runtime = VariationalToLighterRuntime(parse_args(["--browser-smoke-test"]))
+        runtime.ticker = "BTC"
+        runtime.variational_ticker = "BTC"
+        runtime._round_ledger_synced = True
+        runtime.telegram_messages = []
+        runtime.telegram_notifier = type(
+            "CaptureNotifier",
+            (),
+            {"enqueue": lambda _self, message: runtime.telegram_messages.append(message) or True},
+        )()
+        return runtime
+
+    @staticmethod
+    def _filled_record(key, side, var_price, lighter_price):
+        return OrderLifecycle(
+            trade_key=key,
+            trade_id=key,
+            side=side,
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            last_variational_status="filled",
+            var_fill_price=Decimal(var_price),
+            var_fill_price_source="trade_ws",
+            lighter_side="SELL" if side == "buy" else "BUY",
+            lighter_fill_price=Decimal(lighter_price),
+            lighter_filled_qty=Decimal("0.001"),
+            lighter_filled_quote=Decimal(lighter_price) * Decimal("0.001"),
+            lighter_fill_price_source="trade_ws",
+        )
+
+    def test_fill_and_round_notifications_use_compact_approved_templates(self):
+        rt = self._runtime()
+        entry = self._filled_record("strategy:entry", "buy", "65000", "65010")
+
+        rt._maybe_record_slippage_stats(entry)
+
+        self.assertEqual(len(rt.telegram_messages), 1)
+        self.assertIn("🔔 BTC｜买V/卖L 0.001｜第1单", rt.telegram_messages[0])
+        self.assertIn("平仓Edge 0%", rt.telegram_messages[0])
+        self.assertIn("本轮已配对 0u｜累计 0u", rt.telegram_messages[0])
+
+        close = self._filled_record("strategy:close", "sell", "65050", "65020")
+        rt._maybe_record_slippage_stats(close)
+
+        self.assertEqual(len(rt.telegram_messages), 3)
+        self.assertIn("🔔 BTC｜卖V/买L 0.001｜第2单", rt.telegram_messages[1])
+        self.assertIn("✅ BTC｜第1轮清仓归零", rt.telegram_messages[2])
+        self.assertIn("入场 做多V/做空L｜Edge", rt.telegram_messages[2])
+        self.assertIn("平仓 做空V/做多L｜Edge", rt.telegram_messages[2])
+        self.assertIn("累计收益", rt.telegram_messages[2])
+
+        rt._maybe_record_slippage_stats(close)
+        self.assertEqual(len(rt.telegram_messages), 3)
 
 
 class BrowserOrderBrokerTest(unittest.IsolatedAsyncioTestCase):

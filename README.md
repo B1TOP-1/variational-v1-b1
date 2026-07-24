@@ -49,6 +49,16 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
+可选配置 Telegram 成交推送；两项都设置时启用：
+
+```bash
+TELEGRAM_BOT_TOKEN=123456789:your_bot_token
+TELEGRAM_CHAT_ID=123456789
+```
+
+每笔两腿完整成交推送一次，持仓周期归零时再单独推送周期结果。通知使用有界内存队列和
+独立后台发送任务；Telegram 网络超时、失败或队列满不会阻塞行情、信号和下单流程。
+
 可以同时在 `.env` 预制第二页的梯度。每档格式为 `阈值%:目标净仓位`，档数不限，
 用逗号分隔后界面会按实际档数显示：
 

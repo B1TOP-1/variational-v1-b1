@@ -46,6 +46,7 @@ from variational.quote_comparator import QuoteComparator
 from variational.round_exit_strategy import CompletedRound, RoundExitConfig, RoundExitLedger, RoundStateError
 from variational.spread_store import SpreadStore
 from variational.spread_dashboard import SpreadDashboardServer
+from variational.telegram_notifier import TelegramNotifier
 
 VARIATIONAL_TICKER_OVERRIDES = {
     "LIT": "LIGHTER",
@@ -479,6 +480,11 @@ class VariationalToLighterRuntime:
             handler.close()
         self.logger.handlers.clear()
         self.logger.propagate = False
+        self.telegram_notifier = TelegramNotifier(
+            os.getenv("TELEGRAM_BOT_TOKEN", ""),
+            os.getenv("TELEGRAM_CHAT_ID", ""),
+            logger=self.logger,
+        )
 
         self.run_started_at = cst_now()
         run_name = self.run_started_at.strftime("%Y-%m-%d_%H-%M-%S_%f_UTC+8")
@@ -1207,6 +1213,88 @@ class VariationalToLighterRuntime:
                 lighter_slip_text,
             )
 
+    @staticmethod
+    def _telegram_signed(value: Decimal | None, *, suffix: str = "") -> str:
+        if value is None:
+            return "-"
+        if value == 0:
+            return f"0{suffix}"
+        return f"{value:+.4f}{suffix}"
+
+    @staticmethod
+    def _telegram_position(value: Decimal) -> str:
+        if value == 0:
+            return "0"
+        return f"{value:+f}"
+
+    def _telegram_fill_message(
+        self,
+        record: OrderLifecycle,
+        completed_rounds: list[CompletedRound],
+    ) -> str:
+        ledger = self.round_exit_ledger
+        completed = completed_rounds[-1] if completed_rounds else None
+        entry_edge = ledger.entry_edge_actual
+        close_edge = ledger.close_edge_actual
+        round_quote = ledger.live_paired_quote_pnl
+        if completed is not None and ledger.position_qty == 0:
+            entry_edge = completed.entry_edge_actual
+            close_edge = completed.close_edge_actual
+            round_quote = completed.estimated_quote_pnl
+        entry_edge = entry_edge if entry_edge is not None else Decimal("0")
+        close_edge = close_edge if close_edge is not None else Decimal("0")
+        round_quote = round_quote if round_quote is not None else Decimal("0")
+        total_quote = ledger.paired_quote_pnl or Decimal("0")
+        direction = "买V/卖L" if record.side.strip().lower() == "buy" else "卖V/买L"
+        manual = (
+            record.var_fill_price_source == "manual_input"
+            or record.lighter_fill_price_source == "manual_input"
+        )
+        icon = "⚠️" if manual else "🔔"
+        return "\n".join(
+            (
+                f"{icon} {self.ticker or record.asset}｜{direction} "
+                f"{decimal_to_str(record.qty)}｜第{self._stat_both_filled}单",
+                f"入场Edge {self._telegram_signed(entry_edge, suffix='%')}｜"
+                f"平仓Edge {self._telegram_signed(close_edge, suffix='%')}",
+                f"仓位 V{self._telegram_position(ledger.position_qty)} / "
+                f"L{self._telegram_position(-ledger.position_qty)}",
+                f"本轮已配对 {self._telegram_signed(round_quote, suffix='u')}｜"
+                f"累计 {self._telegram_signed(total_quote, suffix='u')}",
+            )
+        )
+
+    def _telegram_round_message(self, completed: CompletedRound) -> str:
+        if completed.side == "long":
+            entry_direction = "做多V/做空L"
+            close_direction = "做空V/做多L"
+        else:
+            entry_direction = "做空V/做多L"
+            close_direction = "做多V/做空L"
+        ledger = self.round_exit_ledger
+        return "\n".join(
+            (
+                f"✅ {self.ticker or ''}｜第{completed.round_id}轮清仓归零",
+                f"入场 {entry_direction}｜Edge {completed.entry_edge_actual:+.4f}%",
+                f"平仓 {close_direction}｜Edge {completed.close_edge_actual:+.4f}%",
+                f"本轮收益 {completed.edge_pnl:+.4f}%｜"
+                f"{self._telegram_signed(completed.estimated_quote_pnl, suffix='u')}",
+                f"累计收益 {self._telegram_signed(ledger.paired_quote_pnl, suffix='u')}｜"
+                f"已配对 {decimal_to_str(ledger.paired_close_qty)} {self.ticker or ''}",
+            )
+        )
+
+    def _enqueue_telegram_fill(
+        self,
+        record: OrderLifecycle,
+        completed_rounds: list[CompletedRound],
+    ) -> None:
+        self.telegram_notifier.enqueue(
+            self._telegram_fill_message(record, completed_rounds)
+        )
+        for completed in completed_rounds:
+            self.telegram_notifier.enqueue(self._telegram_round_message(completed))
+
     def _maybe_record_slippage_stats(self, record: OrderLifecycle) -> None:
         """两腿都成交后累计一次分腿滑点（仅策略单有触发价；调用方持 _record_lock）。"""
         if record.slippage_recorded:
@@ -1306,6 +1394,7 @@ class VariationalToLighterRuntime:
                         cumulative_quote_label,
                         cumulative_quote_text,
                     )
+            self._enqueue_telegram_fill(record, completed_rounds)
         record.slippage_recorded = True
 
     def _normal_close_threshold_for_entry_side(self, entry_side: str) -> Decimal | None:
@@ -4431,6 +4520,11 @@ class VariationalToLighterRuntime:
     async def run(self) -> None:
         self._start_session_logging()
         self.logger.info("会话目录: %s", self.run_dir.resolve())
+        self.telegram_notifier.start()
+        self.logger.info(
+            "Telegram成交推送: %s",
+            "已启用" if self.telegram_notifier.enabled else "未配置",
+        )
         self.setup_signal_handlers()
         self.setup_keyboard()
         dashboard_started = self.spread_dashboard.start()
@@ -4502,6 +4596,8 @@ class VariationalToLighterRuntime:
         if self._strategy_task and not self._strategy_task.done():
             self._strategy_task.cancel()
             await asyncio.gather(self._strategy_task, return_exceptions=True)
+
+        await self.telegram_notifier.stop()
 
         await self._browser_order_queue.stop()
         await self.lighter_gateway.stop()
