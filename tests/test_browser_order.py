@@ -1201,7 +1201,7 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("持仓-0.011BTC", binance_line)
         self.assertIn("Lit仓+0.011", binance_line)
-        self.assertIn("累计收益", var_line)
+        self.assertIn("累计清零毛收益", var_line)
         self.assertNotIn("含未平单", var_line)
         self.assertNotIn("持仓", var_line)
         self.assertNotIn("Lit仓", var_line)
@@ -1484,40 +1484,35 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rt.records[key].slippage_recorded)
         self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.01"))
 
-    def test_session_execution_summary_only_counts_complete_two_leg_orders(self):
+    def test_dashboard_cumulative_profit_excludes_open_round(self):
         rt = self._runtime()
-        complete = OrderLifecycle(
-            trade_key="strategy:complete",
-            trade_id="",
-            side="buy",
-            qty=Decimal("0.002"),
-            asset="BTC",
-            auto_hedge_enabled=True,
-            last_variational_status="filled",
-            var_fill_price=Decimal("100"),
-            lighter_fill_price=Decimal("101"),
-            lighter_filled_qty=Decimal("0.002"),
+        rt.ticker = "BTC"
+        rt.round_exit_ledger.apply_fill(
+            "buy",
+            Decimal("0.002"),
+            Decimal("1"),
+            unit_spread=Decimal("1"),
         )
-        partial = OrderLifecycle(
-            trade_key="strategy:partial-summary",
-            trade_id="",
-            side="sell",
-            qty=Decimal("0.001"),
-            asset="BTC",
-            auto_hedge_enabled=True,
-            last_variational_status="filled",
-            var_fill_price=Decimal("102"),
-            lighter_fill_price=Decimal("100"),
-            lighter_filled_qty=Decimal("0.0005"),
-        )
-        rt.records = {complete.trade_key: complete, partial.trade_key: partial}
-        rt.record_order.extend((complete.trade_key, partial.trade_key))
-        rt._record_session_execution(complete)
 
-        self.assertEqual(
-            rt._session_execution_summary(),
-            (Decimal("0.002"), Decimal("0.002"), 1),
+        console = Console(record=True, width=120)
+        console.print(rt._render_stats_panel(is_zh=True))
+        open_text = console.export_text()
+
+        self.assertIn("累计清零毛收益: 0 / 0周期", open_text)
+        self.assertNotIn("+0.0020u", open_text)
+
+        rt.round_exit_ledger.apply_fill(
+            "sell",
+            Decimal("0.002"),
+            Decimal("0.5"),
+            unit_spread=Decimal("-0.5"),
         )
+        console = Console(record=True, width=120)
+        console.print(rt._render_stats_panel(is_zh=True))
+        closed_text = console.export_text()
+
+        self.assertIn("累计清零毛收益: +0.0010u / 1周期", closed_text)
+        self.assertIn("清零数量 0.002 BTC", closed_text)
 
     def test_record_cache_releases_old_completed_lifecycle_objects(self):
         rt = self._runtime()
@@ -1537,29 +1532,6 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rt.record_order), 500)
         self.assertEqual(len(rt.records), 500)
         self.assertNotIn("strategy:0", rt.records)
-
-    def test_session_summary_is_counter_based_after_record_eviction(self):
-        rt = self._runtime()
-        record = OrderLifecycle(
-            trade_key="strategy:counter",
-            trade_id="",
-            side="buy",
-            qty=Decimal("0.001"),
-            asset="BTC",
-            auto_hedge_enabled=True,
-            last_variational_status="filled",
-            var_fill_price=Decimal("100"),
-            lighter_fill_price=Decimal("101"),
-            lighter_filled_qty=Decimal("0.001"),
-        )
-        rt._record_session_execution(record)
-        rt.records.clear()
-        rt.record_order.clear()
-
-        self.assertEqual(
-            rt._session_execution_summary(),
-            (Decimal("0.001"), Decimal("0.001"), 1),
-        )
 
     async def test_immediate_lighter_fill_is_mapped_before_create_order_returns(self):
         rt = self._runtime()

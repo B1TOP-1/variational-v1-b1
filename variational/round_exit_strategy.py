@@ -45,10 +45,17 @@ class CompletedRound:
 class RoundExitLedger:
     """Actual-fill round ledger and cost-line exit decision reference model."""
 
+    COMPLETED_ROUND_HISTORY_LIMIT = 50
+
     def __init__(self, config: RoundExitConfig) -> None:
         self.config = config
         self._next_round_id = 1
         self.completed_rounds: list[CompletedRound] = []
+        self._completed_round_count = 0
+        self._cumulative_close_qty = Decimal("0")
+        self._cumulative_edge_pnl_weighted = Decimal("0")
+        self._cumulative_quote_pnl: Decimal | None = Decimal("0")
+        self._cumulative_quote_pnl_exact = True
         self._clear_live_round()
 
     def _clear_live_round(self) -> None:
@@ -67,28 +74,46 @@ class RoundExitLedger:
         self._quote_pnl_exact: Decimal | None = Decimal("0")
         self.guard_started = False
 
+    def discard_live_round(self) -> None:
+        """Drop only incomplete position accounting while preserving realized totals."""
+        self._clear_live_round()
+
     @property
     def cumulative_quote_pnl(self) -> Decimal | None:
-        values = [item.estimated_quote_pnl for item in self.completed_rounds]
-        if not values or any(value is None for value in values):
-            return None
-        return sum(values, Decimal("0"))
+        return self._cumulative_quote_pnl if self._completed_round_count else None
 
     @property
     def cumulative_quote_pnl_exact(self) -> bool:
-        return bool(self.completed_rounds) and all(item.quote_pnl_exact for item in self.completed_rounds)
+        return self._completed_round_count > 0 and self._cumulative_quote_pnl_exact
+
+    @property
+    def completed_round_count(self) -> int:
+        return self._completed_round_count
+
+    @property
+    def cumulative_close_qty(self) -> Decimal:
+        return self._cumulative_close_qty
 
     @property
     def cumulative_edge_pnl_average(self) -> Decimal | None:
-        if not self.completed_rounds:
+        if self._cumulative_close_qty <= 0:
             return None
-        total_qty = sum((item.close_qty for item in self.completed_rounds), Decimal("0"))
-        if total_qty <= 0:
-            return None
-        return sum(
-            (item.edge_pnl * item.close_qty for item in self.completed_rounds),
-            Decimal("0"),
-        ) / total_qty
+        return self._cumulative_edge_pnl_weighted / self._cumulative_close_qty
+
+    def _archive_completed_round(self, completed: CompletedRound) -> None:
+        self._completed_round_count += 1
+        self._cumulative_close_qty += completed.close_qty
+        self._cumulative_edge_pnl_weighted += completed.edge_pnl * completed.close_qty
+        if self._cumulative_quote_pnl is not None and completed.estimated_quote_pnl is not None:
+            self._cumulative_quote_pnl += completed.estimated_quote_pnl
+        else:
+            self._cumulative_quote_pnl = None
+        self._cumulative_quote_pnl_exact = (
+            self._cumulative_quote_pnl_exact and completed.quote_pnl_exact
+        )
+        self.completed_rounds.append(completed)
+        if len(self.completed_rounds) > self.COMPLETED_ROUND_HISTORY_LIMIT:
+            del self.completed_rounds[:-self.COMPLETED_ROUND_HISTORY_LIMIT]
 
     @property
     def entry_edge_actual(self) -> Decimal | None:
@@ -170,7 +195,7 @@ class RoundExitLedger:
             ),
             self._quote_pnl_exact is not None,
         )
-        self.completed_rounds.append(completed)
+        self._archive_completed_round(completed)
         return completed
 
     def apply_fill(
@@ -249,7 +274,7 @@ class RoundExitLedger:
 
     def to_state(self) -> dict[str, object]:
         return {
-            "version": 4,
+            "version": 5,
             "next_round_id": self._next_round_id,
             "round_id": self.round_id,
             "side": self.side,
@@ -269,6 +294,15 @@ class RoundExitLedger:
             "estimated_quote_pnl_qty": str(self._estimated_quote_pnl_qty),
             "quote_pnl_exact": str(self._quote_pnl_exact) if self._quote_pnl_exact is not None else None,
             "guard_started": self.guard_started,
+            "completed_round_count": self._completed_round_count,
+            "cumulative_close_qty": str(self._cumulative_close_qty),
+            "cumulative_edge_pnl_weighted": str(self._cumulative_edge_pnl_weighted),
+            "cumulative_quote_pnl": (
+                str(self._cumulative_quote_pnl)
+                if self._cumulative_quote_pnl is not None
+                else None
+            ),
+            "cumulative_quote_pnl_exact": self._cumulative_quote_pnl_exact,
             "completed_rounds": [
                 {
                     "round_id": item.round_id,
@@ -285,14 +319,14 @@ class RoundExitLedger:
                     ),
                     "quote_pnl_exact": item.quote_pnl_exact,
                 }
-                for item in self.completed_rounds[-50:]
+                for item in self.completed_rounds[-self.COMPLETED_ROUND_HISTORY_LIMIT:]
             ],
         }
 
     @classmethod
     def from_state(cls, config: RoundExitConfig, state: dict) -> RoundExitLedger:
         version = int(state.get("version", 0))
-        if version not in {2, 3, 4}:
+        if version not in {2, 3, 4, 5}:
             raise ValueError("unsupported round state version")
         ledger = cls(config)
         ledger._next_round_id = int(state.get("next_round_id", 1))
@@ -340,6 +374,40 @@ class RoundExitLedger:
                 )
                 for item in state.get("completed_rounds", [])
             ]
+        if version >= 5:
+            ledger._completed_round_count = int(state.get("completed_round_count", 0))
+            ledger._cumulative_close_qty = Decimal(str(state.get("cumulative_close_qty", "0")))
+            ledger._cumulative_edge_pnl_weighted = Decimal(
+                str(state.get("cumulative_edge_pnl_weighted", "0"))
+            )
+            cumulative_quote_pnl = state.get("cumulative_quote_pnl")
+            ledger._cumulative_quote_pnl = (
+                Decimal(str(cumulative_quote_pnl))
+                if cumulative_quote_pnl is not None
+                else None
+            )
+            ledger._cumulative_quote_pnl_exact = bool(
+                state.get("cumulative_quote_pnl_exact", False)
+            )
+        else:
+            ledger._completed_round_count = len(ledger.completed_rounds)
+            ledger._cumulative_close_qty = sum(
+                (item.close_qty for item in ledger.completed_rounds),
+                Decimal("0"),
+            )
+            ledger._cumulative_edge_pnl_weighted = sum(
+                (item.edge_pnl * item.close_qty for item in ledger.completed_rounds),
+                Decimal("0"),
+            )
+            quote_values = [item.estimated_quote_pnl for item in ledger.completed_rounds]
+            ledger._cumulative_quote_pnl = (
+                sum(quote_values, Decimal("0"))
+                if quote_values and all(value is not None for value in quote_values)
+                else None
+            )
+            ledger._cumulative_quote_pnl_exact = bool(ledger.completed_rounds) and all(
+                item.quote_pnl_exact for item in ledger.completed_rounds
+            )
         if ledger.position_qty == 0:
             ledger._clear_live_round()
         elif ledger.round_id is None or ledger.side is None or ledger.entry_qty <= 0:

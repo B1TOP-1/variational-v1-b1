@@ -49,7 +49,8 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
-可以同时在 `.env` 预制第二页的梯度。每档格式为 `阈值%:目标净仓位`，多档用逗号分隔：
+可以同时在 `.env` 预制第二页的梯度。每档格式为 `阈值%:目标净仓位`，档数不限，
+用逗号分隔后界面会按实际档数显示：
 
 ```bash
 GRADIENT_SINGLE_ORDER_QTY=0.001
@@ -315,8 +316,9 @@ LIGHTER_API_KEY_INDEX=...
 LIGHTER_PRIVATE_KEY=...
 ```
 
-Optional Page 2 gradient presets can be loaded from `.env`. Each level uses
-`threshold_percent:target_net_position`, separated by commas:
+Optional Page 2 gradient presets can be loaded from `.env`. Any number of levels
+can be configured as `threshold_percent:target_net_position`, separated by commas;
+the UI renders the configured row count:
 
 ```bash
 GRADIENT_SINGLE_ORDER_QTY=0.001

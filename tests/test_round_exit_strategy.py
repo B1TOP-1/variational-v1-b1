@@ -170,6 +170,32 @@ class RoundExitLedgerTest(unittest.TestCase):
         self.assertEqual(restored.entry_edge_actual, D("0.042"))
         self.assertEqual(restored.completed_rounds, [])
 
+    def test_version_four_state_derives_realized_cumulative_totals(self):
+        ledger = self.ledger()
+        ledger.apply_fill(
+            "buy", D("0.001"), D("0.060"), unit_spread=D("10")
+        )
+        ledger.apply_fill(
+            "sell", D("0.001"), D("0.040"), unit_spread=D("-9")
+        )
+        state = ledger.to_state()
+        state["version"] = 4
+        for key in (
+            "completed_round_count",
+            "cumulative_close_qty",
+            "cumulative_edge_pnl_weighted",
+            "cumulative_quote_pnl",
+            "cumulative_quote_pnl_exact",
+        ):
+            state.pop(key)
+
+        restored = RoundExitLedger.from_state(ledger.config, state)
+
+        self.assertEqual(restored.completed_round_count, 1)
+        self.assertEqual(restored.cumulative_close_qty, D("0.001"))
+        self.assertEqual(restored.cumulative_quote_pnl, D("0.001"))
+        self.assertTrue(restored.cumulative_quote_pnl_exact)
+
     def test_quote_pnl_estimate_uses_each_close_fill_reference_price(self):
         ledger = self.ledger()
         ledger.apply_fill("sell", D("0.002"), D("0.050"))
@@ -209,6 +235,46 @@ class RoundExitLedgerTest(unittest.TestCase):
         restored = RoundExitLedger.from_state(ledger.config, ledger.to_state())
         self.assertEqual(restored.cumulative_quote_pnl, D("0.185212"))
         self.assertTrue(restored.cumulative_quote_pnl_exact)
+
+    def test_cumulative_totals_survive_recent_round_history_limit(self):
+        ledger = self.ledger()
+        for _ in range(60):
+            ledger.apply_fill(
+                "buy", D("0.001"), D("0.060"), unit_spread=D("10")
+            )
+            ledger.apply_fill(
+                "sell", D("0.001"), D("0.040"), unit_spread=D("-9")
+            )
+
+        self.assertEqual(len(ledger.completed_rounds), 50)
+        self.assertEqual(ledger.completed_round_count, 60)
+        self.assertEqual(ledger.cumulative_close_qty, D("0.060"))
+        self.assertEqual(ledger.cumulative_quote_pnl, D("0.060"))
+
+        restored = RoundExitLedger.from_state(ledger.config, ledger.to_state())
+
+        self.assertEqual(len(restored.completed_rounds), 50)
+        self.assertEqual(restored.completed_round_count, 60)
+        self.assertEqual(restored.cumulative_close_qty, D("0.060"))
+        self.assertEqual(restored.cumulative_quote_pnl, D("0.060"))
+
+    def test_discarding_live_round_preserves_realized_totals(self):
+        ledger = self.ledger()
+        ledger.apply_fill(
+            "buy", D("0.001"), D("0.060"), unit_spread=D("10")
+        )
+        ledger.apply_fill(
+            "sell", D("0.001"), D("0.040"), unit_spread=D("-9")
+        )
+        ledger.apply_fill(
+            "sell", D("0.002"), D("0.030"), unit_spread=D("-8")
+        )
+
+        ledger.discard_live_round()
+
+        self.assertEqual(ledger.position_qty, D("0"))
+        self.assertEqual(ledger.completed_round_count, 1)
+        self.assertEqual(ledger.cumulative_quote_pnl, D("0.001"))
 
     def test_cross_zero_fill_splits_completed_and_new_round(self):
         ledger = self.ledger()
