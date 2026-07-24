@@ -318,6 +318,36 @@ class SpreadMathTest(unittest.TestCase):
 
         self.assertEqual(len(runtime._browser_order_queue.items), 1)
 
+    def test_browser_activity_click_only_schedules_without_any_signal(self):
+        class Queue:
+            def __init__(self):
+                self.items = []
+
+            def submit(self, item):
+                self.items.append(item)
+
+        runtime = object.__new__(VariationalToLighterRuntime)
+        runtime.browser_order_broker = SimpleNamespace(is_connected=lambda: True)
+        runtime._strategy_order_in_flight = False
+        runtime._latest_gradient_signal = None
+        runtime._pending_signal_sig = None
+        runtime._pending_signal_ready = False
+        runtime._manual_fill_recovery_busy = False
+        runtime._manual_fill_price_buffer = None
+        runtime._browser_activity_next_side = "sell"
+        runtime.gradient_strategy = GradientStrategyState.default()
+        runtime._browser_order_queue = Queue()
+
+        self.assertTrue(runtime._schedule_browser_activity_click())
+        self.assertEqual(len(runtime._browser_order_queue.items), 1)
+        command = runtime._browser_order_queue.items[0]
+        self.assertTrue(command.activity_only)
+        self.assertEqual(command.side, "sell")
+
+        runtime._latest_gradient_signal = object()
+        self.assertFalse(runtime._schedule_browser_activity_click())
+        self.assertEqual(len(runtime._browser_order_queue.items), 1)
+
     def test_gradient_signal_creates_strategy_record_and_live_browser_order(self):
         class Queue:
             def __init__(self):

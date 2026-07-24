@@ -19,6 +19,7 @@ class BrowserOrderCommand:
     qty: Decimal
     dry_run: bool = True
     prepare_only: bool = False
+    activity_only: bool = False
     trade_key: str | None = None
     submit_method: str = "js_click"
     timeout_ms: int = 20000
@@ -32,6 +33,8 @@ class BrowserOrderCommand:
 
     @property
     def action(self) -> str:
+        if self.activity_only:
+            return "keepalive_click"
         return "prepare_browser_order" if self.prepare_only else "place_browser_order"
 
     def to_payload(self) -> dict[str, Any]:
@@ -41,6 +44,7 @@ class BrowserOrderCommand:
             "qty": format(self.qty, "f"),
             "dryRun": bool(self.dry_run),
             "prepareOnly": bool(self.prepare_only),
+            "activityOnly": bool(self.activity_only),
             "simulateOnly": False,
             "timeoutMs": int(self.timeout_ms),
             "orderResponseTimeoutMs": int(self.order_response_timeout_ms),

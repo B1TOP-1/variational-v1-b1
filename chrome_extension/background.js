@@ -2057,6 +2057,16 @@ async function handleBrokerCommand(action, payload) {
   if (action === "place_browser_order" || action === "prepare_browser_order") {
     return await handlePlaceBrowserOrder(payload);
   }
+  if (action === "keepalive_click") {
+    const tabId = state.attachedTabId ?? (await getActiveTabId());
+    const side = String(payload?.side || "buy").toLowerCase() === "sell" ? "sell" : "buy";
+    const locate = await runInTab(tabId, locateOrderElementsInPage, [side]);
+    if (!locate?.sideButtonRect) {
+      return { ok: false, side, error: "side_button_missing", locate };
+    }
+    await dispatchTrustedClick(tabId, locate.sideButtonRect);
+    return { ok: true, side, clickedAt: nowIso(), locate };
+  }
   if (action === "read_position") {
     return await handleReadPosition(payload);
   }

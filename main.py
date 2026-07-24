@@ -67,6 +67,7 @@ MEMORY_MONITOR_ENABLED_ENV = "VARIATIONAL_MEMORY_MONITOR"
 READY_TIMEOUT_SECONDS = 60.0
 # broker 层等待必须 >= 页面内 timeout_ms，否则会在页面返回前假超时。
 BROWSER_ORDER_BROKER_MARGIN_SECONDS = 8.0
+BROWSER_ACTIVITY_INTERVAL_SECONDS = 300.0
 LIGHTER_ORDER_MAP_MAX = 500
 DOM_POSITION_TIMEOUT_SECONDS = 5.0
 STRATEGY_EVAL_FALLBACK_SECONDS = 0.2
@@ -517,6 +518,7 @@ class VariationalToLighterRuntime:
         self.dashboard_task: asyncio.Task[None] | None = None
         self.spread_sampling_task: asyncio.Task[None] | None = None
         self.binance_usdc_task: asyncio.Task[None] | None = None
+        self.browser_activity_task: asyncio.Task[None] | None = None
         self.binance_usdc_bid: Decimal | None = None
         self.binance_usdc_ask: Decimal | None = None
         self.binance_usdc_updated_at: float | None = None
@@ -598,6 +600,7 @@ class VariationalToLighterRuntime:
         self._last_prepared_order_sig: tuple[str, str] | None = None
         self._pending_prepare_sigs: set[tuple[str, str]] = set()
         self._prepared_order_side: str = "buy"
+        self._browser_activity_next_side = "sell"
         self._pending_trigger_spreads: list[PendingTriggerSpread] = []
         self._browser_order_queue: BrowserOrderDispatchQueue[BrowserOrderCommand] = (
             BrowserOrderDispatchQueue(self._send_browser_order_task)
@@ -690,11 +693,8 @@ class VariationalToLighterRuntime:
                     dashboard_changed = True
                     if self.gradient_strategy.single_order_qty != previous_order_qty:
                         self._schedule_prepare_browser_order()
-                # 由禁用切到启用 → 视为手动确认，解除硬停。
                 if self.gradient_strategy.enabled and not was_enabled and self._strategy_halted:
-                    self._strategy_halted = False
-                    self._halt_reason = ""
-                    self.logger.info("策略硬停已由手动重新启用解除")
+                    self._manual_fill_recovery_status = "触发策略已启用；仍处于硬停，回到顶部按 Enter 恢复运行"
         elif key == "1":
             self.current_page = 1
             dashboard_changed = True
@@ -751,17 +751,42 @@ class VariationalToLighterRuntime:
             self._manual_fill_price_buffer = ""
             self._manual_fill_recovery_status = "请输入漏记的 Var 成交价，Enter确认，Esc取消"
             return True
-        if (
-            key in ("\r", "\n")
-            and halted
-            and getattr(self, "_manual_fill_recovery_status", "").startswith("手动补记成功")
-        ):
+        if key in ("\r", "\n") and halted and self.gradient_strategy.enabled_selected():
+            reason = self._strategy_resume_block_reason()
+            if reason:
+                self._manual_fill_recovery_status = f"启动失败：{reason}"
+                self.logger.warning("策略手动启动失败: %s", reason)
+                return True
+            self.gradient_strategy.enabled = True
             self._strategy_halted = False
             self._halt_reason = ""
-            self._manual_fill_recovery_status = "策略已重新启动"
-            self.logger.info("策略已在程序内手动重新启动")
+            self._manual_fill_recovery_status = "策略已手动启动"
+            self.logger.info("策略已在程序内手动启动")
             return True
         return False
+
+    def _strategy_resume_block_reason(self) -> str:
+        errors = self.gradient_strategy.validation_errors()
+        if errors:
+            return errors[0]
+        position_qty = self._cached_position_qty
+        if position_qty is None:
+            return "Var真实仓位未知"
+        if not self._round_ledger_synced:
+            return "本轮账本尚未同步"
+        if abs(self.round_exit_ledger.position_qty - position_qty) > self._balance_tolerance():
+            return (
+                f"本轮账本与真实仓位不一致 ledger={decimal_to_str(self.round_exit_ledger.position_qty)} "
+                f"live={decimal_to_str(position_qty)}"
+            )
+        if self.args.auto_hedge and not self._positions_balanced():
+            return (
+                f"两腿仓位不平衡 Var={decimal_to_str(position_qty)} "
+                f"Lit={decimal_to_str(self._current_lighter_position())}"
+            )
+        if self._var_quote_disconnected():
+            return "Var报价尚未恢复"
+        return ""
 
     def restore_keyboard(self) -> None:
         if self._stdin_fd is None:
@@ -2458,7 +2483,7 @@ class VariationalToLighterRuntime:
             payload = record.to_payload()
         await self.append_order_log("variational_fill_manual", payload)
         self._manual_fill_recovery_status = (
-            f"手动补记成功：{record.side} {record.qty} @ {fill_price}，请按 Enter 重新启动策略"
+            f"手动补记成功：{record.side} {record.qty} @ {fill_price}；回到顶部按 Enter 启动策略"
         )
         self.logger.warning(
             "Var成交价手动补记: key=%s 方向=%s 数量=%s 价格=%s（非成交WS）",
@@ -2914,11 +2939,73 @@ class VariationalToLighterRuntime:
         self._pending_prepare_sigs.add(prepare_sig)
         self._browser_order_queue.submit(BrowserOrderCommand(side=side, qty=qty, dry_run=True, prepare_only=True))
 
+    def _schedule_browser_activity_click(self) -> bool:
+        if (
+            not self.browser_order_broker.is_connected()
+            or self._strategy_order_in_flight
+            or self._latest_gradient_signal is not None
+            or self._pending_signal_sig is not None
+            or self._pending_signal_ready
+            or self._manual_fill_recovery_busy
+            or self._manual_fill_price_buffer is not None
+        ):
+            return False
+        side = self._browser_activity_next_side
+        self._browser_order_queue.submit(
+            BrowserOrderCommand(
+                side=side,
+                qty=self.gradient_strategy.single_order_qty,
+                dry_run=True,
+                activity_only=True,
+            )
+        )
+        return True
+
+    async def browser_activity_loop(self) -> None:
+        while not self.stop_flag:
+            await asyncio.sleep(BROWSER_ACTIVITY_INTERVAL_SECONDS)
+            if self.stop_flag:
+                return
+            self._schedule_browser_activity_click()
+
     async def _send_browser_order_task(self, command: BrowserOrderCommand) -> None:
+        if command.activity_only:
+            await self._send_browser_activity_click(command)
+            return
         if command.prepare_only:
             await self._send_prepare_browser_order(command)
             return
         await self._send_browser_order(command)
+
+    async def _send_browser_activity_click(self, command: BrowserOrderCommand) -> None:
+        if (
+            self._strategy_order_in_flight
+            or self._latest_gradient_signal is not None
+            or self._pending_signal_sig is not None
+            or self._pending_signal_ready
+        ):
+            self.logger.info("浏览器保活动作取消: 策略信号已出现")
+            return
+        try:
+            result = await self.browser_order_broker.place_order(
+                command,
+                timeout=self._browser_order_timeout(command),
+            )
+        except Exception as exc:
+            self.logger.info("浏览器保活动作跳过: side=%s error=%s", command.side, exc)
+            return
+        if not result.get("ok"):
+            self.logger.info(
+                "浏览器保活动作未执行: side=%s error=%s",
+                command.side,
+                result.get("error") or result.get("blockedReason") or "unknown",
+            )
+            return
+        side = "sell" if command.side.strip().lower() == "sell" else "buy"
+        self._browser_activity_next_side = "buy" if side == "sell" else "sell"
+        self._prepared_order_side = side
+        self._last_prepared_order_sig = None
+        self.logger.info("浏览器保活点击: %s", side.upper())
 
     @staticmethod
     def _browser_order_timeout(command: BrowserOrderCommand) -> float:
@@ -3378,8 +3465,8 @@ class VariationalToLighterRuntime:
         if is_zh:
             grid.add_row(f"策略下单: {self._stat_fired}   两腿成交: {self._stat_both_filled}")
             grid.add_row(
-                f"本次成交净额: {session_cashflow:+.4f}u | {session_qty:g} "
-                f"{self.ticker or ''} / {session_count}笔 (含未平仓·未扣费)"
+                f"累计收益: {session_cashflow:+.4f}u / {session_count}笔 | "
+                f"成交量 {session_qty:g} {self.ticker or ''}"
             )
             if latest_round is None:
                 grid.add_row("最近完成周期收益: -")
@@ -3492,14 +3579,18 @@ class VariationalToLighterRuntime:
         for index, _row in enumerate(self.gradient_strategy.close_rows):
             strategy_table.add_row(self._strategy_row_text(StrategySection.CLOSE, index))
         strategy_table.add_row("")
-        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认/启动  r补记成交价  Esc取消  Tab切页  q退出")
+        strategy_table.add_row("按键: ↑↓移动  ←→切字段  数字/.编辑  +/-增删梯度  Enter确认/停止时启动  r补记成交价  Esc取消  Tab切页  q退出")
         return Panel(strategy_table, title="触发策略", border_style="magenta")
 
     def _strategy_enabled_row_text(self) -> str:
         selected = self.gradient_strategy.enabled_selected()
         cursor = ">" if selected else " "
-        icon = "[OK]" if self.gradient_strategy.enabled else "[ ]"
-        status_text = "启动触发策略"
+        if self._strategy_halted:
+            icon = "[ ]"
+            status_text = "解除停止并启动策略"
+        else:
+            icon = "[OK]" if self.gradient_strategy.enabled else "[ ]"
+            status_text = "启动触发策略"
         row_text = f"{cursor} {icon} {status_text}"
         if selected:
             return f"[reverse]{row_text}[/]"
@@ -3671,12 +3762,12 @@ class VariationalToLighterRuntime:
                 )
         if is_zh:
             pnl_text = (
-                f"本次成交净额 [{session_color}]{session_value}[/]/{session_count}笔(含未平单) | "
+                f"累计收益 [{session_color}]{session_value}[/]/{session_count}笔 | "
                 f"{latest_round_text}"
             )
         else:
             pnl_text = (
-                f"session cashflow [{session_color}]{session_value}[/]/{session_count} fills(open included) | "
+                f"cumulative return [{session_color}]{session_value}[/]/{session_count} fills | "
                 f"{latest_round_text}"
             )
 
@@ -4203,6 +4294,7 @@ class VariationalToLighterRuntime:
             self.browser_order_broker,
         )
         self._browser_order_queue.start()
+        self.browser_activity_task = asyncio.create_task(self.browser_activity_loop())
         self._schedule_prepare_browser_order()
         self.print_startup_next_steps()
         self.logger.info(
@@ -4244,6 +4336,10 @@ class VariationalToLighterRuntime:
         if self.binance_usdc_task and not self.binance_usdc_task.done():
             self.binance_usdc_task.cancel()
             await asyncio.gather(self.binance_usdc_task, return_exceptions=True)
+
+        if self.browser_activity_task and not self.browser_activity_task.done():
+            self.browser_activity_task.cancel()
+            await asyncio.gather(self.browser_activity_task, return_exceptions=True)
 
         if self.dashboard_task and not self.dashboard_task.done():
             await asyncio.gather(self.dashboard_task, return_exceptions=True)

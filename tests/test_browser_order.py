@@ -145,6 +145,16 @@ class BrowserOrderCommandTest(unittest.TestCase):
         self.assertEqual(payload["dryRun"], True)
         self.assertEqual(payload["prepareOnly"], True)
 
+    def test_builds_activity_click_without_submit_action(self):
+        command = BrowserOrderCommand(
+            side="sell",
+            qty=Decimal("0.001"),
+            activity_only=True,
+        )
+
+        self.assertEqual(command.action, "keepalive_click")
+        self.assertTrue(command.to_payload()["activityOnly"])
+
     def test_normalizes_unknown_side_to_buy(self):
         command = BrowserOrderCommand(side="invalid", qty=Decimal("0.002"))
 
@@ -177,6 +187,16 @@ class BrowserOrderCommandTest(unittest.TestCase):
 
         self.assertIn('action === "read_position"', background)
         self.assertIn("当前仓位", background)
+
+    def test_extension_keepalive_click_only_targets_side_control(self):
+        background = (Path(__file__).resolve().parents[1] / "chrome_extension" / "background.js").read_text()
+        start = background.index('if (action === "keepalive_click")')
+        end = background.index('if (action === "read_position")', start)
+        keepalive = background[start:end]
+
+        self.assertIn("locateOrderElementsInPage", keepalive)
+        self.assertIn("dispatchTrustedClick", keepalive)
+        self.assertNotIn("submit-button", keepalive)
 
     def test_parse_dom_position_text(self):
         parse = VariationalToLighterRuntime._parse_dom_position_text
@@ -239,6 +259,38 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(missing.var_fill_price_estimated)
         self.assertIn("手动补记成功", rt._manual_fill_recovery_status)
         self.assertNotIn(missing.trade_key, rt._pending_variational_strategy_order_keys)
+
+    def test_enter_resumes_strategy_from_dedicated_halted_row(self):
+        rt = self._runtime()
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.05")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.005")
+        rt._round_ledger_synced = True
+        rt.round_exit_ledger.apply_fill("buy", Decimal("0.004"), Decimal("0.04"))
+        rt._cached_position_qty = Decimal("0.004")
+        rt._strategy_halted = True
+        rt._halt_reason = "manual check"
+
+        handled = rt._handle_manual_fill_recovery_key("\r")
+
+        self.assertTrue(handled)
+        self.assertFalse(rt._strategy_halted)
+        self.assertTrue(rt.gradient_strategy.enabled)
+        self.assertEqual(rt._manual_fill_recovery_status, "策略已手动启动")
+
+    def test_enter_rejects_resume_while_ledger_still_mismatches(self):
+        rt = self._runtime()
+        rt.gradient_strategy.open_rows[0].threshold_pct = Decimal("0.05")
+        rt.gradient_strategy.open_rows[0].target_qty = Decimal("0.005")
+        rt._round_ledger_synced = True
+        rt.round_exit_ledger.apply_fill("buy", Decimal("0.005"), Decimal("0.04"))
+        rt._cached_position_qty = Decimal("0.003")
+        rt._strategy_halted = True
+
+        handled = rt._handle_manual_fill_recovery_key("\r")
+
+        self.assertTrue(handled)
+        self.assertTrue(rt._strategy_halted)
+        self.assertIn("账本与真实仓位不一致", rt._manual_fill_recovery_status)
 
     def test_pending_fill_match_uses_nearest_order_time_not_fifo(self):
         rt = self._runtime()
@@ -1149,7 +1201,8 @@ class HedgeLegTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("持仓-0.011BTC", binance_line)
         self.assertIn("Lit仓+0.011", binance_line)
-        self.assertIn("本次成交净额", var_line)
+        self.assertIn("累计收益", var_line)
+        self.assertNotIn("含未平单", var_line)
         self.assertNotIn("持仓", var_line)
         self.assertNotIn("Lit仓", var_line)
 
