@@ -1251,18 +1251,20 @@ class VariationalToLighterRuntime:
             or record.lighter_fill_price_source == "manual_input"
         )
         icon = "⚠️" if manual else "🔔"
-        return "\n".join(
-            (
-                f"{icon} {self.ticker or record.asset}｜{direction} "
-                f"{decimal_to_str(record.qty)}｜第{self._stat_both_filled}单",
-                f"入场Edge {self._telegram_signed(entry_edge, suffix='%')}｜"
-                f"平仓Edge {self._telegram_signed(close_edge, suffix='%')}",
-                f"仓位 V{self._telegram_position(ledger.position_qty)} / "
-                f"L{self._telegram_position(-ledger.position_qty)}",
+        lines = [
+            f"{icon} {self.ticker or record.asset}｜{direction} "
+            f"{decimal_to_str(record.qty)}｜第{self._stat_both_filled}单",
+            f"入场Edge {self._telegram_signed(entry_edge, suffix='%')}｜"
+            f"平仓Edge {self._telegram_signed(close_edge, suffix='%')}",
+            f"仓位 V{self._telegram_position(ledger.position_qty)} / "
+            f"L{self._telegram_position(-ledger.position_qty)}",
+        ]
+        if completed is not None or ledger.close_qty > 0:
+            lines.append(
                 f"本轮已配对 {self._telegram_signed(round_quote, suffix='u')}｜"
-                f"累计 {self._telegram_signed(total_quote, suffix='u')}",
+                f"累计 {self._telegram_signed(total_quote, suffix='u')}"
             )
-        )
+        return "\n".join(lines)
 
     def _telegram_round_message(self, completed: CompletedRound) -> str:
         if completed.side == "long":

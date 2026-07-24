@@ -698,13 +698,16 @@ class TelegramFillMessageTest(unittest.TestCase):
         self.assertEqual(len(rt.telegram_messages), 1)
         self.assertIn("🔔 BTC｜买V/卖L 0.001｜第1单", rt.telegram_messages[0])
         self.assertIn("平仓Edge 0%", rt.telegram_messages[0])
-        self.assertIn("本轮已配对 0u｜累计 0u", rt.telegram_messages[0])
+        self.assertNotIn("本轮已配对", rt.telegram_messages[0])
+        self.assertNotIn("累计", rt.telegram_messages[0])
 
         close = self._filled_record("strategy:close", "sell", "65050", "65020")
         rt._maybe_record_slippage_stats(close)
 
         self.assertEqual(len(rt.telegram_messages), 3)
         self.assertIn("🔔 BTC｜卖V/买L 0.001｜第2单", rt.telegram_messages[1])
+        self.assertIn("本轮已配对", rt.telegram_messages[1])
+        self.assertIn("累计", rt.telegram_messages[1])
         self.assertIn("✅ BTC｜第1轮清仓归零", rt.telegram_messages[2])
         self.assertIn("入场 做多V/做空L｜Edge", rt.telegram_messages[2])
         self.assertIn("平仓 做空V/做多L｜Edge", rt.telegram_messages[2])
