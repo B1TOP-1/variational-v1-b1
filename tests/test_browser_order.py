@@ -218,7 +218,7 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         runtime.lighter_gateway.size_multiplier = 1000
         return runtime
 
-    async def test_manual_missing_var_fill_uses_price_and_marks_source(self):
+    async def test_manual_missing_var_fill_uses_price_and_quantity_and_marks_source(self):
         rt = self._runtime()
         rt._round_ledger_synced = True
         entry = OrderLifecycle(
@@ -252,13 +252,144 @@ class PositionRecoveryTest(unittest.IsolatedAsyncioTestCase):
         rt._pending_variational_strategy_order_keys.append(missing.trade_key)
         rt._cached_position_qty = Decimal("0.004")
 
-        await rt._manual_recover_missing_var_fill(Decimal("65500"))
+        draft = rt._prepare_manual_fill_recovery()
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft.legs, ("var",))
+        draft.values[("var", "price")] = Decimal("65500")
+        draft.values[("var", "qty")] = Decimal("0.001")
+        draft.step_index = 2
+
+        await rt._apply_manual_fill_recovery(draft)
 
         self.assertEqual(missing.var_fill_price, Decimal("65500"))
         self.assertEqual(missing.var_fill_price_source, "manual_input")
         self.assertTrue(missing.var_fill_price_estimated)
         self.assertIn("手动补记成功", rt._manual_fill_recovery_status)
         self.assertNotIn(missing.trade_key, rt._pending_variational_strategy_order_keys)
+
+    async def test_manual_missing_lighter_fill_uses_price_and_quantity_and_marks_source(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        entry = OrderLifecycle(
+            trade_key="strategy:entry",
+            trade_id="",
+            side="buy",
+            qty=Decimal("0.005"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65000"),
+            lighter_fill_price=Decimal("65010"),
+            lighter_filled_qty=Decimal("0.005"),
+            last_variational_status="filled",
+        )
+        rt.records[entry.trade_key] = entry
+        rt.record_order.append(entry.trade_key)
+        rt._account_round_fill(entry, Decimal("0.05"))
+        missing = OrderLifecycle(
+            trade_key="strategy:missing-lighter",
+            trade_id="fill-var",
+            side="sell",
+            qty=Decimal("0.001"),
+            asset="BTC",
+            auto_hedge_enabled=True,
+            var_fill_price=Decimal("65500"),
+            var_fill_price_source="trade_ws",
+            last_variational_status="filled",
+        )
+        rt.records[missing.trade_key] = missing
+        rt.record_order.append(missing.trade_key)
+        rt._cached_position_qty = Decimal("0.004")
+
+        draft = rt._prepare_manual_fill_recovery()
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft.legs, ("lighter",))
+        draft.values[("lighter", "price")] = Decimal("65510")
+        draft.values[("lighter", "qty")] = Decimal("0.001")
+        draft.step_index = 2
+
+        await rt._apply_manual_fill_recovery(draft)
+
+        self.assertEqual(missing.lighter_fill_price, Decimal("65510"))
+        self.assertEqual(missing.lighter_filled_qty, Decimal("0.001"))
+        self.assertEqual(missing.lighter_fill_price_source, "manual_input")
+        self.assertTrue(missing.round_accounted)
+
+    async def test_manual_external_flat_close_prompts_for_both_legs_and_completes_round(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        rt.round_exit_ledger.apply_fill(
+            "buy",
+            Decimal("0.005"),
+            Decimal("0.05"),
+            unit_spread=Decimal("10"),
+        )
+        rt._cached_position_qty = Decimal("0")
+        rt._lighter_positions["BTC"] = Decimal("0")
+
+        draft = rt._prepare_manual_fill_recovery()
+        self.assertIsNotNone(draft)
+        self.assertTrue(draft.external_close)
+        self.assertEqual(draft.legs, ("var", "lighter"))
+        self.assertEqual(draft.side, "sell")
+        self.assertEqual(draft.expected_qty, Decimal("0.005"))
+        draft.values.update({
+            ("var", "price"): Decimal("65500"),
+            ("var", "qty"): Decimal("0.005"),
+            ("lighter", "price"): Decimal("65510"),
+            ("lighter", "qty"): Decimal("0.005"),
+        })
+        draft.step_index = 4
+
+        await rt._apply_manual_fill_recovery(draft)
+
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0"))
+        self.assertEqual(rt.round_exit_ledger.completed_round_count, 1)
+        manual = next(record for record in rt.records.values() if record.strategy_action == "manual_close")
+        self.assertEqual(manual.var_fill_price_source, "manual_input")
+        self.assertEqual(manual.lighter_fill_price_source, "manual_input")
+        self.assertIn("持仓周期已归零", rt._manual_fill_recovery_status)
+
+    def test_manual_recovery_rejects_wrong_quantity_before_apply(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        rt._strategy_halted = True
+        rt.round_exit_ledger.apply_fill("buy", Decimal("0.005"), Decimal("0.05"))
+        rt._cached_position_qty = Decimal("0")
+        rt._lighter_positions["BTC"] = Decimal("0")
+
+        self.assertTrue(rt._handle_manual_fill_recovery_key("r"))
+        rt._manual_fill_price_buffer = "65500"
+        self.assertTrue(rt._handle_manual_fill_recovery_key("\r"))
+        rt._manual_fill_price_buffer = "0.004"
+        self.assertTrue(rt._handle_manual_fill_recovery_key("\r"))
+
+        self.assertIn("必须输入 0.005", rt._manual_fill_recovery_status)
+        self.assertEqual(rt._manual_fill_recovery_draft.current_field, "qty")
+
+    def test_restart_with_external_flat_preserves_live_round_for_manual_recovery(self):
+        rt = self._runtime()
+        rt.round_exit_ledger.apply_fill("buy", Decimal("0.005"), Decimal("0.05"))
+        rt._lighter_positions["BTC"] = Decimal("0")
+        rt._round_ledger_synced = False
+
+        rt._sync_round_ledger_with_live_position(Decimal("0"))
+
+        self.assertTrue(rt._round_ledger_synced)
+        self.assertTrue(rt._strategy_halted)
+        self.assertEqual(rt.round_exit_ledger.position_qty, Decimal("0.005"))
+        self.assertIn("程序外两腿平仓", rt._halt_reason)
+
+    def test_manual_external_close_rejects_even_one_lot_of_live_position(self):
+        rt = self._runtime()
+        rt._round_ledger_synced = True
+        rt.round_exit_ledger.apply_fill("buy", Decimal("0.005"), Decimal("0.05"))
+        rt._cached_position_qty = Decimal("0.001")
+        rt._lighter_positions["BTC"] = Decimal("0")
+
+        draft = rt._prepare_manual_fill_recovery()
+
+        self.assertIsNone(draft)
+        self.assertIn("没有检测到两腿已手动归零", rt._manual_fill_recovery_status)
 
     def test_enter_resumes_strategy_from_dedicated_halted_row(self):
         rt = self._runtime()
